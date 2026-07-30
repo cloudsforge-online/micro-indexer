@@ -1,0 +1,47 @@
+{
+  "name": "@cloudsforge/indexer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The multi-chain indexer. One normalised schema, a worker per chain family, checkpointing, reorg recovery and provider failover. Replaces balance-probing (AD-07).",
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node --import tsx src/index.ts",
+    "migrate": "node --import tsx src/migrator.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-concurrency=1 src/*.test.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "check": "pnpm typecheck && pnpm test"
+  },
+  "_runtimeDependencies": [
+    "The six @cloudsforge/* runtime packages and @cloudsforge/contracts-chain are consumed as",
+    "file: paths because they are not published yet. Once AD-02 lands they become registry",
+    "versions and these paths — plus the two named build contexts in the Dockerfile and the",
+    "extra checkouts in CI — are deleted. Nothing else in this repository changes.",
+    "The runtime packages take a caret range on publish ('^1.0.0'). contracts-chain does NOT:",
+    "it takes an EXACT pin ('1.0.0'), because wallet, settlement, custody and indexer must agree",
+    "byte-for-byte on confirmation depths and amount maths. A caret there is money credited at",
+    "the wrong depth — see the package's own header.",
+    "tsx is a runtime dependency for the same reason: the unpublished packages resolve to their",
+    "TypeScript sources. On publish their publishConfig points at dist/, tsx moves to",
+    "devDependencies, and the image runs 'node dist/index.js'."
+  ],
+  "dependencies": {
+    "@cloudsforge/auth": "file:../runtime/packages/auth",
+    "@cloudsforge/contracts-chain": "file:../contracts/packages/chain",
+    "@cloudsforge/db": "file:../runtime/packages/db",
+    "@cloudsforge/http": "file:../runtime/packages/http",
+    "@cloudsforge/jobs": "file:../runtime/packages/jobs",
+    "@cloudsforge/lifecycle": "file:../runtime/packages/lifecycle",
+    "@cloudsforge/telemetry": "file:../runtime/packages/telemetry",
+    "postgres": "^3.4.5",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "jose": "^5.9.6",
+    "typescript": "^5.7.2"
+  }
+}
