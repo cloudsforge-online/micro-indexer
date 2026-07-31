@@ -5,29 +5,43 @@
 #
 #   docker build -t cloudsforge-indexer \
 #     --build-context runtimepkgs=../runtime \
-#     --build-context contractpkgs=../contracts .
+#     --build-context contractspkgs=../contracts .
 #
 # Both are temporary. Once the runtime and contract packages are published (AD-02), package.json
 # takes registry versions — a caret range for the runtime packages and an EXACT pin for
 # @cloudsforge/contracts-chain — the COPY lines marked below are deleted, the flags go away, and
 # this becomes an ordinary single-context build. Nothing else in this repository changes.
 #
-# They are named `runtimepkgs` and `contractpkgs` rather than `runtime` and `contracts` because a
+# They are named `runtimepkgs` and `contractspkgs` rather than `runtime` and `contracts` because a
 # build context and a build stage share one namespace, and the final stage below is `runtime`.
 
 # ----------------------------------------------------------------------------------- deps
 FROM node:22-slim AS deps
-RUN corepack enable
+# Pin pnpm in the image. The sibling workspaces are installed before this service's own
+# package.json is copied, so corepack has no packageManager field to read at that point and
+# would otherwise grab whatever is latest and then refuse to switch to the 11.9.0 the
+# siblings pin.
+RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
 WORKDIR /app
 
 # Temporary: the file: dependencies resolve to ../runtime and ../contracts relative to this
 # directory, so the packages must exist at those paths inside the image for the lockfile to stay
 # frozen. Only manifests and sources are copied — node_modules is excluded by the pnpm store
 # layout, not by a .dockerignore that would have to live in someone else's repository.
-COPY --from=runtimepkgs package.json pnpm-workspace.yaml /runtime/
+COPY --from=runtimepkgs package.json pnpm-workspace.yaml pnpm-lock.yaml /runtime/
 COPY --from=runtimepkgs packages /runtime/packages
-COPY --from=contractpkgs package.json pnpm-workspace.yaml /contracts/
-COPY --from=contractpkgs packages /contracts/packages
+COPY --from=contractspkgs package.json pnpm-workspace.yaml pnpm-lock.yaml /contracts/
+COPY --from=contractspkgs packages /contracts/packages
+
+# Install the siblings' OWN dependencies first. `link:` uses the sibling as-is and does not
+# manage its dependency tree, so /runtime's and /contracts' node_modules must exist
+# independently — both for `tsc` to resolve the sibling source it typechecks (jose,
+# @opentelemetry/api, @cloudsforge/contracts-chain) and for `node --import tsx` to load
+# @cloudsforge/* at run time. Without this the image builds a set of @cloudsforge symlinks
+# that point at source which cannot resolve its own imports.
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm-store,sharing=locked \
+    pnpm --dir /runtime install --frozen-lockfile --config.store-dir=/pnpm-store \
+ && pnpm --dir /contracts install --frozen-lockfile --config.store-dir=/pnpm-store
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 # `--frozen-lockfile` is the point of the step: a build that silently resolves a different
@@ -52,6 +66,11 @@ WORKDIR /app
 
 # No corepack, no pnpm, no build toolchain in the final image: fewer things an RCE can reach, and
 # nothing at runtime needs them.
+# The siblings come across too: /app/node_modules holds @cloudsforge/* as symlinks into
+# them, so without the targets the links dangle and the first `import '@cloudsforge/db'`
+# fails at run time.
+COPY --from=build /runtime /runtime
+COPY --from=build /contracts /contracts
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/tsconfig.json /app/tsconfig.base.json ./

@@ -1,0 +1,48 @@
+name: CI
+
+# The whole file. Every service in the estate calls the ONE reusable workflow in micro-org rather
+# than carrying its own copy — the measured target in docs/ecosystem/03 §5 is zero bespoke CI files.
+# If this repository ever needs a job of its own, that is the signal the reusable workflow needs an
+# input, not that this repository needs a fork of it.
+#
+# `service-ci.yml` typechecks, runs the suite against a real Postgres `ci_test` container, and FAILS
+# the build if the database-backed suite skipped — which is why the suite reads
+# INDEXER_TEST_DATABASE_URL spelled exactly as the workflow exports it. It also enforces the estate
+# rules (one database, no cross-service imports, the three health endpoints, no unleased timers) that
+# repository walls used to enforce for free.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: cloudsforge-online/micro-org/.github/workflows/service-ci.yml@main
+    with:
+      service: indexer
+      database-env-var: INDEXER_DATABASE_URL
+      port: 4008
+      # The image startup smoke test boots the real service, and `env.ts` validates its
+      # configuration at import — so the container needs the variables it declares, not just a
+      # database, or it exits before it serves /livez. These are CI-only NON-secrets: throwaway
+      # values that only have to clear a length check, and URLs that are never dialled because
+      # /livez needs no upstream. Never a real credential.
+      smoke-env: |
+        IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
+        IDENTITY_ISSUER=http://127.0.0.1:4001
+        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+    secrets:
+      # @cloudsforge/* is resolved by link:../runtime and link:../contracts, so CI checks out
+      # micro-runtime and micro-contracts as siblings — both private, so the workflow needs a
+      # contents:read token.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
+
+  hygiene:
+    uses: cloudsforge-online/micro-org/.github/workflows/secret-hygiene.yml@main
+    permissions:
+      contents: read
