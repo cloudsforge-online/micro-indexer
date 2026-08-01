@@ -186,6 +186,25 @@ export function createServer(deps: ServerDeps): Server {
 
     const url = new URL(req.url ?? '/', `http://${headerOf(req, 'host') ?? 'localhost'}`)
     const method = req.method ?? 'GET'
+
+    // A CORS preflight, answered before routing. A browser sends OPTIONS ahead of any request
+    // carrying `authorization` or `x-request-id`, and an unanswered preflight blocks the real
+    // request as surely as a 403 on it — the route table has no OPTIONS entries, so without this
+    // the preflight 404'd and every cross-origin read died before it was made. Only a genuine
+    // preflight (it names the method it asks about) is short-circuited; a bare OPTIONS still
+    // falls through to the 404 it deserves.
+    if (method === 'OPTIONS' && headerOf(req, 'access-control-request-method')) {
+      res.writeHead(204, {
+        'access-control-allow-origin': '*',
+        'access-control-allow-methods': 'GET, OPTIONS',
+        'access-control-allow-headers': 'authorization, content-type, x-request-id, traceparent, tracestate, baggage',
+        'access-control-max-age': '86400',
+        'x-request-id': requestId,
+      })
+      res.end()
+      return
+    }
+
     const matched = match(routes, method, url.pathname)
     // Unmatched paths collapse to one label. Using the raw path would let any caller mint
     // unbounded time series and take the scrape target down with cardinality.
@@ -802,6 +821,19 @@ function send(res: ServerResponse, reply: Reply, requestId: string): void {
     // has since gone unready — or a cached tip from four minutes ago — is exactly the lie this
     // whole arrangement exists to stop telling.
     'cache-control': 'no-store',
+    // `*`, deliberately — and this is a DIFFERENT decision from micro-faucet's allowlist, not a
+    // sloppier one. The faucet's POST pays out, so it names the one origin allowed to ask; these
+    // reads are anonymous public chain facts (see authoriseRead), and an origin allowlist here
+    // would re-paywall the chain for every origin nobody predicted — a community dashboard, a
+    // wallet, a researcher — which is the rule the anonymity change enforced. Wildcard origin
+    // carries no credentials semantics: browsers refuse `*` + credentials outright, so a cookie
+    // can never ride on it, and a presented bearer still has to survive verification like any
+    // other. Without this header the reads were public to curl and blocked to every browser on
+    // another host, which is why micro-network-site's chain panel could fetch nothing.
+    'access-control-allow-origin': '*',
+    // Without this a browser may read the body but not the request id — the one thing support
+    // asks a reporter to quote.
+    'access-control-expose-headers': 'x-request-id',
   })
   res.end(payload)
 }

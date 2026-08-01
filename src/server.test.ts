@@ -255,6 +255,39 @@ test('writes are untouched by the read relaxation', async () => {
   assert.equal((await call('/watch/ember/testnet/0x0000000000000000000000000000000000000001', { method: 'POST', token: 'reader' })).status, 403)
 })
 
+test('every answer carries the public-read CORS headers, or a browser cannot use the anonymity', async () => {
+  // The reads went anonymous and stayed browser-unreachable: public to curl, blocked by CORS to
+  // every page on another host — which is why micro-network-site's chain panel fetched nothing.
+  // `*` is the point, not a shortcut: an allowlist here would re-paywall the chain for origins
+  // nobody predicted, and wildcard origin carries no credentials semantics by construction.
+  const answer = await fetch(`${base}/chains/ember/testnet/status`)
+  assert.equal(answer.headers.get('access-control-allow-origin'), '*')
+  // A browser may read the body but not the request id without this — the one thing support asks
+  // a reporter to quote.
+  assert.match(answer.headers.get('access-control-expose-headers') ?? '', /x-request-id/)
+  await answer.arrayBuffer()
+})
+
+test('a preflight is answered before routing, and a bare OPTIONS is not', async () => {
+  // A browser sends OPTIONS before any request carrying `authorization` or `x-request-id`. The
+  // route table has no OPTIONS entries, so before this the preflight 404'd and blocked the real
+  // request as surely as refusing it.
+  const preflight = await fetch(`${base}/chains/ember/testnet/status`, {
+    method: 'OPTIONS',
+    headers: { 'access-control-request-method': 'GET', origin: 'http://localhost:5190' },
+  })
+  assert.equal(preflight.status, 204)
+  assert.equal(preflight.headers.get('access-control-allow-origin'), '*')
+  assert.match(preflight.headers.get('access-control-allow-headers') ?? '', /authorization/)
+  await preflight.arrayBuffer()
+
+  // Only a genuine preflight is short-circuited — it names the method it asks about. A bare
+  // OPTIONS is a prober and gets the 404 an unmatched request deserves.
+  const bare = await fetch(`${base}/chains/ember/testnet/status`, { method: 'OPTIONS' })
+  assert.equal(bare.status, 404)
+  await bare.arrayBuffer()
+})
+
 test('a verifier that cannot reach the JWKS is 503, never 401', async () => {
   // Answering 401 there signs every user in the estate out because identity had a bad minute.
   const answer = await call('/chains/ember/testnet/status', { token: 'unavailable' })
