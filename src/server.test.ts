@@ -225,20 +225,34 @@ test('the three probes every service must serve are unauthenticated', async () =
   assert.match(await metrics.text(), /indexer_lag_blocks/)
 })
 
-test('a read needs a service token carrying indexer:read', async () => {
-  assert.equal((await call('/chains/ember/testnet/status')).status, 401)
-  assert.equal((await call('/chains/ember/testnet/status', { token: 'nope' })).status, 401)
-  assert.equal((await call('/chains/ember/testnet/status', { token: 'unscoped' })).status, 403)
+test('a read needs no token at all, because what it returns is already public', async () => {
+  // These routes answer with chain facts anyone can obtain by running a Hearth node, and this
+  // service stores nothing linking an address to a person. There was no privacy for the old check
+  // to protect - only micro-explorer-web, which could not render a single panel to the public.
+  assert.equal((await call('/chains/ember/testnet/status')).status, 200)
+  assert.equal((await call('/chains/ember/testnet/status', { token: 'player' })).status, 200)
   assert.equal((await call('/chains/ember/testnet/status', { token: 'reader' })).status, 200)
+  assert.equal((await call('/chains/ember/testnet/status', { token: 'admin' })).status, 200)
   // One level of wildcard, which `indexer:*` is.
   assert.equal((await call('/chains/ember/testnet/status', { token: 'wildcard' })).status, 200)
 })
 
-test('an ordinary user token is refused; an operator is not', async () => {
-  // Address ownership is a fact `wallet` holds and this service does not, so the indexer must not
-  // be the place that guesses whether a user may read an address.
-  assert.equal((await call('/chains/ember/testnet/status', { token: 'player' })).status, 403)
-  assert.equal((await call('/chains/ember/testnet/status', { token: 'admin' })).status, 200)
+test('a token that IS presented is still verified, and never silently downgraded', async () => {
+  // The relaxation is "no token is fine", NOT "any token is fine". A broken token is an operator's
+  // misconfiguration and must surface as one; treating it as anonymous would hide the very fault
+  // it signals, and the caller would see a 200 that quietly ignored its credential.
+  assert.equal((await call('/chains/ember/testnet/status', { token: 'nope' })).status, 401)
+  // A SERVICE that presents a credential not granting this route has been misconfigured. Silently
+  // downgrading it to anonymous would turn a deployment mistake into a mystery.
+  assert.equal((await call('/chains/ember/testnet/status', { token: 'unscoped' })).status, 403)
+})
+
+test('writes are untouched by the read relaxation', async () => {
+  // /watch and /backfills spend money - a backfill is provider calls - and change what this
+  // service does rather than reporting what it knows. Anonymous must not reach either.
+  assert.equal((await call('/watch/ember/testnet/0x0000000000000000000000000000000000000001', { method: 'POST' })).status, 401)
+  assert.equal((await call('/backfills/ember/testnet', { method: 'POST' })).status, 401)
+  assert.equal((await call('/watch/ember/testnet/0x0000000000000000000000000000000000000001', { method: 'POST', token: 'reader' })).status, 403)
 })
 
 test('a verifier that cannot reach the JWKS is 503, never 401', async () => {
@@ -296,7 +310,10 @@ test('a malformed address, hash, height or limit is a 400 with a code', async ()
 })
 
 test('every error carries the request id the caller will quote back', async () => {
-  const response = await fetch(`${base}/chains/ember/testnet/status`, {
+  // A write, because reads no longer 401 — an anonymous read is a 200 now, so the old request
+  // here stopped producing the error body this test is about.
+  const response = await fetch(`${base}/backfills/ember/testnet`, {
+    method: 'POST',
     headers: { 'x-request-id': 'my-own-id' },
   })
   assert.equal(response.headers.get('x-request-id'), 'my-own-id')
@@ -384,15 +401,16 @@ test('a malformed contract or block bound is a 400 with a code, never an empty a
   }
 })
 
-test('both new routes need indexer:read like every other read', async () => {
+test('both new routes are anonymous like every other read', async () => {
   for (const path of [
     `/transactions/ember/testnet/${HASH}/confirmations`,
     `/addresses/ember/testnet/${ADDRESS}/token-balances`,
   ]) {
-    assert.equal((await call(path)).status, 401, path)
-    assert.equal((await call(path, { token: 'unscoped' })).status, 403, path)
-    assert.equal((await call(path, { token: 'player' })).status, 403, path)
+    assert.equal((await call(path)).status, 200, path)
+    assert.equal((await call(path, { token: 'player' })).status, 200, path)
     assert.equal((await call(path, { token: 'reader' })).status, 200, path)
+    // Presented-but-insufficient is still refused: see the note on authoriseRead.
+    assert.equal((await call(path, { token: 'unscoped' })).status, 403, path)
   }
 })
 
@@ -494,9 +512,9 @@ test('a chain this replica cannot ask is 503 with its reason, never "no token th
 
 test('the token route authorises and normalises exactly as every other read does', async () => {
   const path = `/tokens/ember/testnet/${TOKEN}`
-  assert.equal((await call(path)).status, 401)
+  assert.equal((await call(path)).status, 200, 'a token\'s on-chain state is a public fact')
+  assert.equal((await call(path, { token: 'player' })).status, 200)
   assert.equal((await call(path, { token: 'unscoped' })).status, 403)
-  assert.equal((await call(path, { token: 'player' })).status, 403, 'ownership is not this service to judge')
   assert.equal((await call(path, { token: 'admin' })).status, 200)
   assert.equal((await call(`/v1/tokens/ember/testnet/${TOKEN}`, { token: 'reader' })).status, 200)
 

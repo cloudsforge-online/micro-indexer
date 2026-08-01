@@ -382,7 +382,7 @@ function buildRoutes(): Route[] {
 /* ------------------------------------------------------------------ handlers */
 
 async function chainStatus(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
-  await authorise(ctx, deps, READ_SCOPE)
+  await authoriseRead(ctx, deps)
   const scope = scopeFrom(ctx)
   const done = deps.lifecycle.track()
   try {
@@ -394,7 +394,7 @@ async function chainStatus(ctx: RequestContext, deps: ServerDeps): Promise<Reply
 }
 
 async function addressActivity(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
-  await authorise(ctx, deps, READ_SCOPE)
+  await authoriseRead(ctx, deps)
   const scope = scopeFrom(ctx)
   const address = addressFrom(ctx, scope.chain)
   const limit = limitFrom(ctx)
@@ -410,7 +410,7 @@ async function addressActivity(ctx: RequestContext, deps: ServerDeps): Promise<R
 }
 
 async function transactionByHash(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
-  await authorise(ctx, deps, READ_SCOPE)
+  await authoriseRead(ctx, deps)
   const scope = scopeFrom(ctx)
   const hash = hashFrom(ctx, scope.chain)
   const done = deps.lifecycle.track()
@@ -435,7 +435,7 @@ async function transactionByHash(ctx: RequestContext, deps: ServerDeps): Promise
  * serve answers `not_found`, an unrun chain answers `unknown_chain`.
  */
 async function transactionConfirmations(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
-  await authorise(ctx, deps, READ_SCOPE)
+  await authoriseRead(ctx, deps)
   const scope = scopeFrom(ctx)
   const hash = hashFrom(ctx, scope.chain)
   const done = deps.lifecycle.track()
@@ -461,7 +461,7 @@ async function transactionConfirmations(ctx: RequestContext, deps: ServerDeps): 
  * a missing balance is missing, never zero, because zero is what evicts a token-gated member.
  */
 async function addressTokenBalances(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
-  await authorise(ctx, deps, READ_SCOPE)
+  await authoriseRead(ctx, deps)
   const scope = scopeFrom(ctx)
   const address = addressFrom(ctx, scope.chain)
   const contract = contractFrom(ctx, scope.chain)
@@ -491,7 +491,7 @@ async function addressTokenBalances(ctx: RequestContext, deps: ServerDeps): Prom
  * in `handle`.
  */
 async function tokenObservation(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
-  await authorise(ctx, deps, READ_SCOPE)
+  await authoriseRead(ctx, deps)
   const scope = scopeFrom(ctx)
   // The same normalisation an address gets everywhere else: a contract address is an address, and
   // a caller pasting the EIP-55 checksum form from an explorer must not get a different answer.
@@ -512,7 +512,7 @@ async function tokenObservation(ctx: RequestContext, deps: ServerDeps): Promise<
 }
 
 async function blockByHeight(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
-  await authorise(ctx, deps, READ_SCOPE)
+  await authoriseRead(ctx, deps)
   const scope = scopeFrom(ctx)
   const raw = ctx.params['height'] ?? ''
   if (!/^\d{1,15}$/.test(raw)) {
@@ -675,6 +675,46 @@ function limitFrom(ctx: RequestContext): number {
 }
 
 /* ------------------------------------------------------------------ auth */
+
+/**
+ * Reads are ANONYMOUS, because what they return is already public.
+ *
+ * Every route here answers with chain facts — a block, a transaction, a confirmation depth, a
+ * token's on-chain state, an address's activity and balances. Anyone may obtain all of it by
+ * running a Hearth node; Hearth is a public chain. This service also stores **nothing that links
+ * an address to a person**: ownership of an address is a fact `wallet` holds, deliberately, so the
+ * indexer is not the place that guesses at it. There is therefore no privacy for an auth check
+ * here to protect — it was a lock on a public library.
+ *
+ * It was not a harmless one. `micro-explorer-web` could not render a single panel: no token is a
+ * 401 and an ordinary customer is a 403, so the public block explorer showed nothing to the public.
+ * `docs/ecosystem/15-monetisation-model.md:50` states the rule this broke — "A public chain whose
+ * explorer is paywalled is not a public chain."
+ *
+ * What is NOT relaxed:
+ *
+ *   * `/watch` and `/backfills` still require `indexer:write`. They spend money — a backfill is
+ *     provider calls — and they change what this service does rather than reporting what it knows.
+ *   * A token that IS presented is still verified. Presenting a broken or expired one is an error
+ *     worth surfacing, and treating it as anonymous would hide exactly the auth misconfiguration
+ *     an operator needs to see.
+ *   * A **service** principal still needs `indexer:read`. A service that presents a credential
+ *     which does not grant this route has been misconfigured, and silently downgrading it to
+ *     anonymous would turn a deployment mistake into a mystery.
+ *
+ * Abuse is a rate limit at the edge, not an authentication check. An authentication check does not
+ * bound cost — a caller holding one valid service token can spend just as much.
+ */
+async function authoriseRead(ctx: RequestContext, deps: ServerDeps): Promise<Principal | null> {
+  const token = bearerFrom(headerOf(ctx.req, 'authorization'))
+  if (!token) return null
+  const principal = await deps.verifier.principal(token)
+  if (principal.kind === 'service') {
+    requireScope(principal, READ_SCOPE)
+    return principal
+  }
+  return principal
+}
 
 async function authorise(
   ctx: RequestContext,

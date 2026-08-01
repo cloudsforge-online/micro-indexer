@@ -6,7 +6,18 @@ supply and authorities as its contract reports them. It replaces the estate's ba
 deposit watcher, whose `let inFlight = false` is the reason two of its ticks can observe different
 totals for one address (`src/jobs.ts:6-9`).
 
-> **It holds no money and no ownership.** A user token reaches this service only as an **operator**:
+> **Reads need no token; writes do.** Every read here answers with a chain fact anyone can obtain
+> by running a Hearth node, and this service stores nothing linking an address to a person — so
+> there was no privacy for an auth check to protect. It used to require `indexer:read` or admin on
+> all nine routes, which meant `micro-explorer-web` could render nothing to the public and a public
+> chain had a paywalled explorer. `/watch` and `/backfills` still require `indexer:write`: they
+> spend provider calls and change what this service does rather than reporting what it knows.
+>
+> A token that IS presented is still verified — a broken one is a 401 and a service without
+> `indexer:read` is a 403, because silently downgrading a bad credential to anonymous would hide
+> the misconfiguration it signals. See `authoriseRead` in `src/server.ts`.
+>
+> **It holds no money and no ownership.** A user token reaches this service as an **operator**:
 > `authorise()` accepts a service principal with the right scope, and otherwise requires `admin`
 > (`src/server.ts:679-697`). The header states why — "ownership of an address is a fact `wallet`
 > holds, so the indexer must not be the place that guesses at it" (`src/server.ts:693-694`).
@@ -153,13 +164,13 @@ outside the outbox relay.
 | `GET` | `/livez` | **no auth** | **static, deliberately** — a liveness probe that consults a dependency restarts a healthy process every time the database blinks, turning a brief outage into a rolling restart of the whole estate (`src/server.ts:340`, reasoning at `:342-347`) |
 | `GET` | `/readyz` | **no auth** | 200/503. A **soft** probe failure leaves the report degraded but still ready, because taking a whole product out of rotation over a non-essential upstream is worse than serving without it (`src/server.ts:350`) |
 | `GET` | `/metrics` | **no auth** | Prometheus text (`src/server.ts:357`) — see Known gaps |
-| `GET` | `/chains/:chain/:network/status` | `indexer:read` or admin | checkpoint, lag, provider health, recent reorgs, halt state (`src/server.ts:384`, auth at `:385`) |
-| `GET` | `/addresses/:chain/:network/:address/activity` | `indexer:read` or admin | paged movements. Confirmations here are against the **tip** (`src/server.ts:396`, auth at `:397`) |
-| `GET` | `/addresses/:chain/:network/:address/token-balances` | `indexer:read` or admin | balances at a height, **absent unless coverage is complete** (`src/server.ts:463`, auth at `:464`) |
-| `GET` | `/transactions/:chain/:network/:hash` | `indexer:read` or admin | one transaction with its logs (`src/server.ts:412`, auth at `:413`) |
-| `GET` | `/transactions/:chain/:network/:hash/confirmations` | `indexer:read` or admin | **the crediting decision input**: `canonical`, `confirmations` against the head, `requiredConfirmations`, `confirmed`, `halted` (`src/server.ts:437`, auth at `:438`) |
-| `GET` | `/tokens/:chain/:network/:address` | `indexer:read` or admin | **contract state, read from the chain**: `name`, `symbol`, `decimals`, `totalSupply`, `cap`, `owner`, `mintAuthority`, `paused`, and the block it was observed at (`src/server.ts:493`, auth at `:494`) |
-| `GET` | `/blocks/:chain/:network/:height` | `indexer:read` or admin | one canonical block with its transactions (`src/server.ts:514`, auth at `:515`) |
+| `GET` | `/chains/:chain/:network/status` | **anonymous** | checkpoint, lag, provider health, recent reorgs, halt state (`src/server.ts:384`, auth at `:385`) |
+| `GET` | `/addresses/:chain/:network/:address/activity` | **anonymous** | paged movements. Confirmations here are against the **tip** (`src/server.ts:396`, auth at `:397`) |
+| `GET` | `/addresses/:chain/:network/:address/token-balances` | **anonymous** | balances at a height, **absent unless coverage is complete** (`src/server.ts:463`, auth at `:464`) |
+| `GET` | `/transactions/:chain/:network/:hash` | **anonymous** | one transaction with its logs (`src/server.ts:412`, auth at `:413`) |
+| `GET` | `/transactions/:chain/:network/:hash/confirmations` | **anonymous** | **the crediting decision input**: `canonical`, `confirmations` against the head, `requiredConfirmations`, `confirmed`, `halted` (`src/server.ts:437`, auth at `:438`) |
+| `GET` | `/tokens/:chain/:network/:address` | **anonymous** | **contract state, read from the chain**: `name`, `symbol`, `decimals`, `totalSupply`, `cap`, `owner`, `mintAuthority`, `paused`, and the block it was observed at (`src/server.ts:493`, auth at `:494`) |
+| `GET` | `/blocks/:chain/:network/:height` | **anonymous** | one canonical block with its transactions (`src/server.ts:514`, auth at `:515`) |
 | `POST` | `/watch/:chain/:network/:address` | `indexer:write` or admin | registers an address to be watched; records who asked (`src/server.ts:531`, auth at `:532`, attribution at `:545`) |
 | `POST` | `/backfills/:chain/:network` | `indexer:write` or admin | opens a historical backfill stream (`src/server.ts:553`, auth at `:554`) |
 
