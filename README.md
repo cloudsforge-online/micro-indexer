@@ -1,19 +1,29 @@
 # `micro-indexer`
 
 Follows chains and answers questions about what is on them: blocks, transactions, logs, per-address
-movements, token balances at a height, and the confirmation depth of one transaction. It replaces
-the estate's balance-probing deposit watcher, whose `let inFlight = false` is the reason two of its
-ticks can observe different totals for one address (`src/jobs.ts:6-9`).
+movements, token balances at a height, the confirmation depth of one transaction, and one token's
+supply and authorities as its contract reports them. It replaces the estate's balance-probing
+deposit watcher, whose `let inFlight = false` is the reason two of its ticks can observe different
+totals for one address (`src/jobs.ts:6-9`).
 
 > **It holds no money and no ownership.** A user token reaches this service only as an **operator**:
 > `authorise()` accepts a service principal with the right scope, and otherwise requires `admin`
-> (`src/server.ts:597-615`). The header states why — "ownership of an address is a fact `wallet`
-> holds, so the indexer must not be the place that guesses at it" (`src/server.ts:611-612`).
+> (`src/server.ts:679-697`). The header states why — "ownership of an address is a fact `wallet`
+> holds, so the indexer must not be the place that guesses at it" (`src/server.ts:693-694`).
 
 > **It stores no confirmation count.** There is no `confirmations` column anywhere, although
 > 04-domain-model §4.2 lists the field: a stored count is stale the moment the next block is mined,
 > and a crediting decision taken against a stale one is the exact failure the depth exists to
 > prevent (`src/migrations.ts:38-43`). It is computed at read time, every time.
+
+> **One read, and only one, leaves the database.** Every other answer here is assembled from rows
+> this service wrote. `GET /tokens/…` is contract state — supply, cap, owner, paused — which exists
+> nowhere but in the contract's own storage, so it is `eth_call`, at the head this service has
+> walked, after the node has been made to prove it still serves that block (`src/tokenstate.ts:207-218`).
+> It was added because `micro-mint` had no other way to satisfy 04-domain-model §5.3, and the
+> alternative — mint reading a chain itself — is what AD-07 exists to prevent. What is still refused
+> is `micro-market`'s token *facts*: keyed by a mint item URN this service has no registry for, and
+> needing complete holder history a follower that cold-starts at `tip − 2 × depth` does not have.
 
 > **It refuses to answer a balance it cannot prove.** When the canonical chain this service holds
 > does not run unbroken from genesis to the asked height, `balances` and `balance` are **absent —
@@ -96,6 +106,7 @@ distinction is easy to lose:
 | `GET …/token-balances` | stored canonical **head**, in one `REPEATABLE READ` snapshot | `src/reads.ts:474` |
 | `GET …/addresses/:address/activity` | `checkpoint.tipHeight` — the **provider-claimed tip** | `src/reads.ts:345`, `:355` |
 | `GET …/transactions/:hash` | `checkpoint.tipHeight` — the **provider-claimed tip** | `src/reads.ts:397`, `:415-418` |
+| `GET /tokens/…` | stored canonical **head**, *and* the node must still serve that block hash | `src/tokenstate.ts:196-218` |
 
 `src/reads.ts:18-30` scopes its own claim correctly ("Two reads that exist because a consumer was
 blocked"). Two other documents state it unqualified, and both are wrong as written — see
@@ -103,32 +114,66 @@ blocked"). Two other documents state it unqualified, and both are wrong as writt
 which is why they were the ones built that way; a consumer taking a *money* decision should use
 `/confirmations`, not the `confirmed` flag on an activity row.
 
+### 7. A state read at the head is not enough; the head has to be proved
+
+`GET /tokens/…` is the only read here that asks a third party a question, and that changes what
+"at the head" can mean. The five reads above answer out of rows this service owns, so the head is
+whatever this service stored. A contract-state call names a **height** to a node, and after a reorg
+the node has a different block at that number — so the height alone would attribute a supply figure
+to a block this service never walked.
+
+So the node's block at the head height is fetched first and its hash compared with the stored one
+(`src/tokenstate.ts:208-218`) — the same check `src/evm.ts` makes at the start of every follow tick.
+A mismatch returns **no observation at all**: 503 `head_diverged`, which is an honest "ask again in
+a moment". EIP-1898 would fold that into the call itself by passing the block *hash*; it is not used
+because the providers this pool fails over between do not all implement it, and a read that works on
+one provider and fails on the next is a read whose answer depends on the weather
+(`src/tokenstate.ts:48-51`).
+
+A **halted** chain is reported here rather than refused, unlike `token-balances`
+(`src/reads.ts:529-532`). That answer is derived from the whole history a halt says cannot be
+vouched for; this one depends on exactly one block, and the hash check has just proved the node
+still serves it (`src/tokenstate.ts:53-57`).
+
 ---
 
 ## Routes
 
 Read out of `src/server.ts`. **Every domain route is served twice — once under `/v1` and once
-unprefixed** (`src/server.ts:124`, mounted at `:328-332`). `/v1/…` is the estate convention and the
+unprefixed** (`src/server.ts:134`, mounted at `:374-378`). `/v1/…` is the estate convention and the
 one to use; the unprefixed form is the spelling in the indexer's own specification and in the
 operator runbooks written against it, and serving both costs one loop rather than a redirect every
-internal caller would have to follow (`src/server.ts:117-123`).
+internal caller would have to follow (`src/server.ts:127-133`).
 
 No route on this service takes an `Idempotency-Key`; the word does not appear in the repository
 outside the outbox relay.
 
 | Method | Path (also under `/v1`) | Who | What it does |
 | --- | --- | --- | --- |
-| `GET` | `/livez` | **no auth** | **static, deliberately** — a liveness probe that consults a dependency restarts a healthy process every time the database blinks, turning a brief outage into a rolling restart of the whole estate (`src/server.ts:282`, reasoning at `:284-289`) |
-| `GET` | `/readyz` | **no auth** | 200/503. A **soft** probe failure leaves the report degraded but still ready, because taking a whole product out of rotation over a non-essential upstream is worse than serving without it (`src/server.ts:292`) |
-| `GET` | `/metrics` | **no auth** | Prometheus text (`src/server.ts:299`) — see Known gaps |
-| `GET` | `/chains/:chain/:network/status` | `indexer:read` or admin | checkpoint, lag, provider health, recent reorgs, halt state (`src/server.ts:338`, auth at `:339`) |
-| `GET` | `/addresses/:chain/:network/:address/activity` | `indexer:read` or admin | paged movements. Confirmations here are against the **tip** (`src/server.ts:350`, auth at `:351`) |
-| `GET` | `/addresses/:chain/:network/:address/token-balances` | `indexer:read` or admin | balances at a height, **absent unless coverage is complete** (`src/server.ts:417`, auth at `:418`) |
-| `GET` | `/transactions/:chain/:network/:hash` | `indexer:read` or admin | one transaction with its logs (`src/server.ts:366`, auth at `:367`) |
-| `GET` | `/transactions/:chain/:network/:hash/confirmations` | `indexer:read` or admin | **the crediting decision input**: `canonical`, `confirmations` against the head, `requiredConfirmations`, `confirmed`, `halted` (`src/server.ts:391`, auth at `:392`) |
-| `GET` | `/blocks/:chain/:network/:height` | `indexer:read` or admin | one canonical block with its transactions (`src/server.ts:432`, auth at `:433`) |
-| `POST` | `/watch/:chain/:network/:address` | `indexer:write` or admin | registers an address to be watched; records who asked (`src/server.ts:449`, auth at `:450`, attribution at `:463`) |
-| `POST` | `/backfills/:chain/:network` | `indexer:write` or admin | opens a historical backfill stream (`src/server.ts:471`, auth at `:472`) |
+| `GET` | `/livez` | **no auth** | **static, deliberately** — a liveness probe that consults a dependency restarts a healthy process every time the database blinks, turning a brief outage into a rolling restart of the whole estate (`src/server.ts:340`, reasoning at `:342-347`) |
+| `GET` | `/readyz` | **no auth** | 200/503. A **soft** probe failure leaves the report degraded but still ready, because taking a whole product out of rotation over a non-essential upstream is worse than serving without it (`src/server.ts:350`) |
+| `GET` | `/metrics` | **no auth** | Prometheus text (`src/server.ts:357`) — see Known gaps |
+| `GET` | `/chains/:chain/:network/status` | `indexer:read` or admin | checkpoint, lag, provider health, recent reorgs, halt state (`src/server.ts:384`, auth at `:385`) |
+| `GET` | `/addresses/:chain/:network/:address/activity` | `indexer:read` or admin | paged movements. Confirmations here are against the **tip** (`src/server.ts:396`, auth at `:397`) |
+| `GET` | `/addresses/:chain/:network/:address/token-balances` | `indexer:read` or admin | balances at a height, **absent unless coverage is complete** (`src/server.ts:463`, auth at `:464`) |
+| `GET` | `/transactions/:chain/:network/:hash` | `indexer:read` or admin | one transaction with its logs (`src/server.ts:412`, auth at `:413`) |
+| `GET` | `/transactions/:chain/:network/:hash/confirmations` | `indexer:read` or admin | **the crediting decision input**: `canonical`, `confirmations` against the head, `requiredConfirmations`, `confirmed`, `halted` (`src/server.ts:437`, auth at `:438`) |
+| `GET` | `/tokens/:chain/:network/:address` | `indexer:read` or admin | **contract state, read from the chain**: `name`, `symbol`, `decimals`, `totalSupply`, `cap`, `owner`, `mintAuthority`, `paused`, and the block it was observed at (`src/server.ts:493`, auth at `:494`) |
+| `GET` | `/blocks/:chain/:network/:height` | `indexer:read` or admin | one canonical block with its transactions (`src/server.ts:514`, auth at `:515`) |
+| `POST` | `/watch/:chain/:network/:address` | `indexer:write` or admin | registers an address to be watched; records who asked (`src/server.ts:531`, auth at `:532`, attribution at `:545`) |
+| `POST` | `/backfills/:chain/:network` | `indexer:write` or admin | opens a historical backfill stream (`src/server.ts:553`, auth at `:554`) |
+
+**`GET /tokens/…` answers with five statuses, and the difference between two of them is the whole
+point.** A caller that cannot tell "there is no token there" from "I could not ask" will render the
+first when it means the second — which is exactly what `micro-mint` did on every project page.
+
+| Status | Code | Means |
+| --- | --- | --- |
+| 200 | — | the contract answered. Every field is nullable, and a null means **the contract does not implement that function** — a fixed-supply token has no `owner()`, `cap()` or `paused()` (`src/tokenstate.ts:101-109`) |
+| 404 | `token_not_found` | this service asked the chain and there is no contract answering `totalSupply()` at the block it has walked. A deployment above the head reads as this, and that is honest (`src/server.ts:503-506`) |
+| 404 | `not_found` | **the router's**, not this route's: a path this service does not serve. Nothing to do with any chain (`src/server.ts:234-241`) |
+| 503 | `chain_not_followed` · `nothing_indexed` · `head_diverged` · `rpc_unavailable` | we could not ask, and which of the four (`src/server.ts:274-283`) |
+| 501 | `family_not_supported` | this build cannot read contract state on that family at all, and retrying will not change it |
 
 **Three routes make no `authorise()` call**: `/livez`, `/readyz`, `/metrics`. They are the only
 ones — every domain route authorises on its first line.
@@ -262,8 +307,13 @@ provider API key lives (`src/env.ts:312-321`).
 
 Downstream consumers that this service was extended for: `micro-market`'s escrow gate
 (`/confirmations`) and `micro-community`'s token-gating job (`/token-balances`) — both recorded at
-`docs/ecosystem/18-build-status.md` §3.3j. `micro-wallet` composes this service with `ledger` and
-`custody`.
+`docs/ecosystem/18-build-status.md` §3.3j — and now `micro-mint`'s project pages (`/tokens/…`),
+which are the §3.3i case: its client asked for `/v1/chains/:chain/:network/tokens/:address`, a route
+nothing served, and read the 404 as "not yet indexed" for ever. `micro-mint`'s CI parses the route
+table out of `src/server.ts:153-163` and fails if any path it requests is not one this service
+serves, so **renaming a route here turns that repository's CI red**. The table's shape — one entry
+per line, method and path as single-quoted literals — is load-bearing for that reason
+(`src/server.ts:136-152`). `micro-wallet` composes this service with `ledger` and `custody`.
 
 ---
 
@@ -288,7 +338,7 @@ docker run -d --rm --name indexer-pg \
 INDEXER_TEST_DATABASE_URL=postgres://indexer:indexer@127.0.0.1:55434/indexer_test pnpm test
 ```
 
-**105 `test(` declarations**, `node:test` only. **Three of them are environmental skips**
+**130 `test(` declarations**, `node:test` only. **Three of them are environmental skips**
 (`src/hearth.test.ts:113`, `:123`, `:164`) and need a **live Hearth node** at
 `INDEXER_HEARTH_RPC_URL` (default `http://127.0.0.1:8545`). They skip cleanly when the node is
 unreachable, because a developer without a local chain must get a green run
@@ -315,19 +365,35 @@ skipped.
   `src/reads.ts:18-30` is the accurate statement. **Both are reported, not edited**: this task's
   remit is this repository's README, and `src/migrations.ts` is a released migration file whose text
   is checksummed.
+* **A token observation is up to nine RPC calls and nothing caches it.** One
+  `eth_getBlockByNumber` for the head-identity check, one `eth_getCode`, and one `eth_call` per
+  field (`src/tokenstate.ts:207-236`). `cache-control: no-store` is estate-wide and right — a
+  cached supply is the lie this route exists to stop telling — but a hot project page multiplies
+  that traffic against the provider. Recorded rather than pre-optimised: no measurement exists yet,
+  and the honest fix is a short-lived cache keyed by the observed block hash, which is already in
+  the answer.
+* **`/tokens/…` is the one read that needs a provider**, so a replica configured with no
+  `INDEXER_RPC_*` for a chain answers 503 `chain_not_followed` for it while still serving every
+  other read from the database (`src/index.ts:212`, `src/tokenstate.ts:185-193`). That is deliberate
+  — a read-only replica is a supported deployment — but it means the token route's availability is
+  not the same as the service's.
+* **`mintAuthority` over-reports rather than under-reports.** A contract with an `owner()` and no
+  mint function is reported as having mint authority. The error direction is chosen: a false
+  "somebody can still mint" makes a buyer more careful, and the opposite mistake is the one that
+  costs them money (`src/tokenstate.ts:274-279`).
 * **Three tests need a live chain.** See above. A CI run with no Hearth node reports green having
   skipped every real-chain assertion.
 * **Not every chain family is implemented.** `NotImplementedError` carries a `family` and a `phase`
   (`src/jobs.ts:161-169`); a deployment that names an unimplemented chain in `INDEXER_CHAINS` gets a
   dead-lettered follow job rather than a boot failure. The dead row is the record, and
   `jobs_overdue` is what surfaces it.
-* **`/metrics` is unauthenticated** (`src/server.ts:299`), unlike `micro-beacon`'s. Anything that
+* **`/metrics` is unauthenticated** (`src/server.ts:357`), unlike `micro-beacon`'s. Anything that
   can reach the port can read `indexer_lag_blocks`, `indexer_tip_height` and the reorg counters.
 * **`confirmed` on an activity row is depth-only.** Unlike `/confirmations`, it does not require
   `status = 'success'` and does not consult `halted` (`src/reads.ts:381-382` versus `:462-472`). A
   consumer taking a money decision should use `/confirmations`.
 * **The unversioned spelling is permanent.** Both `/v1/…` and bare paths are served
-  (`src/server.ts:124`); the estate has no gateway route map, so nothing decides which is public
+  (`src/server.ts:134`); the estate has no gateway route map, so nothing decides which is public
   (`docs/ecosystem/18-build-status.md` §3.3d, items 2–3).
 * **Ledger reconciliation is not wired to this service.** `micro-ledger`'s
   `reconciliation_runs.observed_source` has an `indexer` value and its job never supplies one, so

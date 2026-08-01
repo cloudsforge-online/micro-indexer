@@ -32,6 +32,7 @@ import { RpcPool } from './rpc.ts'
 import { RpcUnavailableError } from './rpc.ts'
 import { createServer } from './server.ts'
 import { TIP_STREAM, getCheckpoint } from './store.ts'
+import { rpcTokenObserver } from './tokenstate.ts'
 import { stubWorker, type ChainWorker } from './worker.ts'
 
 // 1. Environment. Importing `./env.ts` validated it; a missing or placeholder secret has already
@@ -85,6 +86,11 @@ try {
 //    function` on the first tick, whereas the stub fails with the family, the capability and the
 //    phase it is waiting on.
 const workers = new Map<string, ChainWorker>()
+//    The same pools the workers follow with, kept so the read side can make a contract-state call.
+//    ONE pool per chain, not two: a second pool would keep its own health, its own backoff and its
+//    own breaker, so a provider this process had already demoted for the follower would still be
+//    tried first by a page render — and `provider_health` would describe only half the traffic.
+const pools = new Map<string, RpcPool>()
 for (const chain of env.chains) {
   const family = familyOf(chain.scope.chain)
   const key = scopeKey(chain.scope)
@@ -104,6 +110,7 @@ for (const chain of env.chains) {
         provider,
       }),
   })
+  pools.set(key, pool)
   workers.set(
     key,
     new EvmWorker({
@@ -198,6 +205,11 @@ const server = createServer({
   metrics,
   verifier,
   reads: postgresReadStore(sql),
+  // A chain in `INDEXER_CHAINS` whose family has no worker has no pool either, so the token route
+  // answers 503 `chain_not_followed` for it rather than pretending. That is the same choice
+  // `stubWorker` makes above and for the same reason: an absent map entry fails as `undefined is
+  // not a function`, a present one fails with the chain it was asked about.
+  tokens: rpcTokenObserver({ sql, callers: pools }),
   // Sampled at scrape time rather than on a timer. There is no `setInterval` in this repository,
   // and CI greps for one — rule 8.
   beforeScrape: async () => {

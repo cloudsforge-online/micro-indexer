@@ -15,7 +15,13 @@ import type {
   TokenBalancesView,
   TransactionView,
 } from './reads.ts'
-import { READ_SCOPE, WRITE_SCOPE, createServer } from './server.ts'
+import { READ_SCOPE, ROUTE_PATTERNS, WRITE_SCOPE, createServer } from './server.ts'
+import {
+  TokenStateUnavailableError,
+  type TokenObservation,
+  type TokenObserver,
+  type TokenStateFault,
+} from './tokenstate.ts'
 
 /** What the fake store was asked, so a test can assert the normalisation that happened first. */
 const asked: Array<{ what: string; scope: ChainScope; arg?: string | number }> = []
@@ -115,6 +121,39 @@ const reads: ReadStore = {
   },
 }
 
+/**
+ * The token observer, faked at the interface rather than at the socket.
+ *
+ * `TOKEN` is observable, `0xd…` is an address with nothing at it, and a fault can be armed to check
+ * that a chain this replica cannot ask is never reported as an address with no token on it.
+ */
+let fault: TokenStateFault | null = null
+
+const tokens: TokenObserver = {
+  async observe(scope, address) {
+    asked.push({ what: 'token', scope, arg: address })
+    if (fault) throw new TokenStateUnavailableError(fault, `armed: ${fault}`)
+    if (address !== TOKEN) return null
+    return {
+      chain: scope.chain,
+      network: scope.network,
+      contractAddress: address,
+      name: 'Forge',
+      symbol: 'FRG',
+      decimals: 18,
+      totalSupply: '12000000000000000000000000',
+      cap: null,
+      owner: `0x${'e'.repeat(40)}`,
+      mintAuthority: true,
+      paused: false,
+      observedAtBlock: 98,
+      observedAtBlockHash: HASH,
+      tipHeight: 100,
+      halted: false,
+    } satisfies TokenObservation
+  },
+}
+
 const service = (scopes: readonly string[]): Principal => ({
   kind: 'service',
   service: 'wallet',
@@ -148,6 +187,7 @@ before(async () => {
       },
     },
     reads,
+    tokens,
   })
   await new Promise<void>((resolve) => server.listen(0, resolve))
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
@@ -394,4 +434,112 @@ test('the metrics route label is the pattern, never the resolved path', async ()
 
 test('an empty path segment does not match and become an empty query parameter', async () => {
   assert.equal((await call('/addresses/ember/testnet//activity', { token: 'reader' })).status, 404)
+})
+
+/* --------------------------------------- the capability micro-mint was blocked on */
+
+test('a token this service can observe answers with the contract state, not with a record', async () => {
+  // 04-domain-model §5.3: a project page renders supply and authorities from the INDEXER, "the
+  // on-chain reality, not the intent". Everything below is a fact about the contract; not one of
+  // these fields exists in any row this service writes.
+  const answer = await call(`/tokens/ember/testnet/${TOKEN}`, { token: 'reader' })
+  assert.equal(answer.status, 200)
+  assert.equal(answer.body['symbol'], 'FRG')
+  assert.equal(answer.body['mintAuthority'], true)
+  // Smallest units as a decimal STRING. A JSON number silently loses the low digits of any
+  // 18-decimal value above about 9 tokens, which on a supply figure is a wrong page.
+  assert.equal(typeof answer.body['totalSupply'], 'string')
+  assert.equal(answer.body['totalSupply'], '12000000000000000000000000')
+  // The answer says which block it is as at, so a stale page can say how stale it is.
+  assert.equal(answer.body['observedAtBlock'], 98)
+  assert.equal(answer.body['observedAtBlockHash'], HASH)
+})
+
+test('an address with no observable token is 404 token_not_found, never a bare 404', async () => {
+  // THE SPLIT THAT ENDS THE DEFECT. `micro-mint` read every 404 as "not indexed yet" and rendered
+  // that on every project page for ever, because the path it asked for did not exist. A caller
+  // branches on the CODE: `token_not_found` is this service's answer about a chain, `not_found` is
+  // this service saying it does not serve the path — which is the caller's own misconfiguration.
+  const empty = await call(`/tokens/ember/testnet/0x${'d'.repeat(40)}`, { token: 'reader' })
+  assert.equal(empty.status, 404)
+  assert.equal((empty.body['error'] as Record<string, string>)['code'], 'token_not_found')
+
+  const wrongPath = await call(`/chains/ember/testnet/tokens/${TOKEN}`, { token: 'reader' })
+  assert.equal(wrongPath.status, 404)
+  assert.equal(
+    (wrongPath.body['error'] as Record<string, string>)['code'],
+    'not_found',
+    'the exact path micro-mint used to request, and it must not look like an answer about a token',
+  )
+})
+
+test('a chain this replica cannot ask is 503 with its reason, never "no token there"', async () => {
+  // Every one of these is "we could not ask". Answering 404 would let a project page report a
+  // renounced-nothing token because a provider was rate-limiting us.
+  for (const [armed, status] of [
+    ['chain_not_followed', 503],
+    ['nothing_indexed', 503],
+    ['head_diverged', 503],
+    ['rpc_unavailable', 503],
+    // A family whose contract state this build cannot read will not start working on retry.
+    ['family_not_supported', 501],
+  ] as const) {
+    fault = armed
+    const answer = await call(`/tokens/ember/testnet/${TOKEN}`, { token: 'reader' })
+    assert.equal(answer.status, status, armed)
+    assert.equal((answer.body['error'] as Record<string, string>)['code'], armed)
+  }
+  fault = null
+})
+
+test('the token route authorises and normalises exactly as every other read does', async () => {
+  const path = `/tokens/ember/testnet/${TOKEN}`
+  assert.equal((await call(path)).status, 401)
+  assert.equal((await call(path, { token: 'unscoped' })).status, 403)
+  assert.equal((await call(path, { token: 'player' })).status, 403, 'ownership is not this service to judge')
+  assert.equal((await call(path, { token: 'admin' })).status, 200)
+  assert.equal((await call(`/v1/tokens/ember/testnet/${TOKEN}`, { token: 'reader' })).status, 200)
+
+  // Checksummed in every explorer, stored lower-cased here. Accepting one spelling and not the
+  // other would render "not yet indexed" for the address the customer actually holds.
+  asked.length = 0
+  const mixed = await call(`/tokens/ember/testnet/0x${'C'.repeat(40)}`, { token: 'reader' })
+  assert.equal(mixed.status, 200)
+  assert.equal(asked.at(-1)?.arg, TOKEN)
+
+  const malformed = await call('/tokens/ember/testnet/0xnothex', { token: 'reader' })
+  assert.equal(malformed.status, 400)
+  assert.equal((malformed.body['error'] as Record<string, string>)['code'], 'bad_address')
+  assert.equal((await call(`/tokens/doge/mainnet/${TOKEN}`, { token: 'reader' })).status, 404)
+})
+
+/* --------------------------------------- the table two other repositories read */
+
+test('the served route table is exactly this, in both spellings', () => {
+  // A GOLDEN LIST, and its value is that it is annoying to change. `micro-mint`'s CI parses these
+  // same paths out of `server.ts` and asserts its client asks for one of them, so a rename here is
+  // a consumer 404 there. Renaming a route means editing this list, which means noticing.
+  assert.deepEqual(
+    [...ROUTE_PATTERNS],
+    [
+      'GET /v1/chains/:chain/:network/status',
+      'GET /v1/addresses/:chain/:network/:address/activity',
+      'GET /v1/addresses/:chain/:network/:address/token-balances',
+      'GET /v1/transactions/:chain/:network/:hash',
+      'GET /v1/transactions/:chain/:network/:hash/confirmations',
+      'GET /v1/tokens/:chain/:network/:address',
+      'GET /v1/blocks/:chain/:network/:height',
+      'POST /v1/watch/:chain/:network/:address',
+      'POST /v1/backfills/:chain/:network',
+      'GET /chains/:chain/:network/status',
+      'GET /addresses/:chain/:network/:address/activity',
+      'GET /addresses/:chain/:network/:address/token-balances',
+      'GET /transactions/:chain/:network/:hash',
+      'GET /transactions/:chain/:network/:hash/confirmations',
+      'GET /tokens/:chain/:network/:address',
+      'GET /blocks/:chain/:network/:height',
+      'POST /watch/:chain/:network/:address',
+      'POST /backfills/:chain/:network',
+    ],
+  )
 })

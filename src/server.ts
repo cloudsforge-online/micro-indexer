@@ -54,6 +54,7 @@ import {
   type ChainScope,
 } from './chains.ts'
 import type { ReadStore } from './reads.ts'
+import { TokenStateUnavailableError, type TokenObserver } from './tokenstate.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
 export interface PrincipalVerifier {
@@ -66,6 +67,15 @@ export interface ServerDeps {
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
   readonly reads: ReadStore
+  /**
+   * Contract state, read from the chain rather than from this service's own rows.
+   *
+   * Separate from `reads` deliberately. Everything in `ReadStore` is a question about rows this
+   * service wrote and needs a database and nothing else; this one needs an RPC provider, and
+   * folding it in would make the read store a thing that cannot be constructed from a connection
+   * string. See `tokenstate.ts` for why the capability is here at all.
+   */
+  readonly tokens: TokenObserver
   /**
    * Refresh sampled gauges immediately before `/metrics` renders.
    *
@@ -122,6 +132,44 @@ interface Route {
  * both costs one loop rather than a redirect that every internal caller would have to follow.
  */
 const PREFIXES: readonly string[] = ['/v1', '']
+
+type Handler = (ctx: RequestContext, deps: ServerDeps) => Promise<Reply>
+
+/**
+ * THE ROUTE TABLE. Every domain path this service serves, once, in one place.
+ *
+ * It is a module-level constant rather than a local inside `buildRoutes` because it is read from
+ * outside this process: `micro-mint`'s CI checks out this repository and parses these lines, then
+ * asserts that every path its indexer client requests is one of them. That check exists because
+ * two clients have now been written against paths this service has never served — `micro-market`'s
+ * escrow gate (18-build-status §3.3i) and `micro-mint`'s `token()`, which asked for
+ * `/v1/chains/:chain/:network/tokens/:address` and got a 404 it read as "not indexed yet", so
+ * every ForgeMint project page rendered its supply and authorities as unknown, permanently.
+ *
+ * So the SHAPE of these lines is load-bearing: one entry per line, method and path as single-quoted
+ * literals. A path assembled from a variable would still route and would be invisible to the
+ * checker, which is worse than a wrong path because nothing would go red.
+ */
+const DOMAIN: ReadonlyArray<readonly [string, string, Handler]> = [
+  ['GET', '/chains/:chain/:network/status', chainStatus],
+  ['GET', '/addresses/:chain/:network/:address/activity', addressActivity],
+  ['GET', '/addresses/:chain/:network/:address/token-balances', addressTokenBalances],
+  ['GET', '/transactions/:chain/:network/:hash', transactionByHash],
+  ['GET', '/transactions/:chain/:network/:hash/confirmations', transactionConfirmations],
+  ['GET', '/tokens/:chain/:network/:address', tokenObservation],
+  ['GET', '/blocks/:chain/:network/:height', blockByHeight],
+  ['POST', '/watch/:chain/:network/:address', watchAddress],
+  ['POST', '/backfills/:chain/:network', requestBackfill],
+]
+
+/**
+ * The same table as `METHOD path` strings, both spellings, for anything that needs to compare
+ * against it. `server.test.ts` pins it exactly, so a rename here is a red run in the repository
+ * that owns the route rather than a silent 404 in a consumer six weeks later.
+ */
+export const ROUTE_PATTERNS: readonly string[] = Object.freeze(
+  PREFIXES.flatMap((prefix) => DOMAIN.map(([method, path]) => `${method} ${prefix}${path}`)),
+)
 
 export function createServer(deps: ServerDeps): Server {
   const routes = buildRoutes()
@@ -223,6 +271,16 @@ async function handle(
     if (err instanceof NotFoundError) {
       return errorReply(404, err.code, err.message, ctx.requestId)
     }
+    if (err instanceof TokenStateUnavailableError) {
+      // NEVER a 404. "I could not ask the chain" and "there is no token at that address" are
+      // different answers, and a consumer that cannot tell them apart renders the second when it
+      // means the first — which is the whole shape of the defect this route was added to close.
+      // A family this build cannot read is 501, because no amount of waiting will change it;
+      // everything else is 503, because it is a provider, a head or a follower that is behind.
+      const status = err.code === 'family_not_supported' ? 501 : 503
+      ctx.log.warn('token state could not be observed', { code: err.code, err })
+      return errorReply(status, err.code, err.message, ctx.requestId)
+    }
     ctx.log.error('unhandled request failure', { err })
     return errorReply(500, 'internal', 'the request could not be completed', ctx.requestId)
   }
@@ -312,21 +370,9 @@ function buildRoutes(): Route[] {
     }),
   ]
 
-  const domain: Array<[string, string, (ctx: RequestContext, deps: ServerDeps) => Promise<Reply>]> =
-    [
-      ['GET', '/chains/:chain/:network/status', chainStatus],
-      ['GET', '/addresses/:chain/:network/:address/activity', addressActivity],
-      ['GET', '/addresses/:chain/:network/:address/token-balances', addressTokenBalances],
-      ['GET', '/transactions/:chain/:network/:hash', transactionByHash],
-      ['GET', '/transactions/:chain/:network/:hash/confirmations', transactionConfirmations],
-      ['GET', '/blocks/:chain/:network/:height', blockByHeight],
-      ['POST', '/watch/:chain/:network/:address', watchAddress],
-      ['POST', '/backfills/:chain/:network', requestBackfill],
-    ]
-
   const built: Route[] = [...health]
   for (const prefix of PREFIXES) {
-    for (const [method, path, handler] of domain) {
+    for (const [method, path, handler] of DOMAIN) {
       built.push(route(method, `${prefix}${path}`, handler))
     }
   }
@@ -424,6 +470,42 @@ async function addressTokenBalances(ctx: RequestContext, deps: ServerDeps): Prom
   try {
     const answer = await deps.reads.tokenBalances(scope, address, contract, atBlock)
     return { status: 200, body: answer }
+  } finally {
+    done()
+  }
+}
+
+/**
+ * A token's supply and authorities, as the contract itself reports them.
+ *
+ * **The 404 is a genuine answer here, exactly as it is on `/confirmations`, and it carries its own
+ * code so that a caller can tell it from the router's.** `token_not_found` means this service asked
+ * the chain and there is no observable token at that address at the block it has walked — a fresh
+ * deployment above the head reads as this, and that is honest. The bare `not_found` a caller gets
+ * for an unrouted path means something entirely different: that the caller asked for a path this
+ * service does not serve. `micro-mint` conflated the two and rendered "not yet indexed" on every
+ * project page, for ever, and `micro-market` did the same to every escrow activation.
+ *
+ * Everything that is neither of those — no provider for the chain, nothing walked yet, a head the
+ * node no longer serves — is a 503 with its own code. See the `TokenStateUnavailableError` branch
+ * in `handle`.
+ */
+async function tokenObservation(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
+  await authorise(ctx, deps, READ_SCOPE)
+  const scope = scopeFrom(ctx)
+  // The same normalisation an address gets everywhere else: a contract address is an address, and
+  // a caller pasting the EIP-55 checksum form from an explorer must not get a different answer.
+  const address = addressFrom(ctx, scope.chain)
+  const done = deps.lifecycle.track()
+  try {
+    const observed = await deps.tokens.observe(scope, address)
+    if (!observed) {
+      throw new NotFoundError(
+        'token_not_found',
+        'no contract answering totalSupply() at that address, at the block this service has walked',
+      )
+    }
+    return { status: 200, body: observed }
   } finally {
     done()
   }
