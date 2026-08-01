@@ -446,6 +446,21 @@ test(
     const gone = await reads.tokenBalances(SCOPE, BOB, TOKEN, null)
     assert.equal(gone.coverage.complete, true)
     assert.equal(gone.balance, '0', 'the movement left the chain, so the holding left with it')
+
+    // A snapshot block this service has not reached is withheld rather than quietly answered from
+    // the head. A gate asking "what did they hold at block 900" must not be handed the balance at
+    // block 12 under a heading that says 900.
+    const ahead = await reads.tokenBalances(SCOPE, BOB, TOKEN, 900)
+    assert.equal(ahead.atBlock, 900, 'the question is echoed, not rewritten')
+    assert.equal(ahead.coverage.complete, false)
+    assert.equal(ahead.unavailable, 'coverage_incomplete')
+    assert.equal('balance' in ahead, false)
+
+    // And a block it HAS reached is answered as at that block, not as at the head.
+    const earlier = await reads.tokenBalances(SCOPE, BOB, TOKEN, 5)
+    assert.equal(earlier.atBlock, 5)
+    assert.equal(earlier.coverage.complete, true)
+    assert.equal(earlier.balance, '0', 'nothing had moved to this address by height five')
   },
 )
 

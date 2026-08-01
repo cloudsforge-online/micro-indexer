@@ -494,16 +494,21 @@ export function postgresReadStore(sql: Db): ReadStore {
           } satisfies TokenBalancesView
         }
 
-        const at = atBlock === null ? head.headHeight : Math.min(atBlock, head.headHeight)
+        // NOT clamped to the head. A caller that asks for a height this service has not reached is
+        // asking a question it cannot answer, and silently answering the head's question instead
+        // would hand back a number under a heading that says something else — which for a snapshot
+        // gate is a balance from the wrong moment. `complete` fails below, and the balance is
+        // withheld.
+        const at = atBlock ?? head.headHeight
         const coverage = await canonicalCoverage(tx, scope, at)
-        // Unbroken from genesis, or it is a window total rather than a balance. `blocks` counts the
-        // canonical rows at or below `at`; the range is [0, at] only if there are exactly that many
-        // of them, which is a hole check that costs no extra query.
+        // Unbroken from genesis THROUGH the asked height, or it is a window total rather than a
+        // balance. `blocks` counts the canonical rows at or below `at`; the range is [0, at] only
+        // if there are exactly `at + 1` of them, which is a hole check that costs no extra query
+        // and which also fails when `at` is above the head.
         const complete =
           coverage.lowestHeight === 0 &&
-          coverage.highestHeight !== null &&
-          coverage.blocks === coverage.highestHeight + 1 &&
-          coverage.highestHeight === at
+          coverage.highestHeight === at &&
+          coverage.blocks === at + 1
         const view = {
           chain: scope.chain,
           network: scope.network,
