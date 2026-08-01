@@ -1057,6 +1057,218 @@ export async function transactionByHash(
   }
 }
 
+/* ------------------------------------------------------------------ confirmation depth */
+
+/**
+ * Everything a confirmation answer needs, read in ONE statement.
+ *
+ * The single statement is the correctness, not an optimisation. `orphanAbove` retracts blocks,
+ * transactions and activity inside one transaction, so a statement sees either all of a reorg or
+ * none of it. Reading the transaction and the head in two round trips does not: a reorg landing
+ * between them yields a row that still says `included` counted against a head that has already
+ * moved past it, which is a confirmation for a transaction that is no longer on the chain — the
+ * exact wrong answer a depth exists to prevent.
+ *
+ * `head_height` is the highest CANONICAL block this indexer has stored, not `checkpoints.tip_height`.
+ * The tip is what a provider last claimed; the head is what this service has actually walked and
+ * would have detected a reorg in. Counting confirmations against blocks nobody here has looked at
+ * is over-reporting depth, and over-reporting depth is how money is credited early.
+ */
+export interface ConfirmationRecord {
+  readonly hash: string
+  readonly status: TransactionStatus
+  readonly blockHash: string | null
+  readonly blockHeight: number | null
+  /** The status of the block the transaction names. Null when it names none. */
+  readonly blockStatus: BlockStatus | null
+  /** Highest canonical stored block. Null when nothing has been indexed for this scope. */
+  readonly headHeight: number | null
+  /** The tip as last observed. Reported, never counted against. */
+  readonly tipHeight: number | null
+  readonly halted: boolean
+}
+
+export async function confirmationOf(
+  exec: Exec,
+  scope: ChainScope,
+  hash: string,
+): Promise<ConfirmationRecord | null> {
+  const rows = await exec<
+    {
+      hash: string
+      status: TransactionStatus
+      block_hash: string | null
+      block_height: string | null
+      block_status: BlockStatus | null
+      head_height: string | null
+      tip_height: string | null
+      halted: boolean
+    }[]
+  >`
+    select t.hash,
+           t.status,
+           t.block_hash,
+           t.block_height,
+           b.status as block_status,
+           (
+             select max(height) from blocks
+              where chain = ${scope.chain} and network = ${scope.network}
+                and status <> 'orphaned'
+           ) as head_height,
+           c.tip_height,
+           coalesce(c.halted, false) as halted
+      from transactions t
+      left join blocks b
+        on b.chain = t.chain and b.network = t.network and b.hash = t.block_hash
+      left join checkpoints c
+        on c.chain = t.chain and c.network = t.network and c.stream = ${TIP_STREAM}
+     where t.chain = ${scope.chain} and t.network = ${scope.network} and t.hash = ${hash}
+  `
+  const row = rows[0]
+  if (!row) return null
+  return {
+    hash: row.hash,
+    status: row.status,
+    blockHash: row.block_hash,
+    blockHeight: row.block_height === null ? null : Number(row.block_height),
+    blockStatus: row.block_status,
+    headHeight: row.head_height === null ? null : Number(row.head_height),
+    tipHeight: row.tip_height === null ? null : Number(row.tip_height),
+    halted: row.halted,
+  }
+}
+
+/* ------------------------------------------------------------------ token balances */
+
+/**
+ * What stretch of the canonical chain this service actually holds, at or below a height.
+ *
+ * A balance derived from movements is only a balance if the movements are ALL of them. This is the
+ * evidence for that: `lowestHeight` must be the genesis block and the range must have no hole, or
+ * the sum below is a sum over a window and not a balance. The follower cold-starts at
+ * `tip − 2 × depth` (`evm.ts` `#cursor`), so an indexer that was never backfilled to zero cannot
+ * answer, and must say so rather than return the window's total.
+ *
+ * The count rides `blocks_canonical_height_uniq` — `(chain, network, height) where status <>
+ * 'orphaned'` — which is the same partial index the reorg constraint needs, so this costs an
+ * index-only scan and no new index.
+ */
+export interface CanonicalCoverage {
+  /** Highest canonical block stored for the scope, ignoring the bound. Null when none is. */
+  readonly headHeight: number | null
+  readonly lowestHeight: number | null
+  readonly highestHeight: number | null
+  readonly blocks: number
+  readonly tipHeight: number | null
+  readonly halted: boolean
+}
+
+export async function canonicalCoverage(
+  exec: Exec,
+  scope: ChainScope,
+  upToHeight: number | null,
+): Promise<CanonicalCoverage> {
+  const rows = await exec<
+    {
+      head_height: string | null
+      lowest_height: string | null
+      highest_height: string | null
+      blocks: string
+      tip_height: string | null
+      halted: boolean
+    }[]
+  >`
+    select (
+             select max(height) from blocks
+              where chain = ${scope.chain} and network = ${scope.network}
+                and status <> 'orphaned'
+           ) as head_height,
+           (
+             select min(height) from blocks
+              where chain = ${scope.chain} and network = ${scope.network}
+                and status <> 'orphaned'
+                and (${upToHeight === null} or height <= ${upToHeight ?? 0})
+           ) as lowest_height,
+           (
+             select max(height) from blocks
+              where chain = ${scope.chain} and network = ${scope.network}
+                and status <> 'orphaned'
+                and (${upToHeight === null} or height <= ${upToHeight ?? 0})
+           ) as highest_height,
+           (
+             select count(*) from blocks
+              where chain = ${scope.chain} and network = ${scope.network}
+                and status <> 'orphaned'
+                and (${upToHeight === null} or height <= ${upToHeight ?? 0})
+           ) as blocks,
+           (
+             select tip_height from checkpoints
+              where chain = ${scope.chain} and network = ${scope.network}
+                and stream = ${TIP_STREAM}
+           ) as tip_height,
+           coalesce((
+             select halted from checkpoints
+              where chain = ${scope.chain} and network = ${scope.network}
+                and stream = ${TIP_STREAM}
+           ), false) as halted
+  `
+  const row = rows[0]
+  if (!row) throw new Error('coverage query returned no row')
+  return {
+    headHeight: row.head_height === null ? null : Number(row.head_height),
+    lowestHeight: row.lowest_height === null ? null : Number(row.lowest_height),
+    highestHeight: row.highest_height === null ? null : Number(row.highest_height),
+    blocks: Number(row.blocks),
+    tipHeight: row.tip_height === null ? null : Number(row.tip_height),
+    halted: row.halted,
+  }
+}
+
+export interface TokenBalanceRecord {
+  readonly contract: string
+  readonly balance: bigint
+  readonly movements: number
+}
+
+/**
+ * Net token movement for one address, at or below a height.
+ *
+ * `in` minus `out` over the included rows. Orphaned rows are excluded, which is what makes this
+ * reorg-correct: `orphanAbove` marks them in the same transaction that retracts the blocks, so a
+ * reader either sees the reorg or does not, and never sees a movement whose block has left.
+ *
+ * Native movements are excluded deliberately. A native balance would also have to account for gas
+ * paid, which `address_activity` does not record as a movement, so the sum would be short by every
+ * fee this address has ever paid — a plausible number and a wrong one.
+ */
+export async function tokenBalancesAt(
+  exec: Exec,
+  scope: ChainScope,
+  address: string,
+  upToHeight: number,
+  contract: string | null,
+): Promise<TokenBalanceRecord[]> {
+  const rows = await exec<{ contract: string; balance: string; movements: number }[]>`
+    select token_address as contract,
+           sum(case when direction = 'in' then amount else -amount end)::text as balance,
+           count(*)::int as movements
+      from address_activity
+     where chain = ${scope.chain} and network = ${scope.network}
+       and address = ${address}
+       and asset_kind = 'token'
+       and status = 'included'
+       and block_height <= ${upToHeight}
+       and (${contract === null} or token_address = ${contract ?? ''})
+     group by token_address
+     order by token_address
+  `
+  return rows.map((r) => ({
+    contract: r.contract,
+    balance: BigInt(r.balance),
+    movements: r.movements,
+  }))
+}
+
 export interface BlockRecord extends StoredBlock {
   readonly transactionHashes: readonly string[]
 }

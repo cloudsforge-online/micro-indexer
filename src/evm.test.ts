@@ -16,6 +16,7 @@ import { FakeChain, deadClient, fakeClient, type TxSpec } from './fakechain.ts'
 import { registerServiceMetrics } from './metrics.ts'
 import { CHAIN_TABLES, MIGRATIONS } from './migrations.ts'
 import { DEPOSIT_CONFIRMED, DEPOSIT_OBSERVED, type Db } from './outbox.ts'
+import { postgresReadStore } from './reads.ts'
 import { RpcPool } from './rpc.ts'
 import { TIP_STREAM, ensureBackfill, getCheckpoint, watchAddress } from './store.ts'
 
@@ -381,6 +382,124 @@ test(
 
     // No event was emitted for the replacement chain, because it paid nobody being watched.
     assert.deepEqual(await outboxTopics(), [DEPOSIT_OBSERVED, DEPOSIT_OBSERVED])
+  },
+)
+
+test(
+  'the reorg retracts a confirmation and a balance, so neither reports a state that was rolled back',
+  { skip },
+  async () => {
+    // The same simulated reorg as above, asked through the two READ capabilities rather than
+    // through the tables. These are the reads `micro-market`'s escrow gate and
+    // `micro-community`'s token gate take decisions on, so "a reorg cannot produce a wrong answer"
+    // has to be true of the answers and not only of the rows underneath them.
+    const chain = new FakeChain()
+    const transfer: TxSpec = {
+      from: ALICE,
+      to: TOKEN,
+      logs: [
+        {
+          address: TOKEN,
+          topics: [ERC20_TRANSFER_TOPIC, topicFor(ALICE), topicFor(BOB)],
+          data: amountData(5_000n),
+        },
+      ],
+      hash: `0x${'cd'.repeat(32)}`,
+    }
+    chain.appendMany(9) //       heights 1..9, genesis is 0
+    chain.append([transfer]) //  height 10
+    chain.appendMany(2) //       heights 11, 12
+
+    const worker = workerFor(chain)
+    await worker.follow(signal())
+    const reads = postgresReadStore(db())
+
+    // A balance may be believed here only because this chain was followed from its genesis block.
+    const held = await reads.tokenBalances(SCOPE, BOB, TOKEN, null)
+    assert.equal(held.coverage.fromHeight, 0)
+    assert.equal(held.coverage.complete, true, 'unbroken from genesis, so the sum is a balance')
+    assert.equal(held.balance, '5000')
+    assert.equal(held.unavailable, undefined)
+
+    const before = await reads.confirmation(SCOPE, transfer.hash!)
+    assert.equal(before?.canonical, true)
+    // Counted against the stored head of 12, not against whatever a provider last claimed the tip
+    // was: 12 − 10 + 1. The block containing a transaction is its first confirmation.
+    assert.equal(before?.confirmations, 3)
+    assert.equal(before?.requiredConfirmations, 60)
+    assert.equal(before?.confirmed, false, 'three is far below EMBER’s depth of sixty')
+
+    // History is rewritten from height 10. The transfer is no longer on the chain.
+    chain.reorg(10, 3)
+    const outcome = await worker.follow(signal())
+    assert.equal(outcome.reorgs.length, 1)
+    assert.equal(outcome.reorgs[0]?.depth, 3)
+
+    const after = await reads.confirmation(SCOPE, transfer.hash!)
+    assert.equal(after?.status, 'orphaned')
+    assert.equal(after?.canonical, false)
+    // Null, not a smaller number: a depth measured on a chain that no longer contains the
+    // transaction is not a smaller depth, it is not a depth at all.
+    assert.equal(after?.confirmations, null)
+    assert.equal(after?.confirmed, false)
+
+    const gone = await reads.tokenBalances(SCOPE, BOB, TOKEN, null)
+    assert.equal(gone.coverage.complete, true)
+    assert.equal(gone.balance, '0', 'the movement left the chain, so the holding left with it')
+  },
+)
+
+test(
+  'a chain followed from the tip withholds a balance rather than reporting the window total',
+  { skip },
+  async () => {
+    // The follower cold-starts at `tip − 2 × depth` unless told otherwise, so an indexer that was
+    // never backfilled to zero has seen a WINDOW of an address's movements and not all of them.
+    // Summing that window would produce a plausible number and a wrong one, and for a token gate a
+    // wrong low number evicts a member who never sold anything.
+    const chain = new FakeChain()
+    chain.appendMany(9)
+    chain.append([
+      {
+        from: ALICE,
+        to: TOKEN,
+        logs: [
+          {
+            address: TOKEN,
+            topics: [ERC20_TRANSFER_TOPIC, topicFor(ALICE), topicFor(BOB)],
+            data: amountData(5_000n),
+          },
+        ],
+      },
+    ])
+    chain.appendMany(2)
+
+    const worker = new EvmWorker({
+      sql: db(),
+      scope: SCOPE,
+      family: 'ember',
+      rpc: new RpcPool({
+        scope: SCOPE,
+        endpoints: [{ name: 'fake', url: 'http://fake.invalid/' }],
+        clientFor: () => fakeClient(chain),
+      }),
+      logger: silent,
+      metrics: registerServiceMetrics(new Metrics()),
+      producer: 'indexer',
+      followBatchBlocks: 100,
+      backfillBatchBlocks: 100,
+      startHeight: 8,
+    })
+    await worker.follow(signal())
+
+    const answer = await postgresReadStore(db()).tokenBalances(SCOPE, BOB, TOKEN, null)
+    assert.equal(answer.coverage.fromHeight, 8, 'the window this service actually holds')
+    assert.equal(answer.coverage.complete, false)
+    assert.equal(answer.unavailable, 'coverage_incomplete')
+    // ABSENT, not zero and not null. A consumer's rule for a missing balance is the same as its
+    // rule for an outage, and for a gate that rule is "do not demote".
+    assert.equal('balance' in answer, false)
+    assert.equal('balances' in answer, false)
   },
 )
 

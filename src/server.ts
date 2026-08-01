@@ -316,7 +316,9 @@ function buildRoutes(): Route[] {
     [
       ['GET', '/chains/:chain/:network/status', chainStatus],
       ['GET', '/addresses/:chain/:network/:address/activity', addressActivity],
+      ['GET', '/addresses/:chain/:network/:address/token-balances', addressTokenBalances],
       ['GET', '/transactions/:chain/:network/:hash', transactionByHash],
+      ['GET', '/transactions/:chain/:network/:hash/confirmations', transactionConfirmations],
       ['GET', '/blocks/:chain/:network/:height', blockByHeight],
       ['POST', '/watch/:chain/:network/:address', watchAddress],
       ['POST', '/backfills/:chain/:network', requestBackfill],
@@ -370,6 +372,58 @@ async function transactionByHash(ctx: RequestContext, deps: ServerDeps): Promise
     const transaction = await deps.reads.transaction(scope, hash)
     if (!transaction) throw new NotFoundError('transaction_not_found', 'no such transaction')
     return { status: 200, body: transaction }
+  } finally {
+    done()
+  }
+}
+
+/**
+ * Has this transaction reached its depth?
+ *
+ * **The 404 is load-bearing and is a genuine answer.** A transaction this indexer has never seen
+ * is 404 `transaction_not_found`; one it has seen and that has not reached its depth is 200 with
+ * `confirmed: false`. Those are different facts and a caller taking a money decision must be able
+ * to tell them apart — `micro-market` reported "the on-chain escrow is not confirmed yet" for
+ * every activation because a route-level 404 and a negative answer had been collapsed into one.
+ * A caller distinguishes them by the error CODE, not by the status: a path this service does not
+ * serve answers `not_found`, an unrun chain answers `unknown_chain`.
+ */
+async function transactionConfirmations(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
+  await authorise(ctx, deps, READ_SCOPE)
+  const scope = scopeFrom(ctx)
+  const hash = hashFrom(ctx, scope.chain)
+  const done = deps.lifecycle.track()
+  try {
+    const answer = await deps.reads.confirmation(scope, hash)
+    if (!answer) {
+      throw new NotFoundError(
+        'transaction_not_found',
+        'this indexer has never seen that transaction, which is not the same as unconfirmed',
+      )
+    }
+    return { status: 200, body: answer }
+  } finally {
+    done()
+  }
+}
+
+/**
+ * What an address holds of a token, at a block.
+ *
+ * Derived from `address_activity`, so the answer carries the coverage it was derived from and
+ * withholds the balance entirely when that coverage cannot support one. See `reads.tokenBalances`:
+ * a missing balance is missing, never zero, because zero is what evicts a token-gated member.
+ */
+async function addressTokenBalances(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
+  await authorise(ctx, deps, READ_SCOPE)
+  const scope = scopeFrom(ctx)
+  const address = addressFrom(ctx, scope.chain)
+  const contract = contractFrom(ctx, scope.chain)
+  const atBlock = blockFrom(ctx)
+  const done = deps.lifecycle.track()
+  try {
+    const answer = await deps.reads.tokenBalances(scope, address, contract, atBlock)
+    return { status: 200, body: answer }
   } finally {
     done()
   }
@@ -493,6 +547,39 @@ function hashFrom(ctx: RequestContext, chain: ChainId): string {
     throw new BadRequestError('bad_hash', 'hash is not a plausible length')
   }
   return raw
+}
+
+/**
+ * The optional `contract` filter, normalised exactly as an address is.
+ *
+ * Same normalisation and the same reason: token addresses are stored lower-cased and every wallet
+ * and explorer displays the EIP-55 checksum form, so accepting it verbatim would answer "this
+ * address has never held that token" for the spelling users actually have.
+ */
+function contractFrom(ctx: RequestContext, chain: ChainId): string | null {
+  const raw = (ctx.url.searchParams.get('contract') ?? '').trim()
+  if (raw === '') return null
+  const family = familyOf(chain)
+  if (family === 'evm' || family === 'ember') {
+    if (!EVM_ADDRESS.test(raw)) {
+      throw new BadRequestError('bad_contract', 'contract must be a 20-byte hex address')
+    }
+    return raw.toLowerCase()
+  }
+  if (raw.length < 16 || raw.length > 128) {
+    throw new BadRequestError('bad_contract', 'contract is not a plausible length')
+  }
+  return raw
+}
+
+/** The optional `block` bound. Absent means "as at the head this service has walked". */
+function blockFrom(ctx: RequestContext): number | null {
+  const raw = ctx.url.searchParams.get('block')
+  if (raw === null) return null
+  if (!/^\d{1,15}$/.test(raw)) {
+    throw new BadRequestError('bad_block', 'block must be a non-negative integer')
+  }
+  return Number(raw)
 }
 
 function limitFrom(ctx: RequestContext): number {

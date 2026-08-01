@@ -10,7 +10,9 @@ import type {
   ActivityPageView,
   BlockView,
   ChainStatus,
+  ConfirmationView,
   ReadStore,
+  TokenBalancesView,
   TransactionView,
 } from './reads.ts'
 import { READ_SCOPE, WRITE_SCOPE, createServer } from './server.ts'
@@ -20,6 +22,7 @@ const asked: Array<{ what: string; scope: ChainScope; arg?: string | number }> =
 
 const HASH = `0x${'a'.repeat(64)}`
 const ADDRESS = `0x${'b'.repeat(40)}`
+const TOKEN = `0x${'c'.repeat(40)}`
 
 const reads: ReadStore = {
   async status(scope) {
@@ -59,6 +62,44 @@ const reads: ReadStore = {
     asked.push({ what: 'transaction', scope, arg: hash })
     if (hash !== HASH) return null
     return { chain: scope.chain, hash } as unknown as TransactionView
+  },
+  async confirmation(scope, hash) {
+    asked.push({ what: 'confirmation', scope, arg: hash })
+    // Null is "never seen", which the route must turn into a 404 carrying its own code rather than
+    // into a 200 saying `confirmed: false`.
+    if (hash !== HASH) return null
+    return {
+      chain: scope.chain,
+      network: scope.network,
+      hash,
+      txUrn: `cf:chain:ember:${scope.network}:${hash}`,
+      explorerUrl: null,
+      status: 'success',
+      blockHash: HASH,
+      blockHeight: 40,
+      canonical: true,
+      confirmations: 61,
+      requiredConfirmations: 60,
+      confirmed: true,
+      indexedHeight: 100,
+      tipHeight: 100,
+      halted: false,
+    } satisfies ConfirmationView
+  },
+  async tokenBalances(scope, address, contract, atBlock) {
+    asked.push({ what: 'token-balances', scope, arg: `${address}|${contract ?? '*'}|${atBlock ?? '-'}` })
+    return {
+      chain: scope.chain,
+      network: scope.network,
+      address,
+      atBlock: atBlock ?? 100,
+      indexedHeight: 100,
+      tipHeight: 100,
+      halted: false,
+      coverage: { fromHeight: 0, toHeight: atBlock ?? 100, blocks: (atBlock ?? 100) + 1, complete: true },
+      balances: [{ contract: contract ?? TOKEN, balance: '5000' }],
+      ...(contract === null ? {} : { balance: '5000' }),
+    } satisfies TokenBalancesView
   },
   async block(scope, height) {
     asked.push({ what: 'block', scope, arg: height })
@@ -236,6 +277,83 @@ test('a missing transaction or block is 404 rather than an empty 200', async () 
   assert.equal((await call(`/transactions/ember/testnet/${missing}`, { token: 'reader' })).status, 404)
   assert.equal((await call('/blocks/ember/testnet/98', { token: 'reader' })).status, 200)
   assert.equal((await call('/blocks/ember/testnet/99', { token: 'reader' })).status, 404)
+})
+
+/* --------------------------------------- the two capabilities two services were blocked on */
+
+test('a never-seen transaction and an unconfirmed one are different answers', async () => {
+  // THE DEFECT THIS ROUTE EXISTS TO END. `micro-market` reported "the on-chain escrow is not
+  // confirmed yet" on every activation, because a 404 from a route that did not exist and a
+  // genuine negative had been collapsed into one value. They are separated here by the STATUS —
+  // 404 versus 200 — and, within the 404s, by the CODE, so a caller can tell "I have never seen
+  // this transaction" from "you asked for a path I do not serve".
+  const seen = await call(`/transactions/ember/testnet/${HASH}/confirmations`, { token: 'reader' })
+  assert.equal(seen.status, 200)
+  assert.equal(seen.body['confirmed'], true)
+  assert.equal(seen.body['confirmations'], 61)
+  assert.equal(seen.body['requiredConfirmations'], 60, 'the depth travels with the answer')
+
+  const never = `0x${'d'.repeat(64)}`
+  const unseen = await call(`/transactions/ember/testnet/${never}/confirmations`, { token: 'reader' })
+  assert.equal(unseen.status, 404)
+  assert.equal(
+    (unseen.body['error'] as Record<string, string>)['code'],
+    'transaction_not_found',
+    'a code a caller can branch on, not a bare 404',
+  )
+
+  // And the route-level 404 a caller must treat as an outage carries a different code entirely.
+  const noRoute = await call('/transactions/ember/testnet/nope/escrow', { token: 'reader' })
+  assert.equal(noRoute.status, 404)
+  assert.equal((noRoute.body['error'] as Record<string, string>)['code'], 'not_found')
+})
+
+test('the confirmations route does not shadow the transaction record route', async () => {
+  // Four segments and three segments are different patterns; a greedy matcher would have made one
+  // of these unreachable and the failure would have been a silent 404 on a money path.
+  assert.equal((await call(`/transactions/ember/testnet/${HASH}`, { token: 'reader' })).status, 200)
+  assert.equal(
+    (await call(`/v1/transactions/ember/testnet/${HASH}/confirmations`, { token: 'reader' })).status,
+    200,
+  )
+})
+
+test('the balance route normalises the contract as well as the address', async () => {
+  // Both are stored lower-cased and both are displayed checksummed. Accepting one and not the
+  // other answers "this member holds nothing", which demotes them.
+  asked.length = 0
+  const answer = await call(
+    `/addresses/ember/testnet/0x${'B'.repeat(40)}/token-balances?contract=0x${'C'.repeat(40)}&block=42`,
+    { token: 'reader' },
+  )
+  assert.equal(answer.status, 200)
+  assert.equal(asked.at(-1)?.arg, `${ADDRESS}|${TOKEN}|42`)
+  assert.equal(answer.body['balance'], '5000', 'a decimal string; a JSON number loses a uint256')
+  assert.equal(typeof answer.body['balance'], 'string')
+})
+
+test('a malformed contract or block bound is a 400 with a code, never an empty answer', async () => {
+  for (const [path, code] of [
+    [`/addresses/ember/testnet/${ADDRESS}/token-balances?contract=0xnothex`, 'bad_contract'],
+    [`/addresses/ember/testnet/${ADDRESS}/token-balances?block=-1`, 'bad_block'],
+    [`/addresses/ember/testnet/${ADDRESS}/token-balances?block=abc`, 'bad_block'],
+  ] as const) {
+    const answer = await call(path, { token: 'reader' })
+    assert.equal(answer.status, 400, path)
+    assert.equal((answer.body['error'] as Record<string, string>)['code'], code, path)
+  }
+})
+
+test('both new routes need indexer:read like every other read', async () => {
+  for (const path of [
+    `/transactions/ember/testnet/${HASH}/confirmations`,
+    `/addresses/ember/testnet/${ADDRESS}/token-balances`,
+  ]) {
+    assert.equal((await call(path)).status, 401, path)
+    assert.equal((await call(path, { token: 'unscoped' })).status, 403, path)
+    assert.equal((await call(path, { token: 'player' })).status, 403, path)
+    assert.equal((await call(path, { token: 'reader' })).status, 200, path)
+  }
 })
 
 test('the write routes need indexer:write and validate their input', async () => {

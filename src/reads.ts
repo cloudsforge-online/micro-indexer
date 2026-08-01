@@ -14,6 +14,20 @@
  *   - **`requiredConfirmations` is returned alongside.** A consumer must never have to hardcode a
  *     depth to interpret this API; the number comes from `contracts-chain` and travels with the
  *     answer.
+ *
+ * ## Two reads that exist because a consumer was blocked, and what makes them safe
+ *
+ * `confirmation` and `tokenBalances` were added for `micro-market`'s escrow gate and
+ * `micro-community`'s token-gating job (18-build-status §3.3j). Both are decision inputs rather
+ * than records, and both are read during reorgs, so both are built on the same two rules:
+ *
+ *   1. **Confirmations are counted against the stored canonical HEAD, never against
+ *      `checkpoints.tip_height`.** The tip is what a provider last claimed; the head is what this
+ *      service has actually walked and would have detected a reorg in. Counting against blocks
+ *      nobody here has looked at over-reports depth, and over-reporting depth credits early.
+ *   2. **A read that would straddle a reorg takes one snapshot.** `confirmation` is a single
+ *      statement; `tokenBalances` is a REPEATABLE READ transaction. `orphanAbove` retracts blocks,
+ *      transactions and activity together, so one snapshot sees all of a reorg or none of it.
  */
 
 import { chainSpec, explorerTxUrl, formatAmount, txUrn } from '@cloudsforge/contracts-chain'
@@ -31,10 +45,13 @@ import {
   TIP_STREAM,
   activityForAddress,
   blockWithTransactions,
+  canonicalCoverage,
+  confirmationOf,
   ensureBackfill,
   getCheckpoint,
   listProviderHealth,
   recentReorgs,
+  tokenBalancesAt,
   transactionByHash,
   watchAddress,
   type Exec,
@@ -158,6 +175,89 @@ export interface BlockView {
   readonly transactionHashes: readonly string[]
 }
 
+/**
+ * Whether a transaction has reached its depth, and nothing else.
+ *
+ * Separate from `TransactionView` because the two answer different questions for different
+ * callers. `TransactionView` is a record of what the chain said; this is a decision input, and a
+ * caller taking a money decision on it must not have to reconstruct the depth policy, guess at the
+ * head, or notice that `status` was `failed` — so `confirmed` is computed here, once, and every
+ * input it was computed from travels with it.
+ *
+ * **A transaction this indexer has never seen does not produce one of these.** The read returns
+ * null and the route answers 404 `transaction_not_found`, which is a different answer from a 200
+ * saying `confirmed: false`. Collapsing the two is precisely the defect that made
+ * `micro-market` report "the on-chain escrow is not confirmed yet" for a route that did not exist.
+ */
+export interface ConfirmationView {
+  readonly chain: string
+  readonly network: string
+  readonly hash: string
+  readonly txUrn: string
+  readonly explorerUrl: string | null
+  readonly status: string
+  readonly blockHash: string | null
+  readonly blockHeight: number | null
+  /** True while the block this transaction names is still on the canonical chain. */
+  readonly canonical: boolean
+  /** Null whenever there is nothing honest to count: pending, dropped, or reorged away. */
+  readonly confirmations: number | null
+  readonly requiredConfirmations: number
+  /**
+   * The one field a caller may act on. True only when the transaction succeeded, is on the
+   * canonical chain, has reached the depth `contracts-chain` publishes for this coin, and the
+   * chain is not halted.
+   */
+  readonly confirmed: boolean
+  /** The highest canonical block this service has walked. Confirmations are counted against it. */
+  readonly indexedHeight: number | null
+  /** What a provider last claimed the tip was. Reported for lag, never counted against. */
+  readonly tipHeight: number | null
+  readonly halted: boolean
+}
+
+export interface TokenBalanceView {
+  readonly contract: string
+  /** Smallest units, decimal string. A uint256 does not survive a JSON number. */
+  readonly balance: string
+}
+
+/**
+ * What the indexer's own record says an address holds, and the evidence that it is a balance.
+ *
+ * **A balance derived from movements is only a balance if the movements are all of them**, so
+ * `coverage` is not decoration: it is the reason the number may be believed. When the canonical
+ * chain this service holds does not run unbroken from the genesis block to `atBlock`, `balances`
+ * and `balance` are **absent** — not zero, not null. A consumer's rule is then the same as for an
+ * outage, which for `micro-community`'s gate means "do not demote", and that is the correct
+ * behaviour: an indexer that started following at the tip knows nothing about what anybody held.
+ */
+export interface CoverageView {
+  readonly fromHeight: number | null
+  readonly toHeight: number | null
+  readonly blocks: number
+  /** True only when the range is [0, atBlock] with no hole in it. */
+  readonly complete: boolean
+}
+
+export interface TokenBalancesView {
+  readonly chain: string
+  readonly network: string
+  readonly address: string
+  /** The height the answer is as at. Null when nothing has been indexed for this scope. */
+  readonly atBlock: number | null
+  readonly indexedHeight: number | null
+  readonly tipHeight: number | null
+  readonly halted: boolean
+  readonly coverage: CoverageView
+  /** Absent unless the answer may be believed. A missing balance is missing, never zero. */
+  readonly balances?: readonly TokenBalanceView[]
+  /** Absent unless a single `contract` was asked for and the answer may be believed. */
+  readonly balance?: string
+  /** Present exactly when a balance is withheld, naming which of the reasons applied. */
+  readonly unavailable?: 'nothing_indexed' | 'coverage_incomplete' | 'chain_halted' | 'negative'
+}
+
 export interface ReadStore {
   status(scope: ChainScope): Promise<ChainStatus>
   activity(
@@ -167,6 +267,14 @@ export interface ReadStore {
     cursor: string | null,
   ): Promise<ActivityPageView>
   transaction(scope: ChainScope, hash: string): Promise<TransactionView | null>
+  /** Null means this indexer has never seen the transaction, which is not "unconfirmed". */
+  confirmation(scope: ChainScope, hash: string): Promise<ConfirmationView | null>
+  tokenBalances(
+    scope: ChainScope,
+    address: string,
+    contract: string | null,
+    atBlock: number | null,
+  ): Promise<TokenBalancesView>
   block(scope: ChainScope, height: number): Promise<BlockView | null>
   watch(scope: ChainScope, address: string, label: string | null): Promise<void>
   requestBackfill(scope: ChainScope, from: number, to: number): Promise<string>
@@ -318,6 +426,123 @@ export function postgresReadStore(sql: Db): ReadStore {
           status: l.status,
         })),
       }
+    },
+
+    async confirmation(scope, hash) {
+      // One statement, deliberately — see `store.confirmationOf`. Two round trips can straddle a
+      // reorg and count a retracted transaction against a head that has already moved past it.
+      const record = await confirmationOf(exec, scope, hash)
+      if (!record) return null
+      const asset = assetOf(scope.chain)
+      const canonical =
+        record.status !== 'orphaned' &&
+        record.blockStatus !== null &&
+        record.blockStatus !== 'orphaned' &&
+        record.blockHeight !== null
+      const confirmations =
+        canonical && record.headHeight !== null && record.blockHeight !== null
+          ? confirmationsAt(record.headHeight, record.blockHeight)
+          : null
+      return {
+        chain: scope.chain,
+        network: scope.network,
+        hash: record.hash,
+        txUrn: txUrn(asset, scope.network, record.hash),
+        explorerUrl: explorerTxUrl(asset, scope.network, record.hash),
+        status: record.status,
+        blockHash: record.blockHash,
+        blockHeight: record.blockHeight,
+        canonical,
+        confirmations,
+        requiredConfirmations: requiredConfirmations(scope.chain),
+        // `status === 'success'` is not pedantry. An EVM transaction that reverted is mined, sits
+        // in a block, and accumulates depth exactly like one that worked — so a confirmation test
+        // that only counts blocks would tell a marketplace that a failed escrow deposit is
+        // confirmed. `halted` is honoured for the reason the halt exists: an alarming reorg means
+        // the assumption the depth encodes has failed, and depth is all this answer is made of.
+        confirmed:
+          canonical &&
+          record.status === 'success' &&
+          !record.halted &&
+          confirmations !== null &&
+          creditable(scope.chain, confirmations),
+        indexedHeight: record.headHeight,
+        tipHeight: record.tipHeight,
+        halted: record.halted,
+      }
+    },
+
+    async tokenBalances(scope, address, contract, atBlock) {
+      // REPEATABLE READ, and this is the whole of the reorg argument for a balance. Coverage, head
+      // and movements are three statements; under READ COMMITTED each gets its own snapshot, so a
+      // reorg landing between them yields movements from after the retraction summed against a
+      // coverage claim from before it. One snapshot makes the answer a statement about one state
+      // of the chain, which is the only kind of statement worth making about money.
+      return sql.begin('isolation level repeatable read', async (tx) => {
+        const head = await canonicalCoverage(tx, scope, null)
+        if (head.headHeight === null) {
+          return {
+            chain: scope.chain,
+            network: scope.network,
+            address,
+            atBlock: null,
+            indexedHeight: null,
+            tipHeight: head.tipHeight,
+            halted: head.halted,
+            coverage: { fromHeight: null, toHeight: null, blocks: 0, complete: false },
+            unavailable: 'nothing_indexed',
+          } satisfies TokenBalancesView
+        }
+
+        const at = atBlock === null ? head.headHeight : Math.min(atBlock, head.headHeight)
+        const coverage = await canonicalCoverage(tx, scope, at)
+        // Unbroken from genesis, or it is a window total rather than a balance. `blocks` counts the
+        // canonical rows at or below `at`; the range is [0, at] only if there are exactly that many
+        // of them, which is a hole check that costs no extra query.
+        const complete =
+          coverage.lowestHeight === 0 &&
+          coverage.highestHeight !== null &&
+          coverage.blocks === coverage.highestHeight + 1 &&
+          coverage.highestHeight === at
+        const view = {
+          chain: scope.chain,
+          network: scope.network,
+          address,
+          atBlock: at,
+          indexedHeight: head.headHeight,
+          tipHeight: head.tipHeight,
+          halted: head.halted,
+          coverage: {
+            fromHeight: coverage.lowestHeight,
+            toHeight: coverage.highestHeight,
+            blocks: coverage.blocks,
+            complete,
+          },
+        }
+
+        if (!complete) return { ...view, unavailable: 'coverage_incomplete' } satisfies TokenBalancesView
+        // A halted chain is one whose history this service has said it cannot vouch for. Answering
+        // a holdings question from it would let a reorg past the alarm depth evict a community's
+        // membership, which is the failure the halt was raised to stop.
+        if (head.halted) return { ...view, unavailable: 'chain_halted' } satisfies TokenBalancesView
+
+        const records = await tokenBalancesAt(tx, scope, address, at, contract)
+        // Impossible on a complete record — nobody sends what they never received — so it means the
+        // derivation is wrong rather than that the address is overdrawn. Withheld, never clamped:
+        // clamping to zero would turn a bug in this service into an eviction.
+        if (records.some((r) => r.balance < 0n)) {
+          return { ...view, unavailable: 'negative' } satisfies TokenBalancesView
+        }
+
+        const balances = records.map((r) => ({ contract: r.contract, balance: r.balance.toString() }))
+        return {
+          ...view,
+          balances,
+          // With coverage complete back to genesis, "no movement ever" IS a balance of zero, and a
+          // real answer that a gate should act on. It is derived, not defaulted.
+          ...(contract === null ? {} : { balance: balances[0]?.balance ?? '0' }),
+        } satisfies TokenBalancesView
+      })
     },
 
     async block(scope, height) {
