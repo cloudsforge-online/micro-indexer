@@ -52,7 +52,12 @@ export type BlockStatus = 'pending' | 'included' | 'finalised' | 'orphaned'
 export type TransactionStatus = 'pending' | 'success' | 'failed' | 'dropped' | 'orphaned'
 export type Direction = 'in' | 'out'
 export type AssetKind = 'native' | 'token'
-export type RowStatus = 'included' | 'orphaned'
+/**
+ * `conflicted` is reachable only on a UTXO family: it means the movement was retracted by a reorg
+ * AND the coins behind it have since been spent by a different canonical transaction, so it can
+ * never return. See `markConflictedSpends`.
+ */
+export type RowStatus = 'included' | 'orphaned' | 'conflicted'
 
 export interface BlockInput {
   readonly height: number
@@ -323,6 +328,107 @@ export async function upsertActivity(
   return { id: row.id, inserted: row.inserted }
 }
 
+/* ------------------------------------------------------------------ spent outpoints (UTXO) */
+
+/**
+ * One outpoint consumed by one transaction.
+ *
+ * Written only by the Bitcoin worker. An account-model family has no outpoints and writes none,
+ * which is why this lives beside the shared tables rather than inside them: the one schema across
+ * five families (migration 4's first invariant) is about not splitting `transactions` per family,
+ * not about pretending a UTXO chain has no facts of its own.
+ */
+export interface SpendInput {
+  readonly txid: string
+  readonly vout: number
+  readonly spendingTxHash: string
+  readonly blockHeight: number
+  readonly blockHash: string
+}
+
+/**
+ * Record what a transaction spent.
+ *
+ * `on conflict do update` on the full primary key makes re-indexing a block idempotent. What it
+ * does NOT swallow is a *different* transaction spending an outpoint that an included transaction
+ * already spent: that violates `spent_outpoints_canonical_uniq` and raises 23505, which is the
+ * database refusing to hold two canonical spends of one coin. See migration 5's header for why
+ * that belongs here rather than in a worker.
+ */
+export async function recordSpends(
+  exec: Exec,
+  scope: ChainScope,
+  spends: readonly SpendInput[],
+): Promise<void> {
+  for (const spend of spends) {
+    await exec`
+      insert into spent_outpoints (
+        chain, network, txid, vout, spending_tx_hash, block_height, block_hash, status
+      ) values (
+        ${scope.chain}, ${scope.network}, ${spend.txid}, ${spend.vout},
+        ${spend.spendingTxHash}, ${spend.blockHeight}, ${spend.blockHash}, 'included'
+      )
+      on conflict (chain, network, spending_tx_hash, txid, vout) do update set
+        block_height = excluded.block_height,
+        block_hash   = excluded.block_hash,
+        status       = 'included'
+    `
+  }
+}
+
+/**
+ * Mark, permanently, every retracted movement whose coins somebody else has now spent.
+ *
+ * This is the state an account chain does not have. After a Bitcoin reorg the worker re-indexes
+ * the winning chain; some transactions that left come back with the same txid and some do not,
+ * and the difference is not visible from the transaction itself — it is visible from whether the
+ * outpoints it spent are now spent by a *different* canonical transaction. Where they are, the
+ * orphaned transaction is dead rather than merely absent: no future block can contain it, because
+ * its inputs no longer exist to be spent.
+ *
+ * Two words rather than one, and both are already in the schema's vocabulary. The transaction
+ * becomes `dropped` (migration 4 already allows it) and its movements become `conflicted`
+ * (migration 5 widens the check for it). `orphaned` is deliberately not reused: a consumer that
+ * cannot tell "gone for now" from "gone for good" will wait for a confirmation that cannot come,
+ * and waiting forever on a deposit is the failure this distinction exists to prevent.
+ *
+ * Returns the number of transactions killed, so the caller can report it and a test can assert it.
+ */
+export async function markConflictedSpends(
+  exec: Exec,
+  scope: ChainScope,
+): Promise<{ transactions: number; activity: number }> {
+  const killed = await exec<{ hash: string }[]>`
+    update transactions t set status = 'dropped', updated_at = now()
+     where t.chain = ${scope.chain} and t.network = ${scope.network}
+       and t.status = 'orphaned'
+       and exists (
+         select 1
+           from spent_outpoints mine
+           join spent_outpoints theirs
+             on theirs.chain = mine.chain and theirs.network = mine.network
+            and theirs.txid = mine.txid and theirs.vout = mine.vout
+            and theirs.spending_tx_hash <> mine.spending_tx_hash
+            and theirs.status = 'included'
+          where mine.chain = t.chain and mine.network = t.network
+            and mine.spending_tx_hash = t.hash
+       )
+    returning t.hash
+  `
+  if (killed.length === 0) return { transactions: 0, activity: 0 }
+
+  const hashes = killed.map((k) => k.hash)
+  const activity = await exec<{ id: string }[]>`
+    update address_activity
+       set status = 'conflicted', updated_at = now()
+     where chain = ${scope.chain} and network = ${scope.network}
+       and tx_hash = any(${hashes}::text[])
+       and status = 'orphaned'
+    returning id
+  `
+  return { transactions: killed.length, activity: activity.length }
+}
+
 /* ------------------------------------------------------------------ reorg */
 
 export interface OrphanCounts {
@@ -370,8 +476,19 @@ export async function orphanAbove(
     update address_activity
        set status = 'orphaned', reorged_at = now(), confirmed_at = null, updated_at = now()
      where chain = ${scope.chain} and network = ${scope.network}
-       and block_height > ${ancestorHeight} and status <> 'orphaned'
+       and block_height > ${ancestorHeight} and status = 'included'
     returning id
+  `
+  // Releasing the outpoints is what makes the replacement chain indexable at all. The winning
+  // chain's transactions spend the same coins; if the losing chain's spends stayed `included`,
+  // `spent_outpoints_canonical_uniq` would reject every one of them at 23505. Retracting them in
+  // the SAME transaction as the blocks is therefore not tidiness, it is the reason the reorg can
+  // commit — and it is also what leaves the losing spends on the record for `markConflictedSpends`
+  // to compare against once the winner is indexed.
+  await exec`
+    update spent_outpoints set status = 'orphaned'
+     where chain = ${scope.chain} and network = ${scope.network}
+       and block_height > ${ancestorHeight} and status <> 'orphaned'
   `
   return {
     blockHashes: blocks.map((b) => b.hash),

@@ -23,6 +23,8 @@ import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@clo
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
 import { familyOf, scopeKey } from './chains.ts'
 import { SERVICE, env } from './env.ts'
+import { BitcoinNetworkError, BitcoinWorker } from './bitcoin.ts'
+import { SolanaClusterError, SolanaWorker } from './solana.ts'
 import { ChainIdentityError, EvmWorker } from './evm.ts'
 import { registerHandlers, recurringFor, rescheduleRecurring, seedRecurring } from './jobs.ts'
 import { CHAIN_HALTED, PROVIDER_FAILURES_TOTAL, registerServiceMetrics } from './metrics.ts'
@@ -94,7 +96,7 @@ const pools = new Map<string, RpcPool>()
 for (const chain of env.chains) {
   const family = familyOf(chain.scope.chain)
   const key = scopeKey(chain.scope)
-  if (family !== 'evm' && family !== 'ember') {
+  if (family !== 'evm' && family !== 'ember' && family !== 'bitcoin' && family !== 'solana') {
     workers.set(key, stubWorker(chain.scope, family))
     logger.warn('this family is stubbed in this build', { scope: key, family })
     continue
@@ -111,20 +113,26 @@ for (const chain of env.chains) {
       }),
   })
   pools.set(key, pool)
+  //    One shared shape, four families, and the differences live inside the workers rather than
+  //    here — `jobs.ts` and the read API still do not know which family they are driving.
+  const common = {
+    sql,
+    scope: chain.scope,
+    rpc: pool,
+    logger: logger.child({ scope: key }),
+    metrics,
+    producer: SERVICE,
+    followBatchBlocks: env.followBatchBlocks,
+    backfillBatchBlocks: env.backfillBatchBlocks,
+    startHeight: chain.startHeight,
+  }
   workers.set(
     key,
-    new EvmWorker({
-      sql,
-      scope: chain.scope,
-      family,
-      rpc: pool,
-      logger: logger.child({ scope: key }),
-      metrics,
-      producer: SERVICE,
-      followBatchBlocks: env.followBatchBlocks,
-      backfillBatchBlocks: env.backfillBatchBlocks,
-      startHeight: chain.startHeight,
-    }),
+    family === 'bitcoin'
+      ? new BitcoinWorker(common)
+      : family === 'solana'
+        ? new SolanaWorker(common)
+        : new EvmWorker({ ...common, family }),
   )
 }
 
@@ -141,7 +149,15 @@ for (const [key, worker] of workers) {
   try {
     await worker.verifyIdentity(controller.signal)
   } catch (err) {
-    if (err instanceof ChainIdentityError) {
+    // Three errors, one meaning: the endpoint is not the chain this scope claims. EVM proves it
+    // with a chain id, Bitcoin with `getblockchaininfo.chain` and Solana with a genesis hash, and
+    // all three are fatal at boot rather than a warning — indexing one chain into another chain's
+    // rows is silent for as long as nobody looks.
+    if (
+      err instanceof ChainIdentityError ||
+      err instanceof BitcoinNetworkError ||
+      err instanceof SolanaClusterError
+    ) {
       logger.fatal('configured provider serves a different chain', { scope: key, err })
       await sql.end({ timeout: 5 }).catch(() => {})
       process.exit(1)

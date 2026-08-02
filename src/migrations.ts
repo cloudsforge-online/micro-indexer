@@ -385,6 +385,76 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 5,
+    name: 'utxo',
+    // ------------------------------------------------------------------------------------------
+    // What a UTXO chain needs that an account chain does not, and why it is schema rather than
+    // handler code.
+    //
+    // On an account chain a transaction is identified by (sender, nonce), so a transaction that
+    // leaves the canonical chain in a reorg either comes back with the same hash or is superseded
+    // by one whose nonce makes the first unminable. Either way the indexer's `hash` primary key
+    // and its `orphaned` status describe the whole of it, and `evm.ts` needs nothing more.
+    //
+    // Bitcoin has no nonce. A transaction is a set of *outpoint* spends, and two different txids
+    // may spend the same outpoint — that is what a replace-by-fee is, and it is ordinary traffic
+    // rather than an attack. It creates a state the EVM worker has no word for: an orphaned
+    // transaction that can NEVER be re-mined, because the coins it spent have been spent by
+    // somebody else on the chain that won. A deposit consumer told only "orphaned" will wait for
+    // a confirmation that is never coming; it has to be told "conflicted".
+    //
+    // Deciding that needs the spends recorded, so they are recorded here — and the invariant that
+    // matters rides a partial unique index rather than a check in the worker:
+    //
+    //     at most ONE canonical transaction may spend a given outpoint.
+    //
+    // That is the double-spend rule itself, held by the database. It is the exact analogue of
+    // `blocks_canonical_height_uniq` in migration 4, and it earns its place the same way: a reorg
+    // repair that re-indexes a replacement without first orphaning the transaction it displaced
+    // raises 23505 and fails the job loudly, instead of quietly leaving two included transactions
+    // that both claim to have spent one coin. A guard in the worker could not do this, because
+    // the worker is exactly the thing that would be wrong.
+    up: `
+      create table if not exists spent_outpoints (
+        chain            text    not null,
+        network          text    not null,
+        -- The outpoint being spent: the funding transaction and its output index.
+        txid             text    not null,
+        vout             integer not null,
+        -- The transaction doing the spending.
+        spending_tx_hash text    not null,
+        block_height     bigint  not null,
+        block_hash       text    not null,
+        status           text    not null default 'included',
+        constraint spent_outpoints_pk
+          primary key (chain, network, spending_tx_hash, txid, vout),
+        constraint spent_outpoints_chain_ck ${CHAIN_CK},
+        constraint spent_outpoints_network_ck ${NETWORK_CK},
+        constraint spent_outpoints_status_ck check (status in ('included','orphaned')),
+        constraint spent_outpoints_vout_ck check (vout >= 0),
+        constraint spent_outpoints_tx_fk foreign key (chain, network, spending_tx_hash)
+          references transactions (chain, network, hash) on delete cascade
+      );
+
+      -- THE DOUBLE-SPEND INVARIANT. One canonical spender per outpoint, enforced by the database.
+      create unique index if not exists spent_outpoints_canonical_uniq
+        on spent_outpoints (chain, network, txid, vout)
+        where status = 'included';
+
+      -- The conflict lookup: given the outpoints an orphaned transaction spent, who spends them
+      -- now. Leading on the outpoint because that is the predicate.
+      create index if not exists spent_outpoints_outpoint_idx
+        on spent_outpoints (chain, network, txid, vout);
+
+      -- Widening a CHECK is an expand-only change: the previous release never writes the new
+      -- value, so a replica still running it is unaffected, and this may therefore ship in one
+      -- migration rather than four.
+      alter table address_activity drop constraint if exists address_activity_status_ck;
+      alter table address_activity add constraint address_activity_status_ck
+        check (status in ('included','orphaned','conflicted'));
+    `,
+  },
 ]
 
 /**
@@ -410,6 +480,7 @@ export const BASELINE_VERSION = 0
 
 /** Every table this service owns, in an order that is safe to truncate. Used by the DB tests. */
 export const CHAIN_TABLES: readonly string[] = Object.freeze([
+  'spent_outpoints',
   'address_activity',
   'logs',
   'transactions',

@@ -115,7 +115,13 @@ export interface ActivityView {
   readonly logIndex: number | null
   readonly blockHeight: number
   readonly blockHash: string
-  readonly status: 'included' | 'orphaned'
+  /**
+   * `conflicted` is reachable only on a UTXO family, and it is the one a consumer must branch on:
+   * an `orphaned` movement may still be re-mined, a `conflicted` one cannot, because the coins
+   * behind it have been spent by a different canonical transaction. A wallet that treats the two
+   * alike waits forever for a confirmation that is not coming. See `store.markConflictedSpends`.
+   */
+  readonly status: 'included' | 'orphaned' | 'conflicted'
   readonly confirmations: number | null
   readonly confirmed: boolean
   readonly firstSeenAt: string
@@ -350,8 +356,11 @@ export function postgresReadStore(sql: Db): ReadStore {
         tipHeight,
         requiredConfirmations: requiredConfirmations(scope.chain),
         items: page.items.map((item) => {
+          // `!== 'included'` rather than `=== 'orphaned'`: a conflicted movement is off the chain
+          // just as firmly as an orphaned one, and reporting a depth for it would be reporting a
+          // depth for a transaction no block can ever contain.
           const confirmations =
-            tipHeight === null || item.status === 'orphaned'
+            tipHeight === null || item.status !== 'included'
               ? null
               : confirmationsAt(tipHeight, item.blockHeight)
           return {
