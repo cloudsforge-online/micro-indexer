@@ -86,26 +86,37 @@ export class NotImplementedError extends Error {
 export const STUB_PHASE = 'phase P5 (EPC-14)'
 
 /**
- * What each unbuilt family will actually have to do differently.
+ * What each family has to do differently.
  *
  * This is not decoration. It is the domain knowledge in forge-pay's `chains.ts` — which this
  * service supersedes and which will be deleted — written where the person who builds the worker
  * will read it. Losing it costs the same three bugs a second time.
+ *
+ * A family whose worker now exists keeps its note rather than having it replaced with "Built.":
+ * the note is *why* the worker looks the way it does, and it is the thing a reviewer needs when
+ * asking whether a change to `bitcoin.ts` or `solana.ts` is still correct. Only the families still
+ * served by `stubWorker` are read from here at runtime.
  */
 export const FAMILY_NOTES: Readonly<Record<ChainFamily, string>> = Object.freeze({
-  evm: 'Built.',
+  evm: 'Built — evm.ts.',
   ember:
     'Served by the EVM worker: Hearth exposes Ethereum JSON-RPC on 8545 with chain id 7411 ' +
     'mainnet and 7412 testnet, and a confirmation depth of 60 rather than 12.',
   bitcoin:
-    'UTXO, not accounts: address activity is per output, and a transaction credits an address ' +
-    'once per output paying it rather than once. Esplora chain_stats is a CUMULATIVE received ' +
-    'counter unaffected by spending, so the reorg repair cannot simply re-read a balance. ' +
-    'Confirmations count the mining block as the first.',
+    'Built — bitcoin.ts. UTXO, not accounts: address activity is per output, and a transaction ' +
+    'credits an address once per output paying it rather than once. Esplora chain_stats is a ' +
+    'CUMULATIVE received counter unaffected by spending, so the reorg repair cannot simply ' +
+    're-read a balance — it walks to a common ancestor instead. Confirmations count the mining ' +
+    'block as the first. The case with no EVM analogue is replace-by-fee: an orphaned ' +
+    'transaction whose outpoints the winning chain has spent can never be re-mined, so it is ' +
+    'marked conflicted rather than merely orphaned. See spent_outpoints in migration 5.',
   solana:
-    'Slots, not heights, and slots can be skipped — a missing slot is normal and must not be ' +
-    'read as a gap. The finalized commitment is the chain’s own final view rather than a ' +
-    'lagged one, so a reorg below it does not occur and the reorg walk applies only above it.',
+    'Built — solana.ts. Slots, not heights, and slots can be skipped — a missing slot is normal ' +
+    'and must not be read as a gap, so the follower enumerates with getBlocks rather than ' +
+    'counting. The parent is parentSlot, which is usually not slot − 1. The finalized commitment ' +
+    'is the chain’s own final view rather than a lagged one, so a fork below it does not occur ' +
+    'and is halted rather than repaired if it appears to; above it a fork is ordinary at any ' +
+    'slot distance. Crediting requires finality AND the declared depth of 32, never either alone.',
   xrp:
     'Validated ledgers, and one confirmation. Two traps: an account carries a BASE RESERVE, so ' +
     'its balance is not its received total and never was; and XRP has no network binding in the ' +
