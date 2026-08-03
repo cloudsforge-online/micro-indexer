@@ -1,5 +1,7 @@
 # `micro-indexer`
 
+[![ci](https://github.com/cloudsforge-online/micro-indexer/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-indexer/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![tests](https://img.shields.io/badge/tests-real%20Postgres-4169E1?logo=postgresql&logoColor=white)](./.github/workflows/ci.yml)
+
 Follows chains and answers questions about what is on them: blocks, transactions, logs, per-address
 movements, token balances at a height, the confirmation depth of one transaction, and one token's
 supply and authorities as its contract reports them. It replaces the estate's balance-probing
@@ -417,5 +419,5 @@ skipped.
 
 ## Provenance
 
-The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
-human direction and review.
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, assets
+generated with **FLUX 2 Pro**, under human direction and review.
