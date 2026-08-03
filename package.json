@@ -16,10 +16,14 @@
     "check": "pnpm typecheck && pnpm test"
   },
   "_runtimeDependencies": [
-    "The six @cloudsforge/* runtime packages and @cloudsforge/contracts-chain are consumed as",
-    "file: paths because they are not published yet. Once AD-02 lands they become registry",
-    "versions and these paths — plus the two named build contexts in the Dockerfile and the",
-    "extra checkouts in CI — are deleted. Nothing else in this repository changes.",
+    "The six @cloudsforge/* runtime packages, @cloudsforge/contracts-chain and",
+    "@cloudsforge/contracts-events are consumed as file:/link: paths because they are not published",
+    "yet. Once AD-02 lands they become registry versions and these paths — plus the two named build",
+    "contexts in the Dockerfile and the extra checkouts in CI — are deleted. Nothing else in this",
+    "repository changes.",
+    "@cloudsforge/contracts-events is `link:` rather than `file:` for the reason ledger, wallet and",
+    "settlement use link: for it: it is source consumed by tsc, not a package to be copied into this",
+    "tree, and the Dockerfile already carries the whole contracts checkout as a named build context.",
     "The runtime packages take a caret range on publish ('^1.0.0'). contracts-chain does NOT:",
     "it takes an EXACT pin ('1.0.0'), because wallet, settlement, custody and indexer must agree",
     "byte-for-byte on confirmation depths and amount maths. A caret there is money credited at",
@@ -31,6 +35,7 @@
   "dependencies": {
     "@cloudsforge/auth": "file:../runtime/packages/auth",
     "@cloudsforge/contracts-chain": "file:../contracts/packages/chain",
+    "@cloudsforge/contracts-events": "link:../contracts/packages/events",
     "@cloudsforge/db": "file:../runtime/packages/db",
     "@cloudsforge/http": "file:../runtime/packages/http",
     "@cloudsforge/jobs": "file:../runtime/packages/jobs",

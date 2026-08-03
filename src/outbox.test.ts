@@ -19,9 +19,9 @@ const SECRET = 'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4'
 
 test('both topics obey the registry’s shape rule, so registering them later is not a rename', () => {
   // `<service>.<aggregate>.<past-tense-verb>`, three lowercase segments — the pattern
-  // @cloudsforge/contracts-events enforces. Neither topic is in its TOPICS map yet, because that
-  // package is exact-pinned and adding to it is a coordinated release; this is what makes the
-  // eventual addition additive.
+  // @cloudsforge/contracts-events enforces. Neither topic is in its TOPICS map yet; `src/topics.ts`
+  // carries the proposal for each, and `topics.test.ts` fails the day contracts adopts one and the
+  // quarantine entry is not deleted. The shape rule is what makes that addition additive.
   const shape = /^[a-z0-9]+(?:_[a-z0-9]+)*(?:\.[a-z0-9]+(?:_[a-z0-9]+)*){2}$/
   for (const topic of [DEPOSIT_OBSERVED, DEPOSIT_CONFIRMED]) {
     assert.match(topic, shape, topic)
@@ -32,12 +32,16 @@ test('both topics obey the registry’s shape rule, so registering them later is
 test('a signature verifies, and one byte of tampering does not', () => {
   const body = JSON.stringify({ id: 'e-1', topic: DEPOSIT_OBSERVED })
   const signature = signEvent(body, SECRET)
-  assert.match(signature, /^sha256=[0-9a-f]{64}$/)
+  // The CONTRACT's scheme — `t=<seconds>,v1=<hmac over "<seconds>.<body>">`. This asserted
+  // `/^sha256=[0-9a-f]{64}$/` for the life of the service, which is the drifted local copy the
+  // migration removed; `topics.test.ts` holds the full comparison against the contract's verifier.
+  assert.match(signature, /^t=\d+,v1=[0-9a-f]{64}$/)
   assert.equal(verifyEventSignature(body, SECRET, signature), true)
   assert.equal(verifyEventSignature(`${body} `, SECRET, signature), false)
   assert.equal(verifyEventSignature(body, 'a different secret entirely!!', signature), false)
-  // A length mismatch must not throw out of timingSafeEqual.
+  // A malformed header must be refused rather than throw out of the comparison.
   assert.equal(verifyEventSignature(body, SECRET, 'sha256=short'), false)
+  assert.equal(verifyEventSignature(body, SECRET, 't=1,v1=short'), false)
 })
 
 /* ------------------------------------------------------------------ database-backed */

@@ -40,17 +40,35 @@ const SCOPE: ChainScope = { chain: 'ember', network: 'testnet' }
 /** Small enough to be quick, large enough for the parent-hash chain to mean something. */
 const WINDOW = 8
 
+/**
+ * Is a Hearth node answering?
+ *
+ * **A REFERENCED TIMER, NOT `AbortSignal.timeout`.** That helper's timer is `unref()`'d, so it
+ * cannot fire once nothing else is holding the event loop open — and this call is `await`ed at
+ * module scope, which means a probe that never settles hangs the whole file and takes the indexer
+ * suite with it. `@cloudsforge/http` had the identical bug in its own DEADLINE
+ * (`runtime/packages/http/src/index.ts:305`) and its comment records this as the FOURTH instance in
+ * the estate; the rule it states is that `unref()` belongs on a timer nobody is waiting for, and
+ * somebody is waiting for this one.
+ *
+ * The timer is cleared in `finally` so a fast answer does not keep the process alive for two
+ * seconds afterwards, which is the opposite mistake and just as real.
+ */
 async function reachable(): Promise<boolean> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 2_000)
   try {
     const response = await fetch(RPC_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }),
-      signal: AbortSignal.timeout(2_000),
+      signal: controller.signal,
     })
     return response.ok
   } catch {
     return false
+  } finally {
+    clearTimeout(timer)
   }
 }
 

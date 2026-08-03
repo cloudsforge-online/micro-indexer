@@ -15,7 +15,16 @@ import {
 import { FakeChain, deadClient, fakeClient, type TxSpec } from './fakechain.ts'
 import { registerServiceMetrics } from './metrics.ts'
 import { CHAIN_TABLES, MIGRATIONS } from './migrations.ts'
-import { DEPOSIT_CONFIRMED, DEPOSIT_OBSERVED, type Db } from './outbox.ts'
+import { verifyDelivery } from '@cloudsforge/contracts-events'
+import {
+  DEPOSIT_CONFIRMED,
+  DEPOSIT_OBSERVED,
+  buildEnvelope,
+  signEvent,
+  type Db,
+  type OutboxRow,
+} from './outbox.ts'
+import { KEYED_BY, envelopeDefects } from './topics.ts'
 import { postgresReadStore } from './reads.ts'
 import { RpcPool } from './rpc.ts'
 import { TIP_STREAM, ensureBackfill, getCheckpoint, watchAddress } from './store.ts'
@@ -722,6 +731,48 @@ test('a deposit is confirmed once, at the depth the pinned contract publishes', 
   assert.equal(body['requiredConfirmations'], 60)
   assert.match(String(body['txUrn']), /^cf:chain:ember:testnet:0x/)
   assert.match(String(body['explorerUrl']), /explorer\.cloudsforge\.online/)
+
+  /* ---------------------------------------------------------------------------------------------
+   * **THE ROW THE REAL WORKER WROTE, THROUGH THE RELAY'S OWN BUILDER, INTO THE CONTRACT'S OWN
+   * CLASSIFIER.** `topics.test.ts` runs this against a fixture row and is the guard; this runs it
+   * against a row nothing in the test wrote by hand, which is what makes the fixture honest. It is
+   * the check whose absence let four other services relay nothing but refusals for weeks — each
+   * suite verified against its own fake bus, so an envelope no consumer could read looked perfect
+   * from inside the producer.
+   *
+   * It is here rather than in `topics.test.ts` because a real outbox row only exists where a real
+   * chain worker has run.
+   * ------------------------------------------------------------------------------------------- */
+  const stored = await sql<OutboxRow[]>`
+    select id, topic, key, occurred_at, producer, version, actor, correlation_id, payload
+      from outbox where topic = ${DEPOSIT_CONFIRMED}
+  `
+  const row = stored[0]
+  assert.ok(row, 'the confirmed deposit wrote no outbox row')
+
+  // The ordering partition, off the wire rather than off a regex over the emit site. Two movements
+  // on one address stay in chain order; two addresses do not serialise against each other.
+  assert.equal(row.key, `${SCOPE.chain}:${SCOPE.network}:${BOB}`)
+  assert.equal(KEYED_BY[DEPOSIT_CONFIRMED], 'chain:network:address')
+
+  // Both columns really are null on a real emit — which is why `buildEnvelope` has to map them, and
+  // why a fixture that supplied them would be testing an envelope this service never produces.
+  assert.equal(row.actor, null, 'a chain worker has no principal behind it')
+  assert.equal(row.correlation_id, null, 'nor an inbound request')
+
+  const built = buildEnvelope(row)
+  assert.ok(built.ok, 'the relay would refuse the envelope it built from a real deposit')
+  assert.deepEqual(
+    envelopeDefects(JSON.parse(JSON.stringify(built.value))),
+    [],
+    'a real confirmed deposit would be refused at the envelope by every consumer in the estate',
+  )
+  assert.equal(built.value.version, '1.0', 'the wire version is "major.minor", never the stored integer')
+
+  // And the delivery a subscriber receives verifies with the contract's verifier — the exact check
+  // activity's ingest, notify's /ingest and settlement's inbound run.
+  const wire = JSON.stringify(built.value)
+  assert.equal(verifyDelivery(wire, signEvent(wire, 'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4'), ['K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4']).ok, true)
 
   // And never twice.
   await worker.follow(signal())

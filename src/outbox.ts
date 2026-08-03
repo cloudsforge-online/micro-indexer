@@ -22,7 +22,16 @@
  * measured conditions under which that stops being true.
  */
 
-import { createHmac, timingSafeEqual } from 'node:crypto'
+import {
+  EVENT_ID_HEADER,
+  SIGNATURE_HEADER,
+  TOPIC_HEADER,
+  classifyEnvelope,
+  signDelivery,
+  verifyDelivery,
+  type EventEnvelope,
+  type EventVersion,
+} from '@cloudsforge/contracts-events'
 import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
@@ -34,12 +43,12 @@ export type Tx = TransactionSql
 /**
  * The two topics this service produces.
  *
- * **Neither is in `@cloudsforge/contracts-events` `TOPICS` yet.** That registry is the only place
- * a topic name may be spelled, it is exact-pinned, and adding to it is a coordinated release — so
- * they are declared here for now and the registry entry lands with the same release that gives
- * `wallet` a subscription. Both already satisfy the registry's shape rule
- * (`<service>.<aggregate>.<past-tense-verb>`, three lowercase segments), which `outbox.test.ts`
- * asserts, so registering them later is an addition and never a rename.
+ * **Neither is in `@cloudsforge/contracts-events` `TOPICS` yet**, and that is now a proposal with a
+ * spec attached rather than a sentence: `src/topics.ts` holds both entries in
+ * `AWAITING_REGISTRATION`, ready to be pasted into the registry, and `topics.test.ts` fails the
+ * moment contracts adopts one and the entry is not deleted. Both already satisfy the registry's
+ * shape rule (`<service>.<aggregate>.<past-tense-verb>`, three lowercase segments), so registering
+ * them later is an addition and never a rename.
  *
  * The division of labour they encode is the point of the whole service:
  *
@@ -66,18 +75,25 @@ export interface DomainEvent {
   readonly version?: number
 }
 
-/** The wire envelope. Additive-only, versioned per topic, schema-diff enforced — AD-02. */
-export interface EventEnvelope {
-  readonly id: string
-  readonly topic: string
-  readonly key: string
-  readonly occurredAt: string
-  readonly producer: string
-  readonly version: number
-  readonly actor: string | null
-  readonly correlationId: string | null
-  readonly payload: Record<string, unknown>
-}
+/**
+ * The wire envelope is `@cloudsforge/contracts-events`' — re-exported, not redeclared.
+ *
+ * A hand-rolled copy is the drift the contract package exists to prevent, and the estate has
+ * already paid for it: `market`, `trade`, `community` and `devplatform` all stamped the wire
+ * `version` as an INTEGER where `EventVersion` requires "major.minor", so their events were refused
+ * at the envelope and NEVER DELIVERED TO ANYONE — invisible, because every suite tests against its
+ * own fake bus. This file carried the same integer declaration. Importing the type makes an integer
+ * version a compile error rather than a silent nothing.
+ */
+export type { EventEnvelope } from '@cloudsforge/contracts-events'
+
+/**
+ * The wire version, in the CONTRACT's shape.
+ *
+ * The stored column stays an integer — storage records the major — and the mapping to the
+ * contract's `` `${number}.${number}` `` happens here, at the wire, in one place.
+ */
+const wireVersion = (v: number): EventVersion => `${v}.0`
 
 export type Emit = (event: DomainEvent) => void
 
@@ -120,22 +136,136 @@ export async function withOutbox<T>(
 
 /* ------------------------------------------------------------------------ signing */
 
-const SIGNATURE_HEADER = 'x-cloudsforge-signature'
-
-/** `sha256=<hex>` over the exact bytes sent, so a subscriber verifies before parsing. */
+/**
+ * THE CONTRACT SIGNS, NOT THIS FILE.
+ *
+ * This was a local `sha256=<hmac over the body>` under a locally-declared `x-cloudsforge-signature`,
+ * and it was the last copy of that scheme producing deliveries in the estate. The contract signs
+ * `t=<seconds>,v1=<hmac over "<seconds>.<body>">` under `cf-signature`, and every consumer that
+ * imports it — activity's ingest, notify's `/ingest`, settlement's inbound — verifies exactly that.
+ *
+ * The timestamp is INSIDE the signed message rather than beside it, so it cannot be moved without
+ * invalidating the signature, which is what makes a subscriber's freshness window mean anything.
+ * The old scheme had no timestamp at all and therefore no replay bound: a captured delivery was a
+ * permanent credential.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS BREAKS `micro-wallet`'s EVENT INTAKE UNTIL WALLET MOVES, AND THAT IS THE DELIBERATE
+ * CHOICE.** `wallet/src/server.ts:824` reads `x-cloudsforge-signature` and only that, through
+ * `verifyEventSignature` (`wallet/src/outbox.ts:180-193`), whose own comment says the arm is held
+ * open for exactly this producer and "moves when indexer moves, not before". This is that move.
+ *
+ * A dual emit — both headers, both schemes, for a window — was the other defensible answer and was
+ * rejected for two reasons:
+ *
+ *   1. It keeps MINTING the unbounded-replay credential. The legacy MAC covers the body alone, so
+ *      every dual-signed delivery is a forever-valid replay token for as long as the window lasts.
+ *      Retiring that is the whole point of the migration, and a transition that keeps producing it
+ *      buys compatibility with the thing being removed.
+ *   2. Wallet's intake is ALREADY refusing three other producers, so its single-armed check is one
+ *      change that closes four defects rather than one. `settlement` (`settlement/src/outbox.ts:206`),
+ *      `ledger` (`ledger/src/outbox.ts:127`) and `identity` (`identity/src/outbox.ts:166`) have all
+ *      migrated, and each signs `cf-signature`; wallet 401s every one of them today. Adding a
+ *      fourth transitional shape would delay the one fix all four need — wallet verifying with
+ *      `verifyDelivery`, as `micro-settlement` already does behind `verifyInbound`.
+ *
+ * `micro-wallet` is the owner. The change is: read `SIGNATURE_HEADER` from
+ * `@cloudsforge/contracts-events` and verify with `verifyDelivery`, keeping the legacy arm only for
+ * as long as some OTHER producer still needs it — which, from this commit, is none.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * The exported names stay, so no call site changes; the implementations are the contract's, so they
+ * cannot drift again.
+ */
 export function signEvent(body: string, secret: string): string {
-  return `sha256=${createHmac('sha256', secret).update(body).digest('hex')}`
+  return signDelivery(body, secret)
 }
 
-/** Timing-safe, because a byte-at-a-time comparison of a MAC is a byte-at-a-time forgery oracle. */
+/** Timing-safety and the freshness window both live in the contract's verifier. */
 export function verifyEventSignature(body: string, secret: string, presented: string): boolean {
-  const expected = Buffer.from(signEvent(body, secret))
-  const actual = Buffer.from(presented)
-  if (expected.length !== actual.length) return false
-  return timingSafeEqual(expected, actual)
+  return verifyDelivery(body, presented, secret).ok
 }
 
 /* ------------------------------------------------------------------------ relay */
+
+/**
+ * An outbox row, as the contract's envelope — or the reasons it is not one.
+ *
+ * The stored row is looser than the wire: `actor` and `correlation_id` are nullable columns and
+ * `topic` and `producer` are free text, while `EventEnvelope` requires an `Actor`, a non-null
+ * `correlationId`, a `TopicName` and a known `ProducerService`. Rather than cast that gap away,
+ * this builds the envelope and hands it to the CONTRACT'S OWN classifier, so the relay's idea of a
+ * valid event and a subscriber's are the same function.
+ *
+ * **Both of this service's emit sites store nulls in both columns.** `evm.ts:790`, `:935`,
+ * `bitcoin.ts:892`, `:1039`, `solana.ts:765` and `:947` all emit with no `actor` and no
+ * `correlationId`, because a chain watcher has no inbound request and no principal behind it — it
+ * is woken by a block. Sent through as nulls, that is "actor: missing" and "correlationId: missing"
+ * on every deposit event this service has ever written. `system` is the contract's own value for
+ * "no principal did this", which is precisely what a null actor column means here; a missing
+ * correlation id falls back to the event id, so an investigation has a thread even when the event
+ * started the story rather than continuing one.
+ *
+ * ## Why `classifyEnvelope` and not `validateEnvelope`
+ *
+ * `validateEnvelope` refuses an unregistered topic, and **neither of this service's two topics is
+ * registered** — `topicsProducedBy('indexer')` is empty while `indexer` is a permitted producer.
+ * Refusing on that basis would relay nothing at all, which is a worse defect than the one being
+ * fixed. `classifyEnvelope` separates the two facts the contract's own header insists are different:
+ * `unregistered_topic` is a MISSING REGISTRATION (quarantine, do not drop) and `malformed` is a
+ * PRODUCER BUG (refuse, today). `src/topics.ts` is what stops "unregistered" becoming a blanket
+ * excuse: every topic emitted here must be in the registry or in that file's self-emptying
+ * quarantine, or `topics.test.ts` is red.
+ */
+/**
+ * The envelope as this file can prove it at COMPILE time, before the classifier looks at it.
+ *
+ * `version` is the contract's `EventVersion` — `` `${number}.${number}` `` — so assigning the stored
+ * integer column to it is a type error, which is `pnpm typecheck`, which is the build. That is the
+ * whole point of importing the type rather than restating it: the defect that took out `market`,
+ * `trade`, `community` and `devplatform` was `version: row.version`, and it must not be possible to
+ * write that line here and have it compile.
+ *
+ * The other fields stay `string`: `topic` is a `TopicName` on the wire and `producer` a
+ * `ProducerService`, but both come out of free-text columns, and a cast that ASSERTED them would be
+ * the producer vouching for itself. Those are checked at run time by `classifyEnvelope`, which is
+ * the same function every consumer runs — the difference is that a wrong version is knowable
+ * statically and a wrong topic is not.
+ */
+interface EnvelopeCandidate {
+  readonly id: string
+  readonly topic: string
+  readonly key: string
+  readonly occurredAt: string
+  readonly producer: string
+  readonly version: EventVersion
+  readonly actor: string
+  readonly correlationId: string
+  readonly payload: Record<string, unknown>
+}
+
+export function buildEnvelope(
+  row: OutboxRow,
+): { ok: true; value: EventEnvelope; unregisteredTopic: string | null } | { ok: false; defects: readonly string[] } {
+  const candidate: EnvelopeCandidate = {
+    id: row.id,
+    topic: row.topic,
+    key: row.key,
+    occurredAt: row.occurred_at.toISOString(),
+    producer: row.producer,
+    version: wireVersion(row.version),
+    actor: row.actor ?? 'system',
+    correlationId: row.correlation_id ?? row.id,
+    payload: row.payload,
+  }
+  const verdict = classifyEnvelope(candidate)
+  if (verdict.reason === 'malformed') return { ok: false, defects: verdict.defects }
+  return {
+    ok: true,
+    value: candidate as unknown as EventEnvelope,
+    unregisteredTopic: verdict.unregisteredTopic,
+  }
+}
 
 export interface RelayDeps {
   readonly sql: Db
@@ -147,7 +277,14 @@ export interface RelayDeps {
   readonly clientFor?: (url: string) => Pick<HttpClient, 'request'>
 }
 
-interface OutboxRow {
+/**
+ * A stored outbox row, exported because `buildEnvelope` is.
+ *
+ * The suite selects a row the real chain worker wrote and hands it to `buildEnvelope`, which is the
+ * only way to check the wire shape against a row nothing in the test constructed — see
+ * `evm.test.ts`. A test that built the row itself would be checking its own fixture.
+ */
+export interface OutboxRow {
   readonly id: string
   readonly topic: string
   readonly key: string
@@ -205,19 +342,36 @@ export function createRelay(deps: RelayDeps): Handler {
         select id, url from event_subscriptions where topic = ${event.topic} and active = true
       `
 
-      const envelope: EventEnvelope = {
-        id: event.id,
-        topic: event.topic,
-        key: event.key,
-        occurredAt: event.occurred_at.toISOString(),
-        producer: event.producer,
-        version: event.version,
-        actor: event.actor,
-        correlationId: event.correlation_id,
-        payload: event.payload,
+      const built = buildEnvelope(event)
+      if (!built.ok) {
+        // REFUSED HERE RATHER THAN SENT. An envelope the contract rejects is one every subscriber
+        // rejects, so relaying it burns a retry budget delivering something nobody can accept —
+        // and `market`, `trade`, `community` and `devplatform` all shipped exactly that for weeks
+        // without noticing, because their suites verified against their own fake buses.
+        //
+        // Logged and SKIPPED, not published: the row stays unpublished so the defect is visible in
+        // the backlog and is delivered once whatever produced it is fixed, rather than being
+        // silently marked done.
+        deps.logger.error('outbox row is not a valid envelope; not relayed', {
+          eventId: event.id,
+          topic: event.topic,
+          defects: built.defects,
+        })
+        continue
       }
-      // Signed over the exact bytes `HttpClient` will send: it stringifies the same object with
-      // the same key order, so the MAC a subscriber recomputes over the received body matches.
+      if (built.unregisteredTopic !== null) {
+        // Not an error and not a page: a topic this service emits and has proposed, which every
+        // consumer will quarantine until contracts adopts it. `src/topics.ts` holds the spec.
+        deps.logger.info('relaying a topic the shared registry does not yet name', {
+          eventId: event.id,
+          topic: built.unregisteredTopic,
+        })
+      }
+      const envelope = built.value
+      // THE CONTRACT'S SCHEME, not a local one — see `signEvent` above for what that breaks and why
+      // it is the right break. Signed over the exact bytes `HttpClient` will send: it stringifies
+      // the same object with the same key order, so the MAC a subscriber recomputes over the
+      // received body matches.
       const signature = signEvent(JSON.stringify(envelope), deps.signingSecret)
 
       for (const subscription of subscriptions) {
@@ -285,7 +439,11 @@ async function deliver(
       // The event id is the idempotency key, which is what makes this POST safe to retry and is
       // the same value the subscriber dedupes on.
       idempotencyKey: envelope.id,
-      headers: { [SIGNATURE_HEADER]: signature, 'x-event-id': envelope.id },
+      headers: {
+        [SIGNATURE_HEADER]: signature,
+        [EVENT_ID_HEADER]: envelope.id,
+        [TOPIC_HEADER]: envelope.topic,
+      },
       ...(envelope.correlationId ? { requestId: envelope.correlationId } : {}),
     })
     await deps.sql`
