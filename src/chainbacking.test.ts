@@ -79,22 +79,81 @@ const skip = enabled
   : 'set INDEXER_TEST_DATABASE_URL and LEDGER_TEST_DATABASE_URL (both names must contain "test")'
 
 /**
- * `micro-ledger`'s own source, imported across the checkout.
+ * `micro-ledger`'s own source, imported across the checkout at RUN TIME ONLY.
  *
- * A dynamic import inside the gate, deliberately: a static one would make this repository's unit
- * suite fail to load wherever the sibling checkout is absent, which is most CI images. The estate
- * consumes shared code as packages; `reconcileAsset` is not one, and copying it here to avoid the
- * import would be testing a copy — the precise mistake that let a handler and a schema disagree.
+ * ## Why the specifier is computed rather than written as a literal
+ *
+ * **Because `typeof import('../../ledger/src/reconcile.ts')` broke the estate's image build, and
+ * it was this repository's own Dockerfile that said so.** `pnpm typecheck` runs inside the image;
+ * the build context is this repository plus two named contexts for `runtime` and `contracts`, and
+ * a sibling service's source is in none of them. A literal specifier is resolved by `tsc` whether
+ * or not the import is dynamic, so eight `TS2307`s failed `indexer-migrate` — the container the
+ * whole estate's schema depends on. Found by building it, which is the only way it could have
+ * been found.
+ *
+ * A computed specifier is not resolved by `tsc`, so the types below are what this file knows about
+ * `micro-ledger`, stated explicitly. That is a real cost and it is the smaller one: the alternative
+ * was to copy `reconcileAsset` here, and testing a copy is the exact mistake that let a handler and
+ * a schema disagree about the thing they both guarded. A drift between these declarations and
+ * ledger's actual exports fails at run time, loudly, naming the missing export — which is the
+ * failure this file exists to produce.
  */
-type LedgerModule = typeof import('../../ledger/src/reconcile.ts')
-type LedgerSupport = typeof import('../../ledger/src/testsupport.ts')
-type LedgerEntries = typeof import('../../ledger/src/entries.ts')
-type LedgerIdempotency = typeof import('../../ledger/src/idempotency.ts')
+const LEDGER_SRC = new URL('../../ledger/src/', import.meta.url).href
+
+/** Exactly the surface this file drives. Nothing here is inferred; all of it is asserted. */
+interface LedgerReconcileResult {
+  readonly observedSource: 'liability_sum' | 'indexer' | 'unavailable'
+  readonly indexerObservedTotal: string | null
+  readonly drift: string | null
+  readonly status: string
+  readonly froze: boolean
+  readonly unfroze: boolean
+}
+interface LedgerReconcileInput {
+  readonly assetCode: string
+  readonly chain: string
+  readonly network: 'mainnet' | 'testnet'
+  readonly tolerance: Record<string, bigint>
+  readonly producer: string
+  readonly indexerObservedTotal?: bigint
+}
+interface LedgerModule {
+  reconcileAsset(sql: unknown, input: LedgerReconcileInput): Promise<LedgerReconcileResult>
+}
+interface LedgerSupport {
+  openDb(max?: number): import('postgres').Sql
+  migrateTestDb(sql: import('postgres').Sql): Promise<void>
+  resetLedger(sql: import('postgres').Sql): Promise<void>
+  depositEntry(options: { amount: bigint; assetCode?: string }): unknown
+}
+interface LedgerEntries {
+  postEntry(deps: { sql: unknown; producer: string }, request: unknown, fingerprint: string): Promise<unknown>
+}
+interface LedgerIdempotency {
+  requestFingerprint(request: unknown): string
+}
 
 let ledger: LedgerModule
 let support: LedgerSupport
 let entries: LedgerEntries
 let idempotency: LedgerIdempotency
+
+/**
+ * Import one of ledger's modules and prove it has the exports this file names.
+ *
+ * The check is the whole point of a computed specifier being acceptable: `tsc` cannot see across
+ * the checkout, so this does at run time what it would have done at build time, and says which
+ * export moved rather than failing later as `undefined is not a function`.
+ */
+async function ledgerModule<T>(file: string, exports: readonly string[]): Promise<T> {
+  const loaded = (await import(`${LEDGER_SRC}${file}`)) as Record<string, unknown>
+  for (const name of exports) {
+    if (typeof loaded[name] !== 'function') {
+      throw new Error(`micro-ledger's ${file} no longer exports a function named ${name}`)
+    }
+  }
+  return loaded as T
+}
 
 /* ------------------------------------------------------------------ the chain */
 
@@ -275,10 +334,15 @@ export async function observedTotalFor(options: {
 
 before(async () => {
   if (!enabled) return
-  ledger = await import('../../ledger/src/reconcile.ts')
-  support = await import('../../ledger/src/testsupport.ts')
-  entries = await import('../../ledger/src/entries.ts')
-  idempotency = await import('../../ledger/src/idempotency.ts')
+  ledger = await ledgerModule<LedgerModule>('reconcile.ts', ['reconcileAsset'])
+  support = await ledgerModule<LedgerSupport>('testsupport.ts', [
+    'openDb',
+    'migrateTestDb',
+    'resetLedger',
+    'depositEntry',
+  ])
+  entries = await ledgerModule<LedgerEntries>('entries.ts', ['postEntry'])
+  idempotency = await ledgerModule<LedgerIdempotency>('idempotency.ts', ['requestFingerprint'])
 
   const postgres = (await import('postgres')).default
   const { migrate } = await import('@cloudsforge/db')
@@ -365,17 +429,13 @@ beforeEach(async () => {
 /** Credit EMBER into the ledger's custody asset account through the real posting path. */
 async function credit(amount: bigint): Promise<void> {
   const request = support.depositEntry({ amount, assetCode: 'EMBER' })
-  await entries.postEntry(
-    { sql: ledgerSql as unknown as Parameters<typeof entries.postEntry>[0]['sql'], producer: 'ledger' },
-    request,
-    idempotency.requestFingerprint(request as unknown),
-  )
+  await entries.postEntry({ sql: ledgerSql, producer: 'ledger' }, request, idempotency.requestFingerprint(request))
 }
 
 /** The whole loop, in the order the scheduled job will run it. */
 async function reconcile(): Promise<{
   observed: bigint | undefined
-  result: Awaited<ReturnType<LedgerModule['reconcileAsset']>>
+  result: LedgerReconcileResult
 }> {
   const observed = await observedTotalFor({
     baseUrl: indexerBase,
@@ -384,9 +444,7 @@ async function reconcile(): Promise<{
     timeoutMs: 5_000,
     token: 'ledger',
   })
-  const result = await ledger.reconcileAsset(
-    ledgerSql as unknown as Parameters<LedgerModule['reconcileAsset']>[0],
-    {
+  const result = await ledger.reconcileAsset(ledgerSql, {
       assetCode: 'EMBER',
       chain: 'Hearth',
       network: 'testnet',
@@ -396,9 +454,8 @@ async function reconcile(): Promise<{
       // aside, an explicitly-present `undefined` and an absent key are the same to
       // `reconcileAsset` — but writing it this way is what makes the absence deliberate at the
       // call site rather than a value that happened to be undefined.
-      ...(observed === undefined ? {} : { indexerObservedTotal: observed }),
-    },
-  )
+    ...(observed === undefined ? {} : { indexerObservedTotal: observed }),
+  })
   return { observed, result }
 }
 
@@ -544,9 +601,7 @@ test('BREAK 2 — an unreachable indexer arrives as undefined, never as 0n', { s
   assert.equal(unauthorised, undefined)
 
   // Fed to the ledger, every one of those is the same recorded fact: nobody looked.
-  const result = await ledger.reconcileAsset(
-    ledgerSql as unknown as Parameters<LedgerModule['reconcileAsset']>[0],
-    { assetCode: 'EMBER', chain: 'Hearth', network: 'testnet', tolerance: {}, producer: 'ledger' },
+  const result = await ledger.reconcileAsset(ledgerSql, { assetCode: 'EMBER', chain: 'Hearth', network: 'testnet', tolerance: {}, producer: 'ledger' },
   )
   assert.equal(result.observedSource, 'unavailable')
   assert.equal(result.status, 'failed')
