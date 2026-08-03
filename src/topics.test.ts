@@ -399,3 +399,75 @@ test('every exported emitter is reached from somewhere', () => {
     'exported, emits an event, and no code path reaches it — the topic is produced by dead code',
   )
 })
+
+/**
+ * A topic CONSTANT that is declared and never used to emit anything.
+ *
+ * The gap between the two checks above, and it is a real one. The literal scanner reads names out of
+ * `src/`, so `export const RECONCILIATION_COMPLETED = 'ledger.reconciliation.completed'` satisfies it
+ * whether or not any emit site references the constant — delete the `emit(...)` call and the name
+ * check stays green, because the DECLARATION is still a literal in `src/`. And `unreachedEmitters`
+ * cannot see it either, because it looks for exported `emit*` FUNCTIONS and this estate emits inline.
+ *
+ * Proved by breaking it: removing the reconciliation emit left the name reconciliation green and only
+ * the database-backed tests red. A guard that needs a database to fail is a guard that is skipped
+ * exactly when someone is in a hurry.
+ *
+ * So: every constant whose value is one of this service's topics must be REFERENCED somewhere else in
+ * `src/`, outside its own declaration, outside a comment, and outside `topics.ts` — because
+ * `topics.ts` is the list being checked and a reference from there would let the list justify itself.
+ */
+function unusedTopicConstants(files: readonly { name: string; text: string }[]): readonly string[] {
+  const topicLiteral = new RegExp(`^export const ([A-Z][A-Z0-9_]*) = '${SERVICE}\\.[a-z0-9_]+\\.[a-z0-9_]+'`)
+  const declared: { symbol: string; where: string }[] = []
+  for (const file of files) {
+    file.text.split('\n').forEach((line, index) => {
+      const match = topicLiteral.exec(line)
+      if (match?.[1]) declared.push({ symbol: match[1], where: `${file.name}:${index + 1}` })
+    })
+  }
+  return declared
+    .filter(({ symbol }) => {
+      const reference = new RegExp(`\\b${symbol}\\b`)
+      for (const file of files) {
+        for (const line of file.text.split('\n')) {
+          const trimmed = line.trimStart()
+          if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) continue
+          if (topicLiteral.test(line)) continue
+          if (reference.test(line)) return false
+        }
+      }
+      return true
+    })
+    .map(({ symbol, where }) => `${symbol} (${where})`)
+    .sort()
+}
+
+test('the unused-topic-constant detector can actually fail', () => {
+  // The fixture is the exact regression that motivated this check: a constant declared, named in the
+  // registry, and never referenced by an emit.
+  const dead = [{ name: 'a.ts', text: `export const T = '${SERVICE}.thing.happened'\n` }]
+  assert.deepEqual(unusedTopicConstants(dead), ['T (a.ts:1)'])
+
+  // A reference from a COMMENT does not count — that is how a guard passes because its own prose
+  // names the thing it is checking.
+  const prose = [
+    { name: 'a.ts', text: `export const T = '${SERVICE}.thing.happened'\n` },
+    { name: 'b.ts', text: '// T is emitted somewhere, honest\n' },
+  ]
+  assert.deepEqual(unusedTopicConstants(prose), ['T (a.ts:1)'])
+
+  const alive = [
+    { name: 'a.ts', text: `export const T = '${SERVICE}.thing.happened'\n` },
+    { name: 'b.ts', text: 'emit({ topic: T, key: row.id, payload: {} })\n' },
+  ]
+  assert.deepEqual(unusedTopicConstants(alive), [])
+})
+
+test('every topic constant is referenced by something that emits', () => {
+  assert.deepEqual(
+    unusedTopicConstants(emitSourceFiles().map((name) => ({ name, text: readFileSync(name, 'utf8') }))),
+    [],
+    'declared, registered, and no emit site references it — the topic is a name and nothing more',
+  )
+})
