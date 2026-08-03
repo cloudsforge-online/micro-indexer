@@ -52,6 +52,7 @@
 
 import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { Lifecycle } from '@cloudsforge/lifecycle'
@@ -69,14 +70,49 @@ import { TIP_STREAM, setCheckpoint, upsertBlock, watchAddress } from './store.ts
 
 /* ------------------------------------------------------------------ gating */
 
+/**
+ * TWO preconditions, in the order they can be satisfied, and the skip names only the one that is
+ * actually missing.
+ *
+ * ## Why the checkout is asked about FIRST, and why that is not a technicality
+ *
+ * This used to report `set INDEXER_TEST_DATABASE_URL and LEDGER_TEST_DATABASE_URL` for every
+ * reason it could not run, and in the one place it runs most often that sentence is FALSE ADVICE.
+ * The reusable service workflow checks out exactly two siblings — `micro-runtime` and
+ * `micro-contracts` — so in CI `../../ledger/src` does not exist, `ledgerModule()` could not
+ * import a thing, and setting both variables would change nothing at all. Somebody following that
+ * instruction would provision two databases and get the same skip.
+ *
+ * It also cost a real run. `micro-org`'s service workflow fails a job whose output contains
+ * `set <SERVICE>_TEST_DATABASE_URL`, because a database-backed suite that skips is a suite that
+ * reports a pass for work it never did — fifteen services once went green that way. That guard is
+ * right and it stays right: THIS SERVICE'S OWN database tests ran in that same job, all 205 of
+ * them, against the Postgres the workflow provides. What tripped it was this cross-repository
+ * file asking for a SECOND service's database, which no per-service job has or should have.
+ *
+ * So the DSN sentence is still here, unchanged, for the case it was written for — an estate
+ * checkout with no databases provisioned — and it is no longer said about a checkout where the
+ * databases are beside the point. `existsSync` on `reconcile.ts` specifically, not on the
+ * directory: an empty `ledger/` from an interrupted clone is not a checkout.
+ *
+ * The seam itself is unchanged and still runs where it always has: `verify-chain-backing.sh` in
+ * `micro-deploy` provisions both databases and invokes THIS FILE by path.
+ */
+const LEDGER_SRC = new URL('../../ledger/src/', import.meta.url)
+const ledgerCheckedOut = existsSync(new URL('reconcile.ts', LEDGER_SRC))
+
 const indexerUrl = process.env['INDEXER_TEST_DATABASE_URL']
 const ledgerUrl = process.env['LEDGER_TEST_DATABASE_URL']
-const enabled = Boolean(
+const databasesReady = Boolean(
   indexerUrl && /test/i.test(indexerUrl) && ledgerUrl && /test/i.test(ledgerUrl),
 )
+const enabled = ledgerCheckedOut && databasesReady
 const skip = enabled
   ? false
-  : 'set INDEXER_TEST_DATABASE_URL and LEDGER_TEST_DATABASE_URL (both names must contain "test")'
+  : ledgerCheckedOut
+    ? 'set INDEXER_TEST_DATABASE_URL and LEDGER_TEST_DATABASE_URL (both names must contain "test")'
+    : `micro-ledger is not checked out at ${LEDGER_SRC.pathname} — this seam drives both services, ` +
+      'so no single-repository job can run it. deploy/scripts/verify-chain-backing.sh does.'
 
 /**
  * `micro-ledger`'s own source, imported across the checkout at RUN TIME ONLY.
@@ -97,8 +133,9 @@ const skip = enabled
  * a schema disagree about the thing they both guarded. A drift between these declarations and
  * ledger's actual exports fails at run time, loudly, naming the missing export — which is the
  * failure this file exists to produce.
+ *
+ * `LEDGER_SRC` itself is declared above, beside the gate that asks whether it is there at all.
  */
-const LEDGER_SRC = new URL('../../ledger/src/', import.meta.url).href
 
 /** Exactly the surface this file drives. Nothing here is inferred; all of it is asserted. */
 interface LedgerReconcileResult {
@@ -146,7 +183,7 @@ let idempotency: LedgerIdempotency
  * export moved rather than failing later as `undefined is not a function`.
  */
 async function ledgerModule<T>(file: string, exports: readonly string[]): Promise<T> {
-  const loaded = (await import(`${LEDGER_SRC}${file}`)) as Record<string, unknown>
+  const loaded = (await import(`${LEDGER_SRC.href}${file}`)) as Record<string, unknown>
   for (const name of exports) {
     if (typeof loaded[name] !== 'function') {
       throw new Error(`micro-ledger's ${file} no longer exports a function named ${name}`)
