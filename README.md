@@ -6,6 +6,8 @@ supply and authorities as its contract reports them. It replaces the estate's ba
 deposit watcher, whose `let inFlight = false` is the reason two of its ticks can observe different
 totals for one address (`src/jobs.ts:6-9`).
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 > **Reads need no token; writes do.** Every read here answers with a chain fact anyone can obtain
 > by running a Hearth node, and this service stores nothing linking an address to a person — so
 > there was no privacy for an auth check to protect. It used to require `indexer:read` or admin on
@@ -410,3 +412,10 @@ skipped.
   `reconciliation_runs.observed_source` has an `indexer` value and its job never supplies one, so
   every production reconciliation run compares the ledger against itself. Adding this service as the
   observed side is a caller, not a migration.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
