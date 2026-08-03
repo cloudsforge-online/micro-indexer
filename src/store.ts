@@ -877,6 +877,43 @@ export async function filterWatched(
   return new Set(rows.map((r) => r.address))
 }
 
+/**
+ * Every watched address whose label marks it as holding platform money.
+ *
+ * This is the **custody set**, and it is the input to the aggregate `micro-ledger` reconciles
+ * against. It exists as a whole-list read — the one thing `filterWatched` above deliberately is
+ * not — because the question is a sum over the set rather than a membership test for a block. The
+ * cost is bounded by the caller (`custody.ts` refuses a set above a configured size) rather than
+ * by pagination, because a page of a custody set is a partial sum and a partial sum is the exact
+ * lie this whole path exists to refuse.
+ *
+ * `starts_with` rather than `like`, so a prefix containing `%` or `_` matches literally instead of
+ * silently becoming a wildcard that pulls in every watched address on the chain.
+ *
+ * Ordered by address so two runs a moment apart sum the same rows in the same order, which is what
+ * makes a difference between them a fact about the chain rather than about the planner.
+ */
+export async function custodyAddresses(
+  exec: Exec,
+  scope: ChainScope,
+  labelPrefixes: readonly string[],
+  limit: number,
+): Promise<readonly string[]> {
+  if (labelPrefixes.length === 0) return []
+  const rows = await exec<{ address: string }[]>`
+    select address from watched_addresses
+     where chain = ${scope.chain} and network = ${scope.network}
+       and label is not null
+       and exists (
+         select 1 from unnest(${[...labelPrefixes]}::text[]) as prefix
+          where starts_with(watched_addresses.label, prefix)
+       )
+     order by address
+     limit ${limit}
+  `
+  return rows.map((r) => r.address)
+}
+
 /* ------------------------------------------------------------------ confirmation sweep */
 
 export interface PendingActivity {

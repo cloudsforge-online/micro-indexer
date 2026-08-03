@@ -159,6 +159,42 @@ export interface Env {
   /** The same bound for a backfill pass. Separate, because backfill is allowed to be slower. */
   readonly backfillBatchBlocks: number
   readonly rpcDeadlineMs: number
+  /**
+   * Which watched addresses count as holding platform money, by label prefix.
+   *
+   * This is the definition of the **custody set** that `GET /custody/:chain/:network/total` sums
+   * and that `micro-ledger` reconciles its custody accounts against, so it is configuration rather
+   * than a constant in `custody.ts`: the taxonomy belongs to the platform. The default is the two
+   * prefixes the estate actually writes and intends to write —
+   *
+   *   * `deposit:` — `wallet/src/deposits.ts:284` labels every assigned deposit address
+   *     `deposit:<userId>`, and a confirmed arrival there is debited to the ledger's `custody`
+   *     asset account (`wallet/src/deposits.ts:627`). These ARE the custody position.
+   *   * `treasury:` — nothing writes this today. `micro-settlement` sweeps deposits to a pinned
+   *     treasury address (`settlement/src/bitcoin.ts:814`) but holds no `indexer:write` grant, so
+   *     treasury addresses are not registered here at all. The prefix is carried so that fixing
+   *     that is a registration and not another deploy change, and so the gap is visible in this
+   *     comment rather than only in a drift six weeks from now. A swept deployment under-reports
+   *     until it is fixed, which reads at the ledger as positive drift and FREEZES the asset —
+   *     the safe direction, and loud.
+   *
+   * **An empty list is refused rather than defaulted to "everything".** A set that matches nothing
+   * sums to zero over zero addresses, and zero standing in for "we did not look" is the exact
+   * defect this whole path exists to remove. `custody.ts` refuses an empty result for the same
+   * reason, so this is the second of two locks on one door.
+   */
+  readonly custodyLabelPrefixes: readonly string[]
+  /**
+   * The largest custody set an observation will attempt, before it refuses.
+   *
+   * One `eth_getBalance` per address inside one request. Above this the route answers 503
+   * `custody_set_too_large` rather than summing a page — a page of a custody set is a partial sum,
+   * and a partial sum reads at the ledger as positive drift and freezes withdrawals. Raising it is
+   * a deploy decision taken with the cost visible, which truncation would never have been.
+   */
+  readonly custodyMaxAddresses: number
+  /** How many of those balance reads are in flight at once. See `custody.ts`'s `concurrency`. */
+  readonly custodyConcurrency: number
 }
 
 const LEVELS = new Set(['debug', 'info', 'warn', 'error'])
@@ -243,6 +279,39 @@ export function parseChainList(raw: string): readonly ChainScope[] {
 }
 
 /**
+ * `deposit:,treasury:`. Comma-separated, trimmed, deduplicated, and never empty.
+ *
+ * A prefix is taken literally by `store.custodyAddresses`, which uses `starts_with` rather than
+ * `like` so that a `%` in a prefix matches a per-cent sign instead of becoming a wildcard that
+ * pulls every watched address on the chain into the custody set. This function still refuses one,
+ * because a prefix containing a LIKE metacharacter is far more likely to be a mistake than an
+ * intention, and the mistake it would have been is "sum every address we watch".
+ */
+export function parseCustodyPrefixes(raw: string): readonly string[] {
+  const parts = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+  if (parts.length === 0) {
+    throw new EnvError(
+      'INDEXER_CUSTODY_LABEL_PREFIXES must name at least one prefix — an empty set sums to zero ' +
+        'over zero addresses, which is "we did not look" reported as "the chain holds nothing"',
+    )
+  }
+  const seen = new Set<string>()
+  for (const part of parts) {
+    if (/[%_]/.test(part)) {
+      throw new EnvError(`INDEXER_CUSTODY_LABEL_PREFIXES entry ${part} must not contain % or _`)
+    }
+    if (seen.has(part)) {
+      throw new EnvError(`INDEXER_CUSTODY_LABEL_PREFIXES lists ${part} twice`)
+    }
+    seen.add(part)
+  }
+  return Object.freeze(parts)
+}
+
+/**
  * Pure over its source so the failure paths are testable without mutating the process. The eager
  * export below is what makes the service fail fast.
  */
@@ -306,6 +375,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     followBatchBlocks: bounded(source, 'INDEXER_FOLLOW_BATCH_BLOCKS', 25, 1, 500),
     backfillBatchBlocks: bounded(source, 'INDEXER_BACKFILL_BATCH_BLOCKS', 50, 1, 1_000),
     rpcDeadlineMs: bounded(source, 'INDEXER_RPC_DEADLINE_MS', 8_000, 250, 120_000),
+    custodyLabelPrefixes: parseCustodyPrefixes(
+      optional(source, 'INDEXER_CUSTODY_LABEL_PREFIXES', 'deposit:,treasury:'),
+    ),
+    custodyMaxAddresses: bounded(source, 'INDEXER_CUSTODY_MAX_ADDRESSES', 2_000, 1, 100_000),
+    custodyConcurrency: bounded(source, 'INDEXER_CUSTODY_CONCURRENCY', 8, 1, 64),
   }
 }
 

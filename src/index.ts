@@ -26,6 +26,7 @@ import { SERVICE, env } from './env.ts'
 import { BitcoinNetworkError, BitcoinWorker } from './bitcoin.ts'
 import { SolanaClusterError, SolanaWorker } from './solana.ts'
 import { ChainIdentityError, EvmWorker } from './evm.ts'
+import { rpcCustodyObserver } from './custody.ts'
 import { registerHandlers, recurringFor, rescheduleRecurring, seedRecurring } from './jobs.ts'
 import { CHAIN_HALTED, PROVIDER_FAILURES_TOTAL, registerServiceMetrics } from './metrics.ts'
 import { SCHEMA_VERSION } from './migrations.ts'
@@ -226,6 +227,18 @@ const server = createServer({
   // `stubWorker` makes above and for the same reason: an absent map entry fails as `undefined is
   // not a function`, a present one fails with the chain it was asked about.
   tokens: rpcTokenObserver({ sql, callers: pools }),
+  // The same pool map, for the same reason: one pool per chain, so a provider this process has
+  // already demoted for the follower is not tried first by a solvency read. A scope with no pool
+  // answers 503 `chain_not_followed`, which reaches the ledger as no observation at all — and an
+  // asset with no observation freezes. That is the intended behaviour of an indexer replica that
+  // does not follow the chain it was asked about; see `custody.ts`.
+  custody: rpcCustodyObserver({
+    sql,
+    callers: pools,
+    labelPrefixes: env.custodyLabelPrefixes,
+    maxAddresses: env.custodyMaxAddresses,
+    concurrency: env.custodyConcurrency,
+  }),
   // Sampled at scrape time rather than on a timer. There is no `setInterval` in this repository,
   // and CI greps for one — rule 8.
   beforeScrape: async () => {

@@ -53,6 +53,7 @@ import {
   type ChainId,
   type ChainScope,
 } from './chains.ts'
+import { CustodyTotalUnavailableError, type CustodyObserver } from './custody.ts'
 import type { ReadStore } from './reads.ts'
 import { TokenStateUnavailableError, type TokenObserver } from './tokenstate.ts'
 
@@ -76,6 +77,15 @@ export interface ServerDeps {
    * string. See `tokenstate.ts` for why the capability is here at all.
    */
   readonly tokens: TokenObserver
+  /**
+   * Σ confirmed native balance over the custody set, for `micro-ledger`'s reconciliation.
+   *
+   * Separate from `reads` for the reason `tokens` is: it needs an RPC provider, not a connection
+   * string. Separate from `tokens` because the failure semantics are opposite — a contract that
+   * will not answer `owner()` has no owner, and an account that will not answer `eth_getBalance`
+   * has an unknown balance. `custody.ts` carries the argument.
+   */
+  readonly custody: CustodyObserver
   /**
    * Refresh sampled gauges immediately before `/metrics` renders.
    *
@@ -157,6 +167,7 @@ const DOMAIN: ReadonlyArray<readonly [string, string, Handler]> = [
   ['GET', '/transactions/:chain/:network/:hash', transactionByHash],
   ['GET', '/transactions/:chain/:network/:hash/confirmations', transactionConfirmations],
   ['GET', '/tokens/:chain/:network/:address', tokenObservation],
+  ['GET', '/custody/:chain/:network/total', custodyTotal],
   ['GET', '/blocks/:chain/:network/:height', blockByHeight],
   ['POST', '/watch/:chain/:network/:address', watchAddress],
   ['POST', '/backfills/:chain/:network', requestBackfill],
@@ -298,6 +309,18 @@ async function handle(
       // everything else is 503, because it is a provider, a head or a follower that is behind.
       const status = err.code === 'family_not_supported' ? 501 : 503
       ctx.log.warn('token state could not be observed', { code: err.code, err })
+      return errorReply(status, err.code, err.message, ctx.requestId)
+    }
+    if (err instanceof CustodyTotalUnavailableError) {
+      // **NEVER a 200, and never a 404.** A caller reads this route to decide whether the platform
+      // is solvent, and the only two honest answers are a total that may be believed and a refusal.
+      // A 404 would be read as "no custody here", which is a zero with a status code; a 200 with a
+      // partial total is a positive drift that freezes withdrawals on the strength of an RPC
+      // timeout. The status split follows the token route's: 501 for a family no amount of waiting
+      // will make readable, 503 for everything else — a node behind its depth, a halted chain, a
+      // custody set nobody registered, a provider that refused.
+      const status = err.code === 'family_not_supported' ? 501 : 503
+      ctx.log.warn('custody total could not be observed', { code: err.code, err })
       return errorReply(status, err.code, err.message, ctx.requestId)
     }
     ctx.log.error('unhandled request failure', { err })
@@ -524,6 +547,48 @@ async function tokenObservation(ctx: RequestContext, deps: ServerDeps): Promise<
         'no contract answering totalSupply() at that address, at the block this service has walked',
       )
     }
+    return { status: 200, body: observed }
+  } finally {
+    done()
+  }
+}
+
+/**
+ * Σ confirmed native balance over the custody set — the number `micro-ledger` reconciles against.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE ONLY DOMAIN READ ON THIS SERVICE THAT REQUIRES A TOKEN, AND THE RULE THAT OPENED THE
+ * OTHERS IS WHY.** `authoriseRead`'s argument is not "reads are cheap", it is: *what these routes
+ * return is already public — anyone may obtain all of it by running a Hearth node*. Every other
+ * route answers a question about a block, a hash or an address the CALLER already named, and
+ * naming it is what makes the answer public.
+ *
+ * This one answers a question about a SET that only the platform knows: the total the estate holds
+ * in custody, across addresses the caller cannot enumerate and this route does not disclose.
+ * Nobody can obtain it by running a node, because running a node does not tell you which addresses
+ * are ours. It is therefore not covered by the rule that opened the other reads, and serving it
+ * anonymously would publish the treasury's size to anyone who can reach the port.
+ *
+ * So: `authorise(…, READ_SCOPE)`, which demands a service token carrying `indexer:read` or an
+ * admin. It fails CLOSED in the direction that matters — a caller without the grant gets a 401 or
+ * 403, its client maps that to "no observation", and the ledger records `unavailable` and freezes.
+ * A misconfigured deploy therefore stops withdrawals rather than quietly reporting a number.
+ *
+ * The response deliberately carries `addresses` and `labelPrefixes` but no address. The count and
+ * the definition are what let an operator judge whether the set was the right set; the members are
+ * the part the ledger must not learn.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+async function custodyTotal(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
+  await authorise(ctx, deps, READ_SCOPE)
+  const scope = scopeFrom(ctx)
+  const done = deps.lifecycle.track()
+  try {
+    // No `catch` that produces a fallback, on purpose. Every failure inside is a
+    // `CustodyTotalUnavailableError` and every one of them must reach `handle` as a non-200 — a
+    // 200 carrying a partial or defaulted total is the one outcome this route exists to make
+    // impossible.
+    const observed = await deps.custody.total(scope)
     return { status: 200, body: observed }
   } finally {
     done()

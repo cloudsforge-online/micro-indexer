@@ -15,6 +15,12 @@ import type {
   TokenBalancesView,
   TransactionView,
 } from './reads.ts'
+import {
+  CustodyTotalUnavailableError,
+  type CustodyObserver,
+  type CustodyTotalFault,
+  type CustodyTotalObservation,
+} from './custody.ts'
 import { READ_SCOPE, ROUTE_PATTERNS, WRITE_SCOPE, createServer } from './server.ts'
 import {
   TokenStateUnavailableError,
@@ -154,6 +160,37 @@ const tokens: TokenObserver = {
   },
 }
 
+/**
+ * The custody aggregate, with an armable refusal.
+ *
+ * The refusal is the half that matters at this layer: `custody.ts` is where the decision to
+ * withhold is taken, and this file's job is to prove the decision survives the transport — that a
+ * refusal leaves as a non-200 with its code, and never as a 200 carrying a zero.
+ */
+let custodyFault: CustodyTotalFault | null = null
+
+const custody: CustodyObserver = {
+  async total(scope) {
+    asked.push({ what: 'custody', scope })
+    if (custodyFault) throw new CustodyTotalUnavailableError(custodyFault, `armed: ${custodyFault}`)
+    return {
+      chain: scope.chain,
+      network: scope.network,
+      assetCode: 'EMBER',
+      decimals: 18,
+      total: '7000000000000000000',
+      addresses: 3,
+      labelPrefixes: ['deposit:', 'treasury:'],
+      requiredConfirmations: 60,
+      observedAtBlock: 39,
+      observedAtBlockHash: HASH,
+      headHeight: 98,
+      tipHeight: 100,
+      observedAt: '2026-01-01T00:00:00.000Z',
+    } satisfies CustodyTotalObservation
+  },
+}
+
 const service = (scopes: readonly string[]): Principal => ({
   kind: 'service',
   service: 'wallet',
@@ -188,6 +225,7 @@ before(async () => {
     },
     reads,
     tokens,
+    custody,
   })
   await new Promise<void>((resolve) => server.listen(0, resolve))
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
@@ -564,6 +602,70 @@ test('the token route authorises and normalises exactly as every other read does
   assert.equal((await call(`/tokens/doge/mainnet/${TOKEN}`, { token: 'reader' })).status, 404)
 })
 
+/* --------------------------------------- the custody aggregate */
+
+test('the custody total is the one read that demands a token, and it says so with 401 not 200', async () => {
+  // Every other read went anonymous because what it returns is already public — anyone may obtain
+  // it by running a Hearth node. This one is Σ over a set only the platform knows, so running a
+  // node does not tell you it. Anonymous must be refused, and refused in the direction that makes
+  // the ledger record "no observation" rather than a number.
+  assert.equal((await call('/custody/ember/testnet/total')).status, 401)
+  assert.equal((await call('/custody/ember/testnet/total', { token: 'unscoped' })).status, 403)
+  assert.equal((await call('/custody/ember/testnet/total', { token: 'player' })).status, 403)
+  assert.equal((await call('/custody/ember/testnet/total', { token: 'reader' })).status, 200)
+  assert.equal((await call('/custody/ember/testnet/total', { token: 'admin' })).status, 200)
+})
+
+test('a total answers with the number and the evidence, and never with an address', async () => {
+  const answer = await call('/v1/custody/ember/testnet/total', { token: 'reader' })
+  assert.equal(answer.status, 200)
+  // A STRING. An 18-decimal balance does not survive a JSON number, and the digits a float would
+  // drop are exactly where a reconciliation drift lives.
+  assert.equal(answer.body['total'], '7000000000000000000')
+  assert.equal(typeof answer.body['total'], 'string')
+  // The evidence a caller needs to judge the number: how many addresses were in the sum, what
+  // defined the set, and which block it is as at.
+  assert.equal(answer.body['addresses'], 3)
+  assert.deepEqual(answer.body['labelPrefixes'], ['deposit:', 'treasury:'])
+  assert.equal(answer.body['observedAtBlock'], 39)
+  assert.equal(answer.body['requiredConfirmations'], 60)
+  // And NOT the members. The ledger must not learn which addresses are custody's, so no field of
+  // this answer may carry one.
+  assert.ok(!JSON.stringify(answer.body).includes(ADDRESS))
+})
+
+test('every refusal leaves as a non-200 carrying its code — never a 200, never a zero', async () => {
+  // THE GUARD THE WHOLE ROUTE EXISTS FOR. A partial or defaulted total reads at the ledger as
+  // positive drift, and positive drift freezes withdrawals for the asset. So there is no status
+  // code on this route that means "some of it": either a number that may be believed, or a refusal
+  // the client turns into `undefined`.
+  const faults: Array<[CustodyTotalFault, number]> = [
+    ['family_not_supported', 501],
+    ['chain_not_followed', 503],
+    ['nothing_indexed', 503],
+    ['below_confirmation_depth', 503],
+    ['depth_not_walked', 503],
+    ['head_diverged', 503],
+    ['chain_halted', 503],
+    ['no_custody_addresses', 503],
+    ['custody_set_too_large', 503],
+    ['address_unreadable', 503],
+    ['rpc_unavailable', 503],
+  ]
+  for (const [code, expected] of faults) {
+    custodyFault = code
+    const answer = await call('/custody/ember/testnet/total', { token: 'reader' })
+    assert.equal(answer.status, expected, `${code} must answer ${expected}`)
+    assert.equal((answer.body['error'] as Record<string, string>)['code'], code)
+    // The two failures that would be read as an answer: a 200 with a total, and a 404 that a
+    // consumer files as "no custody here" — which is a zero wearing a status code.
+    assert.equal(answer.body['total'], undefined)
+    assert.notEqual(answer.status, 404)
+  }
+  custodyFault = null
+  assert.equal((await call('/custody/ember/testnet/total', { token: 'reader' })).status, 200)
+})
+
 /* --------------------------------------- the table two other repositories read */
 
 test('the served route table is exactly this, in both spellings', () => {
@@ -579,6 +681,7 @@ test('the served route table is exactly this, in both spellings', () => {
       'GET /v1/transactions/:chain/:network/:hash',
       'GET /v1/transactions/:chain/:network/:hash/confirmations',
       'GET /v1/tokens/:chain/:network/:address',
+      'GET /v1/custody/:chain/:network/total',
       'GET /v1/blocks/:chain/:network/:height',
       'POST /v1/watch/:chain/:network/:address',
       'POST /v1/backfills/:chain/:network',
@@ -588,6 +691,7 @@ test('the served route table is exactly this, in both spellings', () => {
       'GET /transactions/:chain/:network/:hash',
       'GET /transactions/:chain/:network/:hash/confirmations',
       'GET /tokens/:chain/:network/:address',
+      'GET /custody/:chain/:network/total',
       'GET /blocks/:chain/:network/:height',
       'POST /watch/:chain/:network/:address',
       'POST /backfills/:chain/:network',
