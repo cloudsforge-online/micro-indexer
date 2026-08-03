@@ -17,8 +17,16 @@ const BASE: Record<string, string> = {
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
-const { EnvError, SERVICE, env, loadEnv, parseChainList, parseEndpoints, rpcVarFor } =
-  await import('./env.ts')
+const {
+  EnvError,
+  SERVICE,
+  env,
+  loadEnv,
+  parseChainList,
+  parseCustodyPrefixes,
+  parseEndpoints,
+  rpcVarFor,
+} = await import('./env.ts')
 
 test('a complete environment loads, and importing the module did not exit', () => {
   assert.equal(env.databaseUrl, BASE['INDEXER_DATABASE_URL'])
@@ -132,4 +140,36 @@ test('batch sizes and deadlines are bounded, because an unbounded tick outlives 
   assert.throws(() => loadEnv({ ...BASE, INDEXER_FOLLOW_BATCH_BLOCKS: '10000' }), EnvError)
   assert.throws(() => loadEnv({ ...BASE, INDEXER_RPC_DEADLINE_MS: '10' }), EnvError)
   assert.equal(loadEnv({ ...BASE, INDEXER_FOLLOW_BATCH_BLOCKS: '100' }).followBatchBlocks, 100)
+})
+
+test('the custody set has a default, and an empty definition of it is refused', () => {
+  // The default is the prefix micro-wallet actually writes plus the one micro-settlement will need.
+  assert.deepEqual([...loadEnv(BASE).custodyLabelPrefixes], ['deposit:', 'treasury:'])
+  assert.deepEqual([...parseCustodyPrefixes(' a: , b: ')], ['a:', 'b:'])
+
+  // AN EMPTY SET IS NOT "EVERYTHING" AND IT IS NOT "NOTHING". It matches no address, so the total
+  // would be zero over zero addresses — "we did not look" reported as "the chain holds nothing",
+  // which is the exact defect this whole path removes.
+  assert.throws(() => parseCustodyPrefixes(''), EnvError)
+  assert.throws(() => parseCustodyPrefixes('  ,  '), EnvError)
+  // A variable set to whitespace is UNSET as far as `optional` is concerned, so it takes the
+  // default rather than producing an empty set. Stated here because the two look alike in a
+  // compose file and only one of them is a configuration mistake.
+  assert.deepEqual(
+    [...loadEnv({ ...BASE, INDEXER_CUSTODY_LABEL_PREFIXES: '  ' }).custodyLabelPrefixes],
+    ['deposit:', 'treasury:'],
+  )
+  // And a value that is present but matches nothing IS refused, at the variable rather than at the
+  // first reconciliation.
+  assert.throws(() => loadEnv({ ...BASE, INDEXER_CUSTODY_LABEL_PREFIXES: ',,' }), EnvError)
+  assert.throws(() => parseCustodyPrefixes('dep%'), EnvError)
+  assert.throws(() => parseCustodyPrefixes('a:,a:'), EnvError)
+})
+
+test('the custody bounds are bounded, because the alternative to a bound is a partial sum', () => {
+  assert.equal(loadEnv(BASE).custodyMaxAddresses, 2_000)
+  assert.equal(loadEnv(BASE).custodyConcurrency, 8)
+  assert.throws(() => loadEnv({ ...BASE, INDEXER_CUSTODY_MAX_ADDRESSES: '0' }), EnvError)
+  assert.throws(() => loadEnv({ ...BASE, INDEXER_CUSTODY_CONCURRENCY: '0' }), EnvError)
+  assert.equal(loadEnv({ ...BASE, INDEXER_CUSTODY_MAX_ADDRESSES: '50' }).custodyMaxAddresses, 50)
 })
