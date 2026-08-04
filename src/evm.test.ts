@@ -730,7 +730,17 @@ test('a deposit is confirmed once, at the depth the pinned contract publishes', 
   assert.equal(body['confirmations'], 60)
   assert.equal(body['requiredConfirmations'], 60)
   assert.match(String(body['txUrn']), /^cf:chain:ember:testnet:0x/)
-  assert.match(String(body['explorerUrl']), /explorer\.cloudsforge\.online/)
+  // The TESTNET host, because the URN one line above says testnet. This asserted
+  // `explorer.cloudsforge.online` — the MAINNET host — and passed only because
+  // @cloudsforge/contracts-chain published the mainnet URL for both environments. That was a real
+  // defect (a testnet deposit's link opened the mainnet explorer, where the hash does not exist);
+  // micro-contracts 326de9d fixed it, and this assertion, which had been encoding the bug, started
+  // failing. Pinned to the exact host rather than loosened to a substring: a link that names the
+  // wrong environment is the failure this line exists to catch.
+  assert.equal(
+    String(body['explorerUrl']),
+    `https://explorer.testnet.cloudsforge.online/#/tx/${String(body['txUrn']).replace(/^cf:chain:ember:testnet:/, '')}`,
+  )
 
   /* ---------------------------------------------------------------------------------------------
    * **THE ROW THE REAL WORKER WROTE, THROUGH THE RELAY'S OWN BUILDER, INTO THE CONTRACT'S OWN
