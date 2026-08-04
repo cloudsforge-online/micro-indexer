@@ -102,11 +102,12 @@ export const FAMILY_NOTES: Readonly<Record<ChainFamily, string>> = Object.freeze
   ember:
     'Served by the EVM worker: Hearth exposes Ethereum JSON-RPC on 8545 with chain id 7411 ' +
     'mainnet and 7412 testnet, and a confirmation depth of 60 rather than 12.',
+  // Serves LTC as well as BTC: same RPC surface, same transaction structure, its own depth.
   bitcoin:
-    'Built — bitcoin.ts. UTXO, not accounts: address activity is per output, and a transaction ' +
-    'credits an address once per output paying it rather than once. Esplora chain_stats is a ' +
-    'CUMULATIVE received counter unaffected by spending, so the reorg repair cannot simply ' +
-    're-read a balance — it walks to a common ancestor instead. Confirmations count the mining ' +
+    'Built — bitcoin.ts, and it serves Litecoin too. UTXO, not accounts: address activity is per output, and a transaction ' +
+    'credits an address once per output paying it rather than once. There is no balance to re-read ' +
+    'at all — the transport is Bitcoin Core JSON-RPC, not an address-indexing API — so the reorg ' +
+    'repair walks to a common ancestor instead. Confirmations count the mining ' +
     'block as the first. The case with no EVM analogue is replace-by-fee: an orphaned ' +
     'transaction whose outpoints the winning chain has spent can never be re-mined, so it is ' +
     'marked conflicted rather than merely orphaned. See spent_outpoints in migration 5.',

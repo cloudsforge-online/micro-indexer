@@ -38,7 +38,16 @@ test('each family carries the domain knowledge its worker needed', () => {
   // These notes are forge-pay chains.ts distilled. Losing them costs the same three bugs twice.
   // They are kept after a worker is built, because they are the reason it looks the way it does.
   assert.match(FAMILY_NOTES.bitcoin, /UTXO/)
-  assert.match(FAMILY_NOTES.bitcoin, /CUMULATIVE received counter/)
+  // WAS `/CUMULATIVE received counter/`, describing Esplora's chain_stats. The note was wrong about
+  // the transport and the claim was load-bearing: a design document read it and concluded that
+  // adding Litecoin meant finding a Litecoin Esplora. `bitcoin.ts` calls getblockchaininfo,
+  // getblockcount, getblockhash, getblock and getrawtransaction — it is Core JSON-RPC, which
+  // Litecoin Core also speaks, which is why LTC needed no new follower.
+  assert.match(FAMILY_NOTES.bitcoin, /Bitcoin Core JSON-RPC/)
+  assert.match(FAMILY_NOTES.bitcoin, /common ancestor/)
+  // The family serves two chains now, and the note has to say so — it is where somebody looks to
+  // find out whether Litecoin has a worker.
+  assert.match(FAMILY_NOTES.bitcoin, /Litecoin/)
   assert.match(FAMILY_NOTES.solana, /skipped/)
   assert.match(FAMILY_NOTES.solana, /finalized/)
   assert.match(FAMILY_NOTES.xrp, /BASE RESERVE/)

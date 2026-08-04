@@ -35,10 +35,21 @@ import {
  * `shard` is deliberately absent: SHARD is present in `CHAINS` only so that record is total, it
  * never exists on a chain, and an indexer that accepted it would be advertising an endpoint that
  * can only ever answer empty.
+ *
+ * `ltc` IS PRESENT AND NEEDS NO WORKER OF ITS OWN. Litecoin's spec carries `family: 'bitcoin'`, and
+ * `index.ts` selects a worker by FAMILY, so `BitcoinWorker` follows it unchanged. That is not an
+ * optimism about the two chains being similar — it is a statement about the seam actually used:
+ * this repository reads Litecoin Core over the same JSON-RPC methods it reads Bitcoin Core with,
+ * and it never encodes an address, only reads the one `scriptPubKey.address` the node emits. The
+ * parts of Litecoin that genuinely differ — version bytes, the bech32 HRP, the WIF byte — are all
+ * on the SIGNING side, and live in custody and settlement rather than here.
+ *
+ * The depth is not shared, only the code: `requiredConfirmations('ltc')` reads LTC's own 12 out of
+ * `contracts-chain`, exactly as it reads Bitcoin's 6, because no number in this file is restated.
  */
-export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp'
+export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc'
 
-export const CHAIN_IDS: readonly ChainId[] = Object.freeze(['ember', 'eth', 'btc', 'sol', 'xrp'])
+export const CHAIN_IDS: readonly ChainId[] = Object.freeze(['ember', 'eth', 'btc', 'sol', 'xrp', 'ltc'])
 
 export const NETWORKS: readonly Network[] = Object.freeze(['mainnet', 'testnet'])
 
@@ -48,6 +59,7 @@ const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   btc: 'BTC',
   sol: 'SOL',
   xrp: 'XRP',
+  ltc: 'LTC',
 })
 
 export function isChainId(value: string): value is ChainId {

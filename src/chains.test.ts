@@ -13,6 +13,7 @@ import {
   isNetwork,
   parseScope,
   requiredConfirmations,
+  sameScope,
   scopeKey,
 } from './chains.ts'
 
@@ -91,4 +92,44 @@ test('a scope round-trips, and a malformed one is refused rather than guessed at
   assert.equal(parseScope('xrp'), null)
   assert.equal(parseScope('xrp:devnet'), null)
   assert.equal(isNetwork('devnet'), false)
+})
+
+/* ------------------------------------------- LTC: Bitcoin's family, its own numbers */
+
+test('ltc is a chain this indexer follows, and it resolves to the LTC asset', () => {
+  assert.ok(isChainId('ltc'))
+  assert.equal(assetOf('ltc'), 'LTC')
+  assert.ok(CHAIN_IDS.includes('ltc'))
+})
+
+test('ltc is served by the BITCOIN family, which is what saves a second worker', () => {
+  // `index.ts` selects a worker by family. If this ever stops being 'bitcoin', Litecoin silently
+  // falls through to the EVM worker rather than failing, so it is asserted rather than assumed.
+  assert.equal(familyOf('ltc'), 'bitcoin')
+  assert.equal(familyOf('ltc'), familyOf('btc'))
+})
+
+test('sharing Bitcoin\'s code must not mean sharing Bitcoin\'s depth', () => {
+  // The exact mistake the family reuse invites. LTC's blocks are ~2.5 minutes against Bitcoin's
+  // ~10, so an equal depth is a quarter of the work — these numbers must not converge.
+  assert.equal(requiredConfirmations('ltc'), 12)
+  assert.equal(requiredConfirmations('btc'), 6)
+  assert.notEqual(requiredConfirmations('ltc'), requiredConfirmations('btc'))
+})
+
+test('ltc has no declared chain id, exactly like btc', () => {
+  // A Bitcoin-family transaction carries no chain id; the network binding comes from the node's own
+  // getblockchaininfo and from the WIF. A number appearing here would mean the spec had been given
+  // an EVM-shaped binding it cannot enforce.
+  assert.equal(declaredChainId('ltc', 'mainnet'), undefined)
+  assert.equal(declaredChainId('ltc', 'testnet'), undefined)
+})
+
+test('an ltc scope parses on both networks and cannot span them', () => {
+  assert.deepEqual(parseScope('ltc:mainnet'), { chain: 'ltc', network: 'mainnet' })
+  assert.deepEqual(parseScope('ltc:testnet'), { chain: 'ltc', network: 'testnet' })
+  assert.equal(scopeKey({ chain: 'ltc', network: 'mainnet' }), 'ltc:mainnet')
+  assert.ok(!sameScope({ chain: 'ltc', network: 'mainnet' }, { chain: 'ltc', network: 'testnet' }))
+  // The confusion that would actually cost money: LTC and BTC rows must never be one scope.
+  assert.ok(!sameScope({ chain: 'ltc', network: 'mainnet' }, { chain: 'btc', network: 'mainnet' }))
 })
