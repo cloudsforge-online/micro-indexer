@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import postgres from 'postgres'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { Logger, Metrics } from '@cloudsforge/telemetry'
-import type { ChainScope } from './chains.ts'
+import { requiredConfirmations, type ChainScope } from './chains.ts'
 import {
   ACCEPTED_CORE_CHAINS,
   BitcoinNetworkError,
@@ -681,6 +681,11 @@ test('a reorg at or past the alarm depth halts the chain rather than repairing i
 })
 
 test('a deposit is confirmed at its depth, counting the mining block as the first', { skip }, async () => {
+  const depth = requiredConfirmations(SCOPE.chain)
+  // Below two there is no "one short" step, so the loop below would assert nothing and the test
+  // would pass without ever having proved a deposit is withheld before its depth.
+  assert.ok(depth >= 2, `a depth of ${depth} leaves nothing for this test to withhold`)
+
   const node = new FakeBitcoinNode()
   node.appendMany(2)
   node.append([
@@ -690,14 +695,21 @@ test('a deposit is confirmed at its depth, counting the mining block as the firs
   const worker = workerFor(node)
 
   await worker.follow(signal())
-  // The mining block is confirmation one, so at tip 3 the deposit has exactly one and BTC needs 3.
+  // The mining block is confirmation one, so at tip 3 the deposit has exactly one.
   assert.deepEqual(await outboxTopics(), [DEPOSIT_OBSERVED])
 
-  node.appendMany(1) // tip 4 → two confirmations. Still short.
-  await worker.follow(signal())
-  assert.deepEqual(await outboxTopics(), [DEPOSIT_OBSERVED])
+  // The depth is READ from the chain spec, never restated here. This test used to hard-code BTC's
+  // three — it walked to tip 5 and asserted a credit — so when contracts raised the depth to six
+  // (micro-contracts 6724c19, "raise Bitcoin's depth before it credits anyone") the test failed
+  // rather than followed. A test that pins the number twice does not test the depth, it races it.
+  for (let confirmations = 2; confirmations < depth; confirmations += 1) {
+    node.appendMany(1)
+    const short = await worker.follow(signal())
+    assert.equal(short.confirmed, 0, `credited at ${confirmations} of ${depth} confirmations`)
+    assert.deepEqual(await outboxTopics(), [DEPOSIT_OBSERVED])
+  }
 
-  node.appendMany(1) // tip 5 → three confirmations.
+  node.appendMany(1) // the depth-th confirmation, and the first at which a credit is owed.
   const outcome = await worker.follow(signal())
   assert.equal(outcome.confirmed, 1)
   assert.deepEqual(await outboxTopics(), [DEPOSIT_OBSERVED, DEPOSIT_CONFIRMED])
