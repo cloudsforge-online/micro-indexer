@@ -49,6 +49,7 @@ import {
   decodeCFHeaders,
   decodeFrame,
   decodeHeaders,
+  dsha256,
   encodeMessage,
   filterHash,
   filterHeader,
@@ -77,6 +78,26 @@ const fixture: Fixture = JSON.parse(
 ) as Fixture
 
 const LTC_MAIN = paramsFor('ltc', 'mainnet')
+
+/**
+ * The naive merkle root — the one Bitcoin shipped before CVE-2012-2459 was found.
+ *
+ * Present ONLY so the CVE test can demonstrate that the collision it defends against is real,
+ * rather than asserting that a guard fires and leaving the reader to take the vulnerability on
+ * trust. It must never be exported and must never be used to validate anything.
+ */
+function unguardedMerkleRoot(txids: readonly string[]): string {
+  let level = txids.map((h) => hexToHash(h))
+  while (level.length > 1) {
+    if (level.length % 2 === 1) level = [...level, level[level.length - 1] as Buffer]
+    const next: Buffer[] = []
+    for (let i = 0; i < level.length; i += 2) {
+      next.push(dsha256(Buffer.concat([level[i] as Buffer, level[i + 1] as Buffer])))
+    }
+    level = next
+  }
+  return hashToHex(level[0] as Buffer)
+}
 
 /* ------------------------------------------------------------------ SipHash */
 
@@ -364,15 +385,34 @@ describe('block decoding against a real Litecoin block', () => {
     )
   })
 
-  it('refuses the CVE-2012-2459 duplicated final entry', () => {
-    // `[A, B, B]` and `[A, B]` produce the same merkle root. A node that only checks the root
-    // accepts the first, and then indexes a transaction list the proof of work does not cover.
+  it('refuses the CVE-2012-2459 duplicated final entry, and the collision is real', () => {
+    // This test earns its place by first DEMONSTRATING the attack rather than asserting that a
+    // guard fires. `unguardedMerkleRoot` below is the naive algorithm — the one every merkle
+    // tutorial gives, and the one Bitcoin itself shipped until 2012.
+    //
+    // Under it, a three-transaction list and a four-transaction list whose last entry repeats the
+    // third produce THE SAME ROOT:
+    //
+    //   [A,B,C]    -> odd row, duplicate C -> [A,B,C,C] -> [H(AB), H(CC)] -> H(H(AB)|H(CC))
+    //   [A,B,C,C]  -> even row already     -> [A,B,C,C] -> [H(AB), H(CC)] -> H(H(AB)|H(CC))
+    //
+    // So a peer can take a real block, append a duplicate of its last transaction, and hand us a
+    // transaction list that the real proof of work appears to cover. If we indexed it we would
+    // record a payment that was never made — and, because it hashes correctly, nothing downstream
+    // would ever question it.
     const a = 'a'.repeat(64)
     const b = 'b'.repeat(64)
-    assert.throws(() => merkleRoot([a, b, b]), /CVE-2012-2459/)
-    // The honest odd-length case still works: the duplication only matters when the last two
-    // entries were already equal.
-    assert.equal(merkleRoot([a, b, 'c'.repeat(64)]).length, 64)
+    const c = 'c'.repeat(64)
+
+    const honest = unguardedMerkleRoot([a, b, c])
+    const forged = unguardedMerkleRoot([a, b, c, c])
+    assert.equal(forged, honest, 'the CVE-2012-2459 collision must actually exist')
+
+    // The real implementation refuses the forgery...
+    assert.throws(() => merkleRoot([a, b, c, c]), /CVE-2012-2459/)
+    // ...and still accepts the honest three-transaction block, whose odd row is duplicated
+    // internally and legitimately. A guard that rejected this would reject half of all blocks.
+    assert.equal(merkleRoot([a, b, c]), honest)
   })
 
   it('computes the merkle root of a single-transaction block as that transaction', () => {

@@ -53,13 +53,46 @@ export interface AddressParams {
   readonly hrp: string
   /** HRPs that are valid on this chain but describe something this service cannot observe. */
   readonly opaqueHrps: readonly string[]
+  /**
+   * Witness versions that are valid on this chain but name no payable address.
+   *
+   * Litecoin's MWEB uses two witness programs that look exactly like ordinary future segwit
+   * outputs and are not: `OP_8 <32>` is `witness_mweb_hogaddr`, the commitment the HogEx
+   * transaction carries, and `OP_9 <32>` is `witness_mweb_pegin`, coins moving INTO the
+   * confidential pool. Litecoin Core gives neither an address, and neither is a party anyone can
+   * be credited as.
+   *
+   * The differential harness found this: a general bech32m encoder happily turns `OP_8 <32>` into
+   * a well-formed `ltc1g...` string, and it is a **plausible wrong answer** — the exact failure
+   * this file's header warns about. Crediting an MWEB peg-in to a synthesised address would
+   * attribute money to somebody who does not exist, and the string would never match a real watch
+   * because no user was ever given one.
+   *
+   * Empty on Bitcoin, and it must stay empty: Bitcoin has no MWEB, so a version 8 program there is
+   * an unrecognised-but-valid future segwit output, and Core does give it a bech32m address.
+   */
+  readonly unaddressableWitnessVersions: readonly number[]
 }
 
 export const ADDRESS_PARAMS: Readonly<Record<BtcChain, Readonly<Record<BtcNetwork, AddressParams>>>> =
   Object.freeze({
     btc: Object.freeze({
-      mainnet: Object.freeze({ p2pkh: 0x00, p2sh: 0x05, p2shLegacy: [], hrp: 'bc', opaqueHrps: [] }),
-      testnet: Object.freeze({ p2pkh: 0x6f, p2sh: 0xc4, p2shLegacy: [], hrp: 'tb', opaqueHrps: [] }),
+      mainnet: Object.freeze({
+        p2pkh: 0x00,
+        p2sh: 0x05,
+        p2shLegacy: [],
+        hrp: 'bc',
+        opaqueHrps: [],
+        unaddressableWitnessVersions: [],
+      }),
+      testnet: Object.freeze({
+        p2pkh: 0x6f,
+        p2sh: 0xc4,
+        p2shLegacy: [],
+        hrp: 'tb',
+        opaqueHrps: [],
+        unaddressableWitnessVersions: [],
+      }),
     }),
     ltc: Object.freeze({
       mainnet: Object.freeze({
@@ -70,6 +103,7 @@ export const ADDRESS_PARAMS: Readonly<Record<BtcChain, Readonly<Record<BtcNetwor
         // MWEB. Confidential by construction: there is no transparent output to observe and no
         // amount to read, so an address here is honestly unobservable rather than unsupported.
         opaqueHrps: ['ltcmweb'],
+        unaddressableWitnessVersions: [8, 9],
       }),
       testnet: Object.freeze({
         p2pkh: 0x6f,
@@ -77,6 +111,7 @@ export const ADDRESS_PARAMS: Readonly<Record<BtcChain, Readonly<Record<BtcNetwor
         p2shLegacy: [0xc4],
         hrp: 'tltc',
         opaqueHrps: ['tmweb'],
+        unaddressableWitnessVersions: [8, 9],
       }),
     }),
   })
@@ -302,6 +337,9 @@ export function scriptToAddress(script: Uint8Array, params: AddressParams): stri
       // Version 0 has exactly two defined lengths. Anything else at version 0 is not a valid
       // witness program and has no address, rather than an address nobody can spend from.
       if (version === 0 && pushLen !== 20 && pushLen !== 32) return null
+      // Litecoin's MWEB peg scripts. They are shaped exactly like a future segwit output and name
+      // nobody: encoding one would invent a payee. See `unaddressableWitnessVersions`.
+      if (params.unaddressableWitnessVersions.includes(version) && pushLen === 32) return null
       const words = [version, ...convertBits([...script.subarray(2)], 8, 5, true)]
       return bech32Encode(params.hrp, words, version === 0 ? BECH32_CONST : BECH32M_CONST)
     }
@@ -356,6 +394,15 @@ export function addressToScript(address: string, params: AddressParams): Decoded
     const program = convertBits(rest, 5, 8, false)
     if (program.length < 2 || program.length > 40) {
       throw new AddressError('witness_length', `witness program of ${program.length} bytes`)
+    }
+    // The mirror of the refusal in `scriptToAddress`. A user cannot be handed one of these as a
+    // deposit address, so accepting it here would register a watch that can never match — silence
+    // rather than a refusal, which is the outcome this codebase spends the most effort avoiding.
+    if (params.unaddressableWitnessVersions.includes(version) && program.length === 32) {
+      throw new AddressError(
+        'opaque',
+        `witness version ${version} is an MWEB peg script and names no payable party`,
+      )
     }
     if (version === 0 && program.length !== 20 && program.length !== 32) {
       throw new AddressError('witness_length', 'a version 0 program must be 20 or 32 bytes')
