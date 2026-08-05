@@ -46,10 +46,47 @@
 
 import { JOBS_SCHEMA_SQL } from '@cloudsforge/jobs'
 import type { Migration } from '@cloudsforge/db'
+import { CHAIN_IDS, NETWORKS } from './chains.ts'
 
-/** Repeated on every chain table. A typo cannot mint a sixth chain that nothing follows. */
-const CHAIN_CK = `check (chain in ('ember','eth','btc','sol','xrp'))`
-const NETWORK_CK = `check (network in ('mainnet','testnet'))`
+/**
+ * Repeated on every chain table. A typo cannot mint a chain that nothing follows.
+ *
+ * **DERIVED, never restated.** This list used to be typed out by hand here, and it drifted: LTC
+ * was added to `chains.ts` and not to this file, so `watched_addresses` rejected every Litecoin
+ * address. Both estates were patched live, which fixed the databases that existed and left every
+ * database created afterwards wrong — the worst shape a schema defect can take, because it is
+ * invisible until somebody provisions a new environment and then it looks like a code bug.
+ *
+ * Deriving it from `CHAIN_IDS` is what makes that unrepeatable: adding a chain to the type is now
+ * the same act as allowing it in the schema. `migrations.test.ts` asserts the two agree, so a
+ * future hand-written list fails CI rather than a deploy.
+ */
+const chainList = CHAIN_IDS.map((c) => `'${c}'`).join(',')
+const networkList = NETWORKS.map((n) => `'${n}'`).join(',')
+const CHAIN_CK = `check (chain in (${chainList}))`
+const NETWORK_CK = `check (network in (${networkList}))`
+
+/**
+ * Every table this service owns, in an order that is safe to truncate.
+ *
+ * Declared here, above `MIGRATIONS`, rather than at the foot of the file where it used to sit —
+ * migration 6 builds its DDL from this list at module-evaluation time, so a definition below the
+ * array would still be in its temporal dead zone. Moving it is also the point: this is now the ONE
+ * list of chain-scoped tables, used by the migration that repairs their constraints and by the
+ * database tests that truncate them. Writing a second one is how the chain check drifted in the
+ * first place.
+ */
+export const CHAIN_TABLES: readonly string[] = Object.freeze([
+  'spent_outpoints',
+  'address_activity',
+  'logs',
+  'transactions',
+  'blocks',
+  'reorgs',
+  'checkpoints',
+  'provider_health',
+  'watched_addresses',
+])
 
 export const MIGRATIONS: readonly Migration[] = [
   {
@@ -455,6 +492,35 @@ export const MIGRATIONS: readonly Migration[] = [
         check (status in ('included','orphaned','conflicted'));
     `,
   },
+  {
+    version: 6,
+    name: 'chain-check-converge',
+    // ------------------------------------------------------------------------------------------
+    // Bring every database's chain constraint back to ONE definition, whenever it was created.
+    //
+    // The defect this repairs: migration 1 spelled the chain list out by hand, `chains.ts` spelled
+    // it out separately, and the two drifted when LTC was added to the type and not to the schema.
+    // Every Litecoin address was refused by `watched_addresses_chain_ck` — an indexer that cannot
+    // be told what to watch, which is the whole of its job.
+    //
+    // Both running estates were patched live. That is precisely why this migration is needed
+    // rather than optional: a live `ALTER` fixes the databases that exist and nothing else, so
+    // every environment provisioned afterwards would come up broken, and it would present as a
+    // code bug rather than a schema one. This makes the two converge for good.
+    //
+    // Widening a CHECK is expand-only: the previous release never writes a value the new
+    // constraint would reject, so a replica still running it is unaffected and this may ship in
+    // one migration. Dropping first with `if exists` makes it idempotent and makes it work on a
+    // database that was already patched by hand.
+    up: CHAIN_TABLES.map(
+      (table) => `
+      alter table ${table} drop constraint if exists ${table}_chain_ck;
+      alter table ${table} add constraint ${table}_chain_ck ${CHAIN_CK};
+      alter table ${table} drop constraint if exists ${table}_network_ck;
+      alter table ${table} add constraint ${table}_network_ck ${NETWORK_CK};
+    `,
+    ).join('\n'),
+  },
 ]
 
 /**
@@ -478,15 +544,3 @@ export const SCHEMA_VERSION: number = MIGRATIONS.reduce((max, m) => Math.max(max
  */
 export const BASELINE_VERSION = 0
 
-/** Every table this service owns, in an order that is safe to truncate. Used by the DB tests. */
-export const CHAIN_TABLES: readonly string[] = Object.freeze([
-  'spent_outpoints',
-  'address_activity',
-  'logs',
-  'transactions',
-  'blocks',
-  'reorgs',
-  'checkpoints',
-  'provider_health',
-  'watched_addresses',
-])

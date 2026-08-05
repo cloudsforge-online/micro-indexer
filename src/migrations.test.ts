@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { checksumOf } from '@cloudsforge/db'
 import { BASELINE_VERSION, CHAIN_TABLES, MIGRATIONS, SCHEMA_VERSION } from './migrations.ts'
+import { CHAIN_IDS, NETWORKS } from './chains.ts'
 
 const ALL_SQL = MIGRATIONS.map((m) => m.up).join('\n')
 
@@ -111,6 +112,44 @@ test('checksums are stable, which is what makes an edited migration refuse to ru
       checksumOf(m),
       checksumOf({ ...m, up: `\n  ${m.up}  \n` }),
       `${m.name} is whitespace-sensitive`,
+    )
+  }
+})
+
+test('every chain in CHAIN_IDS is allowed by the schema, from one definition and not two', () => {
+  // The regression this locks down: LTC was added to `chains.ts` and not to the hand-written list
+  // in this file, so `watched_addresses_chain_ck` rejected every Litecoin address — an indexer
+  // that cannot be told what to watch. Both estates were patched live, which fixed the databases
+  // that existed and left every database created afterwards broken.
+  //
+  // Asserting the constraint text against CHAIN_IDS is what makes a third list impossible: adding
+  // a chain to the type without the schema following now fails here rather than in a deploy.
+  for (const chain of CHAIN_IDS) {
+    assert.match(
+      ALL_SQL,
+      new RegExp(`check \\(chain in \\([^)]*'${chain}'`),
+      `${chain} is in CHAIN_IDS but no chain check allows it`,
+    )
+  }
+  for (const network of NETWORKS) {
+    assert.match(
+      ALL_SQL,
+      new RegExp(`check \\(network in \\([^)]*'${network}'`),
+      `${network} is in NETWORKS but no network check allows it`,
+    )
+  }
+})
+
+test('the final migration converges every chain-scoped table, whenever the database was created', () => {
+  // A live ALTER fixes only the databases that already exist. Without this, a freshly provisioned
+  // environment comes up with the old constraint and the failure looks like a code bug.
+  const converge = MIGRATIONS[MIGRATIONS.length - 1]
+  assert.ok(converge)
+  for (const table of CHAIN_TABLES) {
+    assert.match(
+      converge.up,
+      new RegExp(`alter table ${table} add constraint ${table}_chain_ck`),
+      `${table} is chain-scoped but the converging migration does not repair it`,
     )
   }
 })
