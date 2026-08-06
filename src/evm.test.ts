@@ -739,7 +739,12 @@ test('a deposit is confirmed once, at the depth the pinned contract publishes', 
   // wrong environment is the failure this line exists to catch.
   assert.equal(
     String(body['explorerUrl']),
-    `https://explorer.testnet.cloudsforge.online/#/tx/${String(body['txUrn']).replace(/^cf:chain:ember:testnet:/, '')}`,
+    // Single-label, not `explorer.testnet.…`. The two-label form is DEAD: the estate's wildcard
+    // certificate covers one label, so `<surface>.testnet.<apex>` never presented a valid chain and
+    // every such host failed TLS. Testnet moved to `<surface>-testnet.<apex>` and the code followed;
+    // this expectation did not, so it pinned a hostname that resolves to nothing and had been
+    // failing CI on every commit since.
+    `https://explorer-testnet.cloudsforge.online/#/tx/${String(body['txUrn']).replace(/^cf:chain:ember:testnet:/, '')}`,
   )
 
   /* ---------------------------------------------------------------------------------------------
