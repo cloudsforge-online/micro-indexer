@@ -211,7 +211,7 @@ test('a success clears the failure streak and the backoff', async () => {
  * **Why this survived is the point: it fails as a 401**, which is exactly what a wrong password
  * looks like. Every diagnosis therefore pointed at the credential — the node's config, the rpcauth
  * hash, the password itself — and never at the client that silently declined to send it. It cost a
- * Litecoin integration most of a session, and `settlement/src/registry.ts:161` has the same shape.
+ * Litecoin integration most of a session, and `settlement/src/registry.ts` has the same shape.
  *
  * Bitcoin Core and its forks authenticate RPC with HTTP Basic and offer nothing else, so without
  * this a self-hosted node is unreachable no matter how the credential is configured.

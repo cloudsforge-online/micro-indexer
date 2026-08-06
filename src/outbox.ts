@@ -151,8 +151,8 @@ export async function withOutbox<T>(
  *
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **THIS BREAKS `micro-wallet`'s EVENT INTAKE UNTIL WALLET MOVES, AND THAT IS THE DELIBERATE
- * CHOICE.** `wallet/src/server.ts:824` reads `x-cloudsforge-signature` and only that, through
- * `verifyEventSignature` (`wallet/src/outbox.ts:180-193`), whose own comment says the arm is held
+ * CHOICE.** `wallet/src/server.ts` reads `x-cloudsforge-signature` and only that, through
+ * `verifyEventSignature` (`wallet/src/outbox.ts`), whose own comment says the arm is held
  * open for exactly this producer and "moves when indexer moves, not before". This is that move.
  *
  * A dual emit — both headers, both schemes, for a window — was the other defensible answer and was
@@ -163,8 +163,8 @@ export async function withOutbox<T>(
  *      Retiring that is the whole point of the migration, and a transition that keeps producing it
  *      buys compatibility with the thing being removed.
  *   2. Wallet's intake is ALREADY refusing three other producers, so its single-armed check is one
- *      change that closes four defects rather than one. `settlement` (`settlement/src/outbox.ts:206`),
- *      `ledger` (`ledger/src/outbox.ts:127`) and `identity` (`identity/src/outbox.ts:166`) have all
+ *      change that closes four defects rather than one. `settlement` (`settlement/src/outbox.ts`),
+ *      `ledger` (`ledger/src/outbox.ts`) and `identity` (`identity/src/outbox.ts`) have all
  *      migrated, and each signs `cf-signature`; wallet 401s every one of them today. Adding a
  *      fourth transitional shape would delay the one fix all four need — wallet verifying with
  *      `verifyDelivery`, as `micro-settlement` already does behind `verifyInbound`.
@@ -197,8 +197,8 @@ export function verifyEventSignature(body: string, secret: string, presented: st
  * this builds the envelope and hands it to the CONTRACT'S OWN classifier, so the relay's idea of a
  * valid event and a subscriber's are the same function.
  *
- * **Both of this service's emit sites store nulls in both columns.** `evm.ts:790`, `:935`,
- * `bitcoin.ts:892`, `:1039`, `solana.ts:765` and `:947` all emit with no `actor` and no
+ * **Both of this service's emit sites store nulls in both columns.** `evm.ts`,
+ * `bitcoin.ts`, `solana.ts` and all emit with no `actor` and no
  * `correlationId`, because a chain watcher has no inbound request and no principal behind it — it
  * is woken by a block. Sent through as nulls, that is "actor: missing" and "correlationId: missing"
  * on every deposit event this service has ever written. `system` is the contract's own value for

@@ -9,7 +9,7 @@
  * observes on chain, and drift beyond tolerance freezes withdrawals. `ledger/src/reconcile.ts`
  * takes an optional `indexerObservedTotal` for that comparison, and until this file existed
  * **nothing in the estate could supply one**. `grep -rn indexerObservedTotal ledger/src` found it
- * passed in exactly one place: a test. The scheduled sweep at `ledger/src/jobs.ts:213` never
+ * passed in exactly one place: a test. The scheduled sweep at `ledger/src/jobs.ts` never
  * passed it, so every reconciliation the platform has ever run took the `liability_sum` branch and
  * compared the ledger against the ledger. A fabricated deposit moves custody and liability
  * together, so those runs reported `clean` about coin that does not exist — and because `clean` is
@@ -40,7 +40,7 @@
  * for a reason an operator can act on, and without a number that was never true.
  *
  * This is the same line `reads.tokenBalances` already holds one route over: "a missing balance is
- * missing, never zero, because zero is what evicts a token-gated member" (`server.ts:479`). Zero
+ * missing, never zero, because zero is what evicts a token-gated member" (`server.ts`). Zero
  * here does not evict a member; it says the chain holds nothing, which for a solvency check is the
  * most dangerous sentence in the estate.
  *

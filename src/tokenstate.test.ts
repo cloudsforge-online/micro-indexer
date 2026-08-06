@@ -2,7 +2,7 @@
  * The token observation, and the two things that make it safe to publish.
  *
  * 1. **It is taken at the stored canonical HEAD**, not at the provider-claimed tip, and not at
- *    `latest`. That is the rule `reads.ts:18-30` states for the two reads a money decision goes
+ *    `latest`. That is the rule `reads.ts` states for the two reads a money decision goes
  *    through, and this is a third — `micro-mint`'s risk indicators are computed from it.
  * 2. **The node is made to prove the head is still the head** before a single field is read. A
  *    height alone is not an identity: after a reorg the node has a different block at the same
@@ -51,7 +51,7 @@ test('decimals is a uint8, and anything wider is refused rather than truncated',
   assert.equal(decodeDecimals(`0x${word(18)}`), 18)
   assert.equal(decodeDecimals(`0x${word(0)}`), 0)
   // Truncating this to 255 would render a six-decimal stablecoin a million times too small — the
-  // same failure `reads.ts:366-369` refuses to risk by formatting a token amount at all.
+  // same failure `reads.ts` refuses to risk by formatting a token amount at all.
   assert.equal(decodeDecimals(`0x${word(1_000)}`), null)
 })
 
@@ -235,7 +235,7 @@ test('the observation is taken at the stored head, not at the tip and not at lat
 
   // EVERY call carries the head's block parameter. `latest` anywhere here is a read of blocks
   // nobody in this service has walked, which is the mistake the head-versus-tip rule exists to
-  // stop — see reads.ts:18-30.
+  // stop — see reads.ts.
   const blockParams = asked
     .filter((a) => a.method === 'eth_call' || a.method === 'eth_getCode')
     .map((a) => a.params.at(-1))
@@ -366,7 +366,7 @@ test('a family with no contract state at all refuses before it asks anything', {
 })
 
 test('a halted chain is REPORTED, not refused', { skip }, async () => {
-  // Unlike `tokenBalances`, which withholds a balance on a halted chain (reads.ts:529-532). That
+  // Unlike `tokenBalances`, which withholds a balance on a halted chain (reads.ts). That
   // answer is derived from the whole history the halt says cannot be vouched for; this one depends
   // on exactly one block, and the hash check has just proved the node still serves it.
   await seedHead(98, HEAD_HASH)

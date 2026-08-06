@@ -47,7 +47,7 @@ const WINDOW = 8
  * cannot fire once nothing else is holding the event loop open — and this call is `await`ed at
  * module scope, which means a probe that never settles hangs the whole file and takes the indexer
  * suite with it. `@cloudsforge/http` had the identical bug in its own DEADLINE
- * (`runtime/packages/http/src/index.ts:305`) and its comment records this as the FOURTH instance in
+ * (`runtime/packages/http/src/index.ts`) and its comment records this as the FOURTH instance in
  * the estate; the rule it states is that `unref()` belongs on a timer nobody is waiting for, and
  * somebody is waiting for this one.
  *

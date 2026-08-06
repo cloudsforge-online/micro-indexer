@@ -22,11 +22,11 @@
  *
  * ## Reorg safety: the HEAD, and then proof that the head is still the head
  *
- * `reads.ts:18-30` scopes the estate's rule: confirmations are counted against the stored canonical
+ * `reads.ts` scopes the estate's rule: confirmations are counted against the stored canonical
  * **head** — what this service has actually walked and would have detected a reorg in — and never
  * against `checkpoints.tip_height`, which is only what a provider last claimed. `/confirmations`
- * (`reads.ts:443-444`) and `/token-balances` (`reads.ts:482`) follow it; `/activity`
- * (`reads.ts:345`) and `/transactions/:hash` (`reads.ts:399`) deliberately do not, because they
+ * (`reads.ts`) and `/token-balances` (`reads.ts`) follow it; `/activity`
+ * (`reads.ts`) and `/transactions/:hash` (`reads.ts`) deliberately do not, because they
  * report a record rather than feed a decision.
  *
  * **This read follows the head, with the two head-based reads, and it is not a close call.** The
@@ -50,7 +50,7 @@
  * by the providers this pool fails over between, and a read that works on one provider and 404s on
  * the next is a read whose answer depends on the weather.
  *
- * A **halted** chain is reported, not refused. `tokenBalances` refuses one (`reads.ts:529-532`)
+ * A **halted** chain is reported, not refused. `tokenBalances` refuses one (`reads.ts`)
  * because a balance derived from movements depends on the whole history the halt says cannot be
  * vouched for. This observation depends on exactly one block, and the hash check above has just
  * proved that block is on the node's canonical chain — so the halt is a fact that travels with the

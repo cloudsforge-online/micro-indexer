@@ -18,8 +18,8 @@
  *     carrying a second inbound arm on its account, and `wallet` a second outbound expectation.
  *   - **An envelope the contract refuses.** `version` went out as the integer `1` where the contract
  *     types it "major.minor", and `actor` and `correlation_id` went out as NULL — which they are on
- *     every event this service has ever written, because all six emit sites (`evm.ts:790`, `:935`,
- *     `bitcoin.ts:892`, `:1039`, `solana.ts:765`, `:947`) are woken by a block rather than by a
+ *     every event this service has ever written, because all six emit sites (`evm.ts`,
+ *     `bitcoin.ts`, `solana.ts`) are woken by a block rather than by a
  *     request and name neither. `validateEnvelope` refuses all three.
  *
  * These are one defect wearing two hats: **the producer is free and the consumer is pinned.** So
@@ -84,7 +84,7 @@ export interface ProposedTopic {
  *
  * `indexer` is a permitted `ProducerService` in the contract and owns **zero** registered topics:
  * `topicsProducedBy('indexer')` returns an empty list. Meanwhile `micro-wallet` subscribes to both
- * of these by name (`wallet/src/outbox.ts:82-83`) and credits money off the second. So the deposit
+ * of these by name (`wallet/src/outbox.ts`) and credits money off the second. So the deposit
  * path — the one path in the estate where an event moves a balance — runs entirely on two topic
  * names no registry has ever agreed to. Nothing enforces the payload, nothing enforces the key, and
  * a rename on either side is silent on both.

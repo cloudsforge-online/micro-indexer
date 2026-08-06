@@ -772,7 +772,7 @@ function limitFrom(ctx: RequestContext): number {
  *
  * It was not a harmless one. `micro-explorer-web` could not render a single panel: no token is a
  * 401 and an ordinary customer is a 403, so the public block explorer showed nothing to the public.
- * `docs/ecosystem/15-monetisation-model.md:50` states the rule this broke — "A public chain whose
+ * `docs/ecosystem/15-monetisation-model.md` states the rule this broke — "A public chain whose
  * explorer is paywalled is not a public chain."
  *
  * What is NOT relaxed:

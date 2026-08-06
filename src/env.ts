@@ -166,11 +166,11 @@ export interface Env {
    * than a constant in `custody.ts`: the taxonomy belongs to the platform. The default is the two
    * prefixes the estate actually writes and intends to write —
    *
-   *   * `deposit:` — `wallet/src/deposits.ts:284` labels every assigned deposit address
+   *   * `deposit:` — `wallet/src/deposits.ts` labels every assigned deposit address
    *     `deposit:<userId>`, and a confirmed arrival there is debited to the ledger's `custody`
-   *     asset account (`wallet/src/deposits.ts:627`). These ARE the custody position.
+   *     asset account (`wallet/src/deposits.ts`). These ARE the custody position.
    *   * `treasury:` — nothing writes this today. `micro-settlement` sweeps deposits to a pinned
-   *     treasury address (`settlement/src/bitcoin.ts:814`) but holds no `indexer:write` grant, so
+   *     treasury address (`settlement/src/bitcoin.ts`) but holds no `indexer:write` grant, so
    *     treasury addresses are not registered here at all. The prefix is carried so that fixing
    *     that is a registration and not another deploy change, and so the gap is visible in this
    *     comment rather than only in a drift six weeks from now. A swept deployment under-reports

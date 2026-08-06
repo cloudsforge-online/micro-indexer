@@ -347,7 +347,7 @@ test('the signature carries a timestamp, so a captured delivery is not a permane
 /**
  * A guard that proves a topic name is correct proves nothing about whether the emit is reached.
  *
- * `identity/src/sessions.ts:390` exports `emitSessionRevoked` and NOTHING CALLS IT — so
+ * `identity/src/sessions.ts` exports `emitSessionRevoked` and NOTHING CALLS IT — so
  * `identity.session.revoked` is produced by dead code while identity's own guard passes, because it
  * scans literals rather than reachability. This is the cheapest check that catches that exact shape.
  *
