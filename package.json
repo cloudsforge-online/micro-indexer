@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/indexer",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "The multi-chain indexer. One normalised schema, a worker per chain family, checkpointing, reorg recovery and provider failover. Replaces balance-probing (AD-07).",
   "license": "MIT",
@@ -20,8 +20,8 @@
   "_runtimeDependencies": [
     "The six @cloudsforge/* runtime packages, @cloudsforge/contracts-chain and",
     "@cloudsforge/contracts-events are consumed as file:/link: paths because they are not published",
-    "yet. Once AD-02 lands they become registry versions and these paths \u2014 plus the two named build",
-    "contexts in the Dockerfile and the extra checkouts in CI \u2014 are deleted. Nothing else in this",
+    "yet. Once AD-02 lands they become registry versions and these paths — plus the two named build",
+    "contexts in the Dockerfile and the extra checkouts in CI — are deleted. Nothing else in this",
     "repository changes.",
     "@cloudsforge/contracts-events is `link:` rather than `file:` for the reason ledger, wallet and",
     "settlement use link: for it: it is source consumed by tsc, not a package to be copied into this",
@@ -29,7 +29,7 @@
     "The runtime packages take a caret range on publish ('^1.0.0'). contracts-chain does NOT:",
     "it takes an EXACT pin ('1.0.0'), because wallet, settlement, custody and indexer must agree",
     "byte-for-byte on confirmation depths and amount maths. A caret there is money credited at",
-    "the wrong depth \u2014 see the package's own header.",
+    "the wrong depth — see the package's own header.",
     "tsx is a runtime dependency for the same reason: the unpublished packages resolve to their",
     "TypeScript sources. On publish their publishConfig points at dist/, tsx moves to",
     "devDependencies, and the image runs 'node dist/index.js'."

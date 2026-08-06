@@ -63,6 +63,21 @@ import { CHAIN_IDS, NETWORKS } from './chains.ts'
  */
 const chainList = CHAIN_IDS.map((c) => `'${c}'`).join(',')
 const networkList = NETWORKS.map((n) => `'${n}'`).join(',')
+/**
+ * **FROZEN. Migrations 4 and 5 are already applied, and their TEXT is their identity.**
+ *
+ * `@cloudsforge/db` hashes each migration's SQL and refuses to run when an applied one has changed
+ * — "add a new migration instead of editing a released one". Deriving `CHAIN_CK` from `CHAIN_IDS`
+ * was right for new migrations and wrong for these two: adding `ltc` to the type silently rewrote
+ * SQL that Postgres had already executed, so every existing estate refused to migrate and the
+ * service could not start. Correct guard, real outage.
+ *
+ * So the historical spelling is pinned here, exactly as it shipped. It must never be regenerated
+ * from anything: a constant that can change is not a constant a migration may contain.
+ */
+const CHAIN_CK_AS_APPLIED = `check (chain in ('ember','eth','btc','sol','xrp'))`
+
+/** Derived, for migrations written from version 6 onward. Adding a chain to the type allows it. */
 const CHAIN_CK = `check (chain in (${chainList}))`
 const NETWORK_CK = `check (network in (${networkList}))`
 
@@ -181,7 +196,7 @@ export const MIGRATIONS: readonly Migration[] = [
         indexed_at  timestamptz not null default now(),
         updated_at  timestamptz not null default now(),
         constraint blocks_pk primary key (chain, network, hash),
-        constraint blocks_chain_ck ${CHAIN_CK},
+        constraint blocks_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint blocks_network_ck ${NETWORK_CK},
         constraint blocks_status_ck check (status in ('pending','included','finalised','orphaned')),
         constraint blocks_height_ck check (height >= 0)
@@ -222,7 +237,7 @@ export const MIGRATIONS: readonly Migration[] = [
         -- transaction re-included in a different block after a reorg updates this row in place
         -- rather than producing a second one.
         constraint transactions_pk primary key (chain, network, hash),
-        constraint transactions_chain_ck ${CHAIN_CK},
+        constraint transactions_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint transactions_network_ck ${NETWORK_CK},
         constraint transactions_status_ck
           check (status in ('pending','success','failed','dropped','orphaned')),
@@ -253,7 +268,7 @@ export const MIGRATIONS: readonly Migration[] = [
         data         text    not null default '0x',
         status       text    not null default 'included',
         constraint logs_pk primary key (chain, network, tx_hash, log_index),
-        constraint logs_chain_ck ${CHAIN_CK},
+        constraint logs_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint logs_network_ck ${NETWORK_CK},
         constraint logs_status_ck check (status in ('included','orphaned')),
         constraint logs_index_ck check (log_index >= 0),
@@ -298,7 +313,7 @@ export const MIGRATIONS: readonly Migration[] = [
         confirmed_at  timestamptz,
         reorged_at    timestamptz,
         updated_at    timestamptz   not null default now(),
-        constraint address_activity_chain_ck ${CHAIN_CK},
+        constraint address_activity_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint address_activity_network_ck ${NETWORK_CK},
         constraint address_activity_direction_ck check (direction in ('in','out')),
         constraint address_activity_kind_ck check (asset_kind in ('native','token')),
@@ -344,7 +359,7 @@ export const MIGRATIONS: readonly Migration[] = [
         halt_reason text,
         updated_at  timestamptz not null default now(),
         constraint checkpoints_pk primary key (chain, network, stream),
-        constraint checkpoints_chain_ck ${CHAIN_CK},
+        constraint checkpoints_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint checkpoints_network_ck ${NETWORK_CK},
         constraint checkpoints_range_ck check ((range_from is null) = (range_to is null)),
         constraint checkpoints_range_order_ck
@@ -369,7 +384,7 @@ export const MIGRATIONS: readonly Migration[] = [
         orphaned_transactions  integer     not null default 0,
         orphaned_activity      integer     not null default 0,
         orphaned_block_hashes  text[]      not null default '{}',
-        constraint reorgs_chain_ck ${CHAIN_CK},
+        constraint reorgs_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint reorgs_network_ck ${NETWORK_CK},
         constraint reorgs_depth_ck check (depth > 0)
       );
@@ -396,7 +411,7 @@ export const MIGRATIONS: readonly Migration[] = [
         rate_limited_until   timestamptz,
         updated_at           timestamptz not null default now(),
         constraint provider_health_pk primary key (chain, network, provider),
-        constraint provider_health_chain_ck ${CHAIN_CK},
+        constraint provider_health_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint provider_health_network_ck ${NETWORK_CK},
         constraint provider_health_state_ck check (state in ('healthy','degraded','down'))
       );
@@ -417,7 +432,7 @@ export const MIGRATIONS: readonly Migration[] = [
         label    text,
         added_at timestamptz not null default now(),
         constraint watched_addresses_pk primary key (chain, network, address),
-        constraint watched_addresses_chain_ck ${CHAIN_CK},
+        constraint watched_addresses_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint watched_addresses_network_ck ${NETWORK_CK}
       );
     `,
@@ -466,7 +481,7 @@ export const MIGRATIONS: readonly Migration[] = [
         status           text    not null default 'included',
         constraint spent_outpoints_pk
           primary key (chain, network, spending_tx_hash, txid, vout),
-        constraint spent_outpoints_chain_ck ${CHAIN_CK},
+        constraint spent_outpoints_chain_ck ${CHAIN_CK_AS_APPLIED},
         constraint spent_outpoints_network_ck ${NETWORK_CK},
         constraint spent_outpoints_status_ck check (status in ('included','orphaned')),
         constraint spent_outpoints_vout_ck check (vout >= 0),
