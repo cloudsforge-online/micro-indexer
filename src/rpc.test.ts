@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { HttpClient } from '@cloudsforge/http'
 import { FakeChain, deadClient, fakeClient, throttledClient } from './fakechain.ts'
-import { RpcError, RpcPool, RpcUnavailableError } from './rpc.ts'
+import { RpcError, RpcPool, RpcUnavailableError, basicAuthFor } from './rpc.ts'
 
 const SCOPE = { chain: 'ember', network: 'testnet' } as const
 
@@ -202,4 +202,38 @@ test('a success clears the failure streak and the backoff', async () => {
   // Totals are cumulative, so the incident is still visible after recovery.
   assert.equal(health?.totalFailures, 3)
   assert.equal(health?.totalRequests, 4)
+})
+
+/**
+ * Regression. `URL.origin` discards userinfo, so a credential written into an RPC endpoint url was
+ * dropped before the request was built.
+ *
+ * **Why this survived is the point: it fails as a 401**, which is exactly what a wrong password
+ * looks like. Every diagnosis therefore pointed at the credential — the node's config, the rpcauth
+ * hash, the password itself — and never at the client that silently declined to send it. It cost a
+ * Litecoin integration most of a session, and `settlement/src/registry.ts:161` has the same shape.
+ *
+ * Bitcoin Core and its forks authenticate RPC with HTTP Basic and offer nothing else, so without
+ * this a self-hosted node is unreachable no matter how the credential is configured.
+ */
+test('a credential in an rpc url survives URL.origin and reaches the request', () => {
+  const header = basicAuthFor('http://someuser:s0me-p4ss@127.0.0.1:50002')
+  assert.ok(header !== undefined, 'credentials in the url must produce an Authorization header')
+
+  // Decoded rather than compared against a base64 literal, so the assertion states the PROPERTY —
+  // the node receives the user and password it was given — instead of pinning one spelling of it.
+  const decoded = Buffer.from(header.replace(/^Basic /, ''), 'base64').toString()
+  assert.equal(decoded, 'someuser:s0me-p4ss')
+})
+
+test('percent-encoded credentials are decoded, because a generated password may contain @ or :', () => {
+  const header = basicAuthFor('http://user%40host:p%3Ass%2Fword@127.0.0.1:50002')
+  const decoded = Buffer.from(String(header).replace(/^Basic /, ''), 'base64').toString()
+  assert.equal(decoded, 'user@host:p:ss/word')
+})
+
+test('a url with no credentials sends no header, because an empty one is refused outright', () => {
+  // The control. Without it, a helper that returned a header unconditionally would pass both of
+  // the assertions above while breaking every anonymous endpoint in the estate.
+  assert.equal(basicAuthFor('http://127.0.0.1:8545'), undefined)
 })

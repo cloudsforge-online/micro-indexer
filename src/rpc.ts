@@ -117,6 +117,27 @@ const RATE_LIMIT_TEXT = /rate.?limit|too many requests|request limit|throttl/i
 
 const MAX_BACKOFF_MS = 60_000
 
+/**
+ * The `Authorization` value for an RPC url that carries credentials, or `undefined` when it does
+ * not.
+ *
+ * Exported so it can be tested directly. `URL.origin` — which is what the client is built from —
+ * DISCARDS USERINFO, so `http://user:pass@host:port` loses its credential silently and the node
+ * answers **401**. That is the same reply a wrong password produces, which is why the defect
+ * survived: every diagnosis pointed at the credential, and none at the client that declined to
+ * send it.
+ *
+ * Bitcoin Core and its forks authenticate RPC with HTTP Basic and offer no alternative, so this is
+ * the only way to reach a self-hosted `litecoind` or `bitcoind`.
+ */
+export function basicAuthFor(url: string): string | undefined {
+  const parsed = new URL(url)
+  if (parsed.username === '') return undefined
+  const user = decodeURIComponent(parsed.username)
+  const pass = decodeURIComponent(parsed.password)
+  return `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`
+}
+
 export class RpcPool {
   readonly #scope: ChainScope
   readonly #endpoints: readonly RpcEndpoint[]
@@ -145,8 +166,20 @@ export class RpcPool {
         const existing = this.#clients.get(endpoint.name)
         if (existing) return existing
         const parsed = new URL(endpoint.url)
+        // `URL.origin` DISCARDS USERINFO. `http://user:pass@host:port` has an origin of
+        // `http://host:port`, so a credential written into an RPC URL was dropped here silently
+        // and the node answered 401 — which reads as "wrong password" when the password was
+        // never sent at all.
+        //
+        // Bitcoin Core and its forks authenticate RPC with HTTP Basic and offer no alternative,
+        // so a self-hosted `litecoind` or `bitcoind` is unreachable without this. It is carried
+        // as a default header rather than left in the URL because the URL is also what `hostOf`
+        // reports into `provider_health` and into the failure metric, and a password belongs in
+        // neither.
+        const basic = basicAuthFor(endpoint.url)
         const client = new HttpClient({
           baseUrl: parsed.origin,
+          ...(basic === undefined ? {} : { headers: { authorization: basic } }),
           // The breaker and the metrics are keyed on this, so it is the operator's name for the
           // endpoint and never the URL — an RPC URL's query string holds the API key.
           name: `rpc:${this.#scope.chain}:${this.#scope.network}:${endpoint.name}`,
