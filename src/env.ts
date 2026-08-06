@@ -22,6 +22,8 @@
  */
 
 import { hostname } from 'node:os'
+
+import { assertGeneratedSecret } from '@cloudsforge/secrets'
 import { isChainId, isNetwork, scopeKey, type ChainScope } from './chains.ts'
 
 /**
@@ -42,22 +44,6 @@ export class EnvError extends Error {
   }
 }
 
-/**
- * Values that must never be accepted. The list is short on purpose: it holds the strings that
- * actually appear in this repository's own `.env.example` and compose files, because those are
- * the ones that get copied into a deployment by someone in a hurry.
- */
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'dev-secret',
-  'dev-outbox-signing-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
-
 type Source = Readonly<Record<string, string | undefined>>
 
 function required(source: Source, name: string): string {
@@ -66,15 +52,28 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
+/**
+ * The deny-list-and-length pair this replaces was not merely weak, it was measurably insufficient:
+ * `estate-only-outbox-secret-` padded with zeros ran as a LIVE signing key across 44 containers on
+ * both networks. It cleared the 24-character floor at 40 characters, and it was not among the eight
+ * strings the list happened to name.
+ *
+ * A membership test can only refuse a placeholder somebody already imagined — so it fails in the
+ * one case it exists for. And length is not entropy: `'x'.repeat(24)` clears any 24-char floor
+ * while carrying almost no key material.
+ *
+ * `assertGeneratedSecret` measures bytes of key material for the alphabet the value is written in,
+ * which refuses both without needing to have met either before.
+ */
+function requiredSecret(source: Source, name: string): string {
   const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
+  // Re-wrapped, not re-thrown: `loadEnv` promises one error class, and a caller catching `EnvError`
+  // should not start seeing a second one because the check underneath got better. The message is
+  // carried verbatim, so the boot line an operator reads is the guard's own words.
+  try {
+    assertGeneratedSecret(name, value)
+  } catch (err) {
+    throw new EnvError(err instanceof Error ? err.message : String(err))
   }
   return value
 }

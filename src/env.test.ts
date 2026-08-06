@@ -13,7 +13,9 @@ const BASE: Record<string, string> = {
   INDEXER_DATABASE_URL: 'postgres://cloudsforge@127.0.0.1:5432/indexer',
   IDENTITY_JWKS_URL: 'https://id.example/.well-known/jwks.json',
   IDENTITY_ISSUER: 'https://id.example',
-  OUTBOX_SIGNING_SECRET: 'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4',
+  // 32 BYTES of key material, not 32 characters — the old fixture was 32 mixed-alphabet chars
+  // carrying 24 bytes, so it pinned the length floor rather than the entropy bar.
+  OUTBOX_SIGNING_SECRET: 'AYJA6kVxSWfFdSIATMrBpu/KnKg4hZmGAkXb0WjBi6Y=',
 }
 for (const [key, value] of Object.entries(BASE)) process.env[key] = value
 
@@ -119,15 +121,33 @@ test('the chain list refuses an unknown chain, an unknown network and a duplicat
   assert.throws(() => parseChainList('ember:testnet,ember:testnet'), EnvError)
 })
 
-test('a placeholder signing secret is refused outright', () => {
+test('a signing secret is measured in key material, not in characters', () => {
   assert.throws(
     () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'changeme' }),
     (err: unknown) => err instanceof EnvError && /placeholder/.test(err.message),
   )
+
+  // This assertion used to read `/at least 24 characters/`, and that was the defect rather than
+  // the check: it pinned CHARACTERS as the unit, which is the bar the real leak walked through.
   assert.throws(
     () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'short' }),
-    (err: unknown) => err instanceof EnvError && /at least 24 characters/.test(err.message),
+    (err: unknown) => err instanceof EnvError && /bytes of key material/.test(err.message),
   )
+
+  // The value that actually ran as a live signing key across 44 containers on both networks. It is
+  // 40 characters, so every length floor of 24 accepted it, and it was not among the eight strings
+  // the old deny-list happened to name. Both of the old checks passed it; this one does not.
+  assert.throws(
+    () => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: `estate-only-outbox-secret-${'0'.repeat(14)}` }),
+    EnvError,
+  )
+
+  // 24 characters of one repeated character clears any 24-char floor and carries almost nothing.
+  assert.throws(() => loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: 'x'.repeat(24) }), EnvError)
+
+  // And the control that makes the four refusals meaningful: a genuine key still boots. Without
+  // this, a guard that refused everything would pass every assertion above.
+  assert.ok(loadEnv({ ...BASE, OUTBOX_SIGNING_SECRET: BASE.OUTBOX_SIGNING_SECRET }))
 })
 
 test('exactly one connection-string variable is declared', () => {
