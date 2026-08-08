@@ -536,6 +536,66 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
     ).join('\n'),
   },
+  {
+    version: 7,
+    name: 'utxo-custody-history',
+    // ------------------------------------------------------------------------------------------
+    // ONE NULLABLE COLUMN, AND IT IS THE WHOLE OF WHY A UTXO CUSTODY TOTAL MAY BE BELIEVED.
+    //
+    // `custody.ts` reads an EVM balance from the chain — `eth_getBalance` at the confirmed height,
+    // which is the account's real balance whatever this service did or did not walk. Litecoin has
+    // no such call. Stock Litecoin Core keeps no address index, so the only balance available for
+    // an address the node's wallet does not own is one DERIVED from the outputs paying it minus the
+    // outpoints spent from it, both of which are facts this service recorded while following.
+    //
+    // A derivation is exact only over a range that was actually walked, and it has two failure
+    // modes with opposite signs:
+    //
+    //   * a gap in the walked record loses receipts (understates, positive drift, freeze) and loses
+    //     spends (overstates, negative drift, freeze while solvent — the 2026-08-05 shape);
+    //   * activity BELOW the earliest block this service ever walked is invisible entirely, and no
+    //     amount of care inside the query can see it.
+    //
+    // The first is checkable here and is checked: contiguous canonical coverage from `lo` to the
+    // confirmed height. The second is not knowable by this service at all, and the honest thing is
+    // to be told rather than to assume. So an address may carry a CLAIM:
+    //
+    //     history_from_height = "this address had no chain activity below this height"
+    //
+    // That is a claim only its registrar can make, and it can make it truthfully in exactly one
+    // situation: it has just derived the key, so nothing can have paid the address before now.
+    // `micro-custody` derives, `micro-wallet` and `micro-settlement` register, and the watch route
+    // takes `freshlyDerived: true` and stamps this service's own canonical head — a height it has
+    // walked, so the coverage half of the proof is satisfied by construction.
+    //
+    // NULL means UNKNOWN, and unknown means the observation is refused (`history_unknown`). That is
+    // not a migration that leaves work behind; it is the correct answer for every row that exists
+    // today. Both `ltc:mainnet` deposit addresses on the live estate were registered by a build
+    // that made no such claim, and no back-fill could invent one — the whole content of the column
+    // is a statement about a moment that has passed. An operator who knows the funding history of a
+    // specific address can state it deliberately, per address, and that is the only way it is ever
+    // set retroactively.
+    //
+    // Nullable and defaulted to nothing, so this is expand-only: the previous release neither reads
+    // nor writes the column, and a replica still running it is unaffected.
+    up: `
+      alter table watched_addresses
+        add column if not exists history_from_height bigint;
+
+      alter table watched_addresses drop constraint if exists watched_addresses_history_ck;
+      alter table watched_addresses add constraint watched_addresses_history_ck
+        check (history_from_height is null or history_from_height >= 0);
+
+      -- The derivation's access path: every canonical inbound native movement for one address at
+      -- or below a height. 'address_activity_lookup_idx' leads on the same three columns and would
+      -- serve it, but it carries every direction and every status, so on a deposit address with a
+      -- long outbound history the planner reads rows it then throws away. This one is the predicate
+      -- exactly, and it is partial, so it costs almost nothing to keep.
+      create index if not exists address_activity_utxo_credit_idx
+        on address_activity (chain, network, address, block_height)
+        where direction = 'in' and status = 'included' and asset_kind = 'native';
+    `,
+  },
 ]
 
 /**
