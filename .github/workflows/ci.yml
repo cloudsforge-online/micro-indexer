@@ -16,7 +16,14 @@ on:
     # `release/**` builds too. A release branch carries the estate-wide version bump, and it
     # has to publish its images before testnet can be deployed from it — which is what proves
     # the release before anything is merged. Mainnet is unaffected: it pins a version tag.
-    branches: [main, 'release/**']
+    #
+    # `feat/**` builds for the same reason one step earlier. The estate deploys IMAGES, not source,
+    # so a change that can only be proved on a running estate can only be proved by an image — and
+    # a branch that cannot produce one can only be tested by merging it first, which is the thing
+    # the prove-before-merge rule exists to prevent. It publishes `sha-<sha>` and nothing else: a
+    # feature branch does not carry a version bump, and `:main` is gated on `refs/heads/main` in
+    # the producer since micro-org#270, so this cannot move a tag anything pins.
+    branches: [main, 'release/**', 'feat/**']
   pull_request:
     branches: [main]
 
@@ -70,11 +77,14 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────────────────────────
   publish:
     needs: [ci, hygiene]
-    # A green push to main and nothing else. An image tag a release manifest pins has to name
-    # something that passed, on the branch it will be deployed from.
+    # A green push, and only from a ref this list names. An image tag a release manifest pins has
+    # to name something that passed, on the branch it will be deployed from — and `feat/**` is
+    # here so that a change can be proved on the estate BEFORE it merges rather than after. The
+    # producer decides what each ref is allowed to tag; this only decides whether it runs at all.
     if: >-
       github.event_name == 'push' && (github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/heads/release/'))
+      startsWith(github.ref, 'refs/heads/release/') ||
+      startsWith(github.ref, 'refs/heads/feat/'))
     uses: cloudsforge-online/micro-org/.github/workflows/publish-image.yml@main
     with:
       kind: service

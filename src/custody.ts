@@ -162,6 +162,8 @@ import {
   custodyAddresses,
   getCheckpoint,
   headBlock,
+  nextUnfinishedBackfill,
+  partialFromHeight,
   unspentOutputTotals,
   type AddressHistory,
   type CustodyAddress,
@@ -193,6 +195,10 @@ export type CustodyTotalFault =
   // backfill, which are different mornings.
   | 'history_unknown'
   | 'history_not_walked'
+  // A backfill is running over blocks this total is summed from. Its own code because the morning
+  // it names is the only one where the answer is "wait": nothing is broken, nothing needs an
+  // operator, and the record is being repaired as the freeze is read.
+  | 'backfill_in_flight'
   // The breakdown and the total disagree. Unreachable by construction — see `groupByPrefix` — and
   // given its own code anyway, because the other codes all name something an operator can go and
   // look at, and this one names a defect in this file. Reusing `address_unreadable` for it would
@@ -699,6 +705,13 @@ async function assertNodeAgrees(
  *
  * This is the one place in this file where a null becomes a number, and it is written out at length
  * because everywhere else in it a null becoming a number is the defect.
+ *
+ * **3. No rescan in flight over the range.** Added when a block became able to record only the
+ * addresses that were watched when it was walked. Registering an address late enqueues a walk of
+ * blocks that already exist, and a walk that rewrites existing blocks leaves proof 1 satisfied the
+ * entire time it is running — the coverage is contiguous, and the rows are half written. That is the
+ * one way a hole can hide from a contiguity check, so it is checked separately.
+ * `backfill_in_flight`.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 async function deriveBalances(
@@ -729,6 +742,36 @@ async function deriveBalances(
       `the canonical record from ${lo} to ${anchor.at} has ${coverage.blocks} blocks up to ` +
         `${coverage.highestHeight} and needs ${needed} up to ${anchor.at} — a derived balance over ` +
         'a record with a hole in it is wrong in both directions at once. Backfill the gap.',
+    )
+  }
+  // Contiguity is necessary and, once a block can be walked for only some addresses, no longer
+  // sufficient. A rescan enqueued because an address was registered late walks blocks that ALREADY
+  // EXIST, so it puts no hole in the coverage above and the count check passes throughout — while
+  // the rows it is there to write are, by definition, not all written yet. Summing across it
+  // understates, which is positive drift, which freezes an asset over a repair that was in progress
+  // the whole time. Refusing says the same thing without the wrong number attached.
+  //
+  // The lowest unfinished range is the only one worth testing: `nextUnfinishedBackfill` orders by
+  // `range_from`, so if that one starts above the confirmed height every other one does too.
+  //
+  // And only on a record that can be narrow. Where every address was recorded, a backfill over
+  // blocks that already exist rewrites them to what they already say — the writes are idempotent
+  // and nothing is deleted first — so it cannot move this number, and refusing over it would
+  // freeze an asset for the duration of an operator's deliberate, harmless catch-up. The second
+  // query is deliberately behind the first: it is reached only when a backfill is actually
+  // pending, which is the rare case.
+  const rescan = await nextUnfinishedBackfill(deps.sql, scope)
+  if (
+    rescan !== null &&
+    rescan.rangeFrom !== null &&
+    rescan.rangeFrom <= anchor.at &&
+    (await partialFromHeight(deps.sql, scope)) !== null
+  ) {
+    throw new CustodyTotalUnavailableError(
+      'backfill_in_flight',
+      `${rescan.stream} on ${scopeKey(scope)} has reached ${rescan.height ?? 'nothing'} of ` +
+        `${rescan.rangeTo} and covers blocks at or below the confirmed height ${anchor.at} — the ` +
+        'record it is rewriting is the record this total sums, so the total is not yet a total',
     )
   }
   for (const entry of entries) {

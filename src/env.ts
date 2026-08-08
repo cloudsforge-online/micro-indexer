@@ -103,6 +103,22 @@ function bounded(source: Source, name: string, fallback: number, min: number, ma
   return value
 }
 
+/**
+ * A boolean, and only the two spellings of one.
+ *
+ * Deliberately not `raw !== 'false'`, which is the usual shape and which turns a typo into the
+ * opposite of what the operator meant while starting cleanly. Everything this service reads from
+ * the environment refuses rather than guesses, and a flag that decides how much of the chain is
+ * stored is not the place to start guessing.
+ */
+function flag(source: Source, name: string, fallback: boolean): boolean {
+  const raw = source[name]?.trim().toLowerCase()
+  if (!raw) return fallback
+  if (raw === 'true') return true
+  if (raw === 'false') return false
+  throw new EnvError(`${name} must be true or false (got ${raw})`)
+}
+
 /** One RPC endpoint. `name` is what appears in `provider_health` and in the failure metric. */
 export interface EndpointConfig {
   readonly name: string
@@ -158,6 +174,29 @@ export interface Env {
   /** The same bound for a backfill pass. Separate, because backfill is allowed to be slower. */
   readonly backfillBatchBlocks: number
   readonly rpcDeadlineMs: number
+  /**
+   * Whether a Bitcoin-family block writes `address_activity` only for watched addresses.
+   *
+   * The default is on, and the reason is arithmetic rather than taste. Following `ltc:mainnet`
+   * cost 2.05 MB per block with indexes, of which the address record is the largest part, and the
+   * watched set did not move across the measurement — the cost tracks the chain's transaction
+   * volume, not the number of customers. Adding `btc:mainnet` on top of that fills the host's
+   * remaining disk in under two months, and an indexer that runs out of disk stops observing
+   * deposits for every chain at once.
+   *
+   * **Turning it off is not free either.** `address_activity` was written for every address on
+   * purpose — the block explorer and `wallet`'s portfolio both read it for addresses nobody
+   * registered — so this trades a product surface for the ability to follow a second UTXO chain.
+   * The switch exists so that trade is an operator's decision per deployment and reversible
+   * without a build, and so a deployment with disk to spare can decline it. What it cannot do is
+   * restore the record for blocks already walked without it: that is a backfill, and
+   * `blocks.detail` marks which blocks need one.
+   *
+   * Bitcoin-family only. The account-model chains are not where the bytes are, and their read
+   * consumers — `foresight`'s contract mirror, `community`'s token gating — are exactly the ones
+   * that ask about addresses this service was never told to watch.
+   */
+  readonly watchedAddressesOnly: boolean
   /**
    * Which watched addresses count as holding platform money, by label prefix.
    *
@@ -374,6 +413,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     followBatchBlocks: bounded(source, 'INDEXER_FOLLOW_BATCH_BLOCKS', 25, 1, 500),
     backfillBatchBlocks: bounded(source, 'INDEXER_BACKFILL_BATCH_BLOCKS', 50, 1, 1_000),
     rpcDeadlineMs: bounded(source, 'INDEXER_RPC_DEADLINE_MS', 8_000, 250, 120_000),
+    watchedAddressesOnly: flag(source, 'INDEXER_WATCHED_ADDRESSES_ONLY', true),
     custodyLabelPrefixes: parseCustodyPrefixes(
       optional(source, 'INDEXER_CUSTODY_LABEL_PREFIXES', 'deposit:,treasury:'),
     ),

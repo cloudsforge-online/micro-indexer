@@ -847,14 +847,33 @@ export async function listProviderHealth(
  *
  * `'head'` is the claim a service that has JUST DERIVED THE KEY is entitled to make and the one it
  * can make without knowing anything about the chain: "nothing can have paid this address before
- * now". It is resolved here, against this service's own canonical head, rather than by the caller —
- * a caller-supplied height would be a height this service might not have walked, and the whole
- * purpose of the column is to be comparable with what it walked.
+ * now". It is resolved here, against this service's own view of the chain, rather than by the
+ * caller — a caller-supplied height would be a height this service might not have walked, and the
+ * whole purpose of the column is to be comparable with what it walked.
  *
  * A number is an operator stating a fact deliberately about an address whose funding history they
  * know. Null is silence, and silence is refused rather than assumed downstream.
  */
 export type HistoryClaim = number | 'head' | null
+
+/**
+ * What a registration actually changed, which is the input to deciding whether to rescan.
+ *
+ * A watch is idempotent and `micro-wallet` re-registers on a blunt retry job, so "an address is
+ * watched" is not news and must not cost anything. What IS news is the two cases where blocks this
+ * service has already walked were walked without knowing about the address: the first registration,
+ * and a re-registration whose claim reaches further back than the one on file. Reporting them
+ * separately from the outcome is what keeps the retry job from re-enqueueing the same backfill on
+ * every pass.
+ */
+export interface WatchOutcome {
+  /** The claim now on file, after `least`. Null means nobody has ever made one. */
+  readonly historyFromHeight: number | null
+  /** This call is the first time the address was watched at all. */
+  readonly firstWatch: boolean
+  /** This call reached the claim further back than it already was. */
+  readonly claimLowered: boolean
+}
 
 export async function watchAddress(
   exec: Exec,
@@ -862,26 +881,71 @@ export async function watchAddress(
   address: string,
   label: string | null,
   history: HistoryClaim = null,
-): Promise<void> {
+): Promise<WatchOutcome> {
   // Read outside the insert, and a stale head is safe in the only direction that matters: it is a
   // LOWER claim than the truth, and a lower claim can only make a later observation refuse.
-  const historyFromHeight = history === 'head' ? ((await headBlock(exec, scope))?.height ?? 0) : history
-  await exec`
-    insert into watched_addresses (chain, network, address, label, history_from_height)
-    values (${scope.chain}, ${scope.network}, ${address}, ${label}, ${historyFromHeight})
-    on conflict (chain, network, address) do update
-      set label = excluded.label,
-          -- LEAST, and it ignores nulls in postgres, so this keeps the LOWEST claim either
-          -- registration made and never loses one to a re-registration that made none. The
-          -- direction matters: the column says "no activity below this height", so a lower number
-          -- is a STRONGER statement and a higher one would quietly narrow what the derivation is
-          -- allowed to see. A re-watch is routine — micro-wallet re-registers on a retry job —
-          -- and routine must not be able to weaken a solvency input.
-          history_from_height = least(
-            watched_addresses.history_from_height,
-            excluded.history_from_height
-          )
+  //
+  // The TIP is taken alongside it and the higher of the two is used, which matters only once the
+  // record can be incomplete for an address. A follower commits the tip it observed before it
+  // indexes any block of that tick, so no block above the observed tip has been walked yet — while
+  // a block BETWEEN the head and the tip may be mid-flight, having already asked which addresses
+  // were watched and got an answer that predates this registration. Claiming the head would leave
+  // that block inside the range the derivation trusts and outside the range this address was
+  // recorded in. Claiming the tip does not: `'head'` is the claim of a caller that has just derived
+  // the key, and "nothing has paid it below the tip" is as true as "nothing has paid it below the
+  // head" for an address that did not exist a moment ago.
+  const historyFromHeight =
+    history === 'head'
+      ? Math.max(
+          (await headBlock(exec, scope))?.height ?? 0,
+          (await getCheckpoint(exec, scope, TIP_STREAM))?.tipHeight ?? 0,
+        )
+      : history
+  // The prior claim is read in the same statement as the write rather than before it, so that two
+  // registrations racing cannot both conclude they changed nothing. `before` is evaluated against
+  // the snapshot the insert starts from, which is exactly the state this call is displacing.
+  const rows = await exec<
+    { history_from_height: string | null; inserted: boolean; before: string | null }[]
+  >`
+    with before as (
+      select history_from_height
+        from watched_addresses
+       where chain = ${scope.chain} and network = ${scope.network} and address = ${address}
+    ),
+    upserted as (
+      insert into watched_addresses (chain, network, address, label, history_from_height)
+      values (${scope.chain}, ${scope.network}, ${address}, ${label}, ${historyFromHeight})
+      on conflict (chain, network, address) do update
+        set label = excluded.label,
+            -- LEAST, and it ignores nulls in postgres, so this keeps the LOWEST claim either
+            -- registration made and never loses one to a re-registration that made none. The
+            -- direction matters: the column says "no activity below this height", so a lower number
+            -- is a STRONGER statement and a higher one would quietly narrow what the derivation is
+            -- allowed to see. A re-watch is routine — micro-wallet re-registers on a retry job —
+            -- and routine must not be able to weaken a solvency input.
+            history_from_height = least(
+              watched_addresses.history_from_height,
+              excluded.history_from_height
+            )
+      returning history_from_height, (xmax = 0) as inserted
+    )
+    select upserted.history_from_height, upserted.inserted,
+           (select history_from_height from before) as before
+      from upserted
   `
+  const row = rows[0]
+  if (!row) throw new Error('watched_addresses upsert returned no row')
+  // `bigint` arrives as a string, and a string comparison below would decide that 900 is lower
+  // than 1000 — which would enqueue a rescan for a re-registration that lowered nothing.
+  const now = row.history_from_height === null ? null : Number(row.history_from_height)
+  const before = row.before === null ? null : Number(row.before)
+  return {
+    historyFromHeight: now,
+    firstWatch: row.inserted,
+    // A claim that was null and is now a number reaches further back than nothing did, because
+    // null is not a low claim — it is no claim, and it is refused rather than believed.
+    claimLowered: !row.inserted && now !== null && (before === null || now < before),
+  }
 }
 
 /**
@@ -936,6 +1000,15 @@ export interface CustodyAddress extends AddressHistory {
  * `status = 'included'` on both sides. An orphaned or conflicted credit is not money, and an
  * orphaned or conflicted spend did not happen; taking either at face value would move the total in
  * the direction of whichever reorg is currently unrepaired.
+ *
+ * **It survives an incomplete address record, and that is not an accident.** When the Bitcoin
+ * worker is recording only watched addresses (`INDEXER_WATCHED_ADDRESSES_ONLY`), both sides of this
+ * query lose rows — but they lose them together and under one rule: a spend row is dropped only
+ * when the outpoint it consumes provably has no credit row here, which is the same predicate as
+ * "the credit was never written". Every credit that exists still has its cancelling spend, so the
+ * arithmetic is unchanged for the addresses this service was told to watch. For an address it was
+ * NOT told to watch it now returns zero rather than a total, which is why the caller's obligation
+ * below is stated as a property of each address's record and not of the chain's.
  *
  * The caller is responsible for the two facts this query cannot establish: that the record is
  * contiguous down to a height below any activity these addresses have ever had, and that `height`
@@ -1511,6 +1584,33 @@ export interface CanonicalCoverage {
   readonly blocks: number
   readonly tipHeight: number | null
   readonly halted: boolean
+}
+
+/**
+ * The lowest height from which this scope's blocks record only the watched addresses, or null.
+ *
+ * Null means every block here holds every address a block touched, which is what an answer about an
+ * address nobody registered depends on. A number means the answer for such an address is unknown
+ * from that height up — not empty, and the two must never be returned as the same thing.
+ *
+ * Served by `blocks_partial_idx`, which is partial on the marker, so this is the first row of an
+ * index scan rather than a predicate evaluated over every block ever walked. Deliberately the
+ * LOWEST marked height rather than the most recent run of them: an operator who turns the switch
+ * off leaves a whole band above the boundary, and reporting the boundary over-states how much of
+ * the record is suspect, which is the direction that cannot mislead anyone.
+ */
+export async function partialFromHeight(exec: Exec, scope: ChainScope): Promise<number | null> {
+  const rows = await exec<{ height: string }[]>`
+    select height
+      from blocks
+     where chain = ${scope.chain}
+       and network = ${scope.network}
+       and detail->>'partial' is not null
+     order by height asc
+     limit 1
+  `
+  const row = rows[0]
+  return row ? Number(row.height) : null
 }
 
 export async function canonicalCoverage(

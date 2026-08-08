@@ -596,6 +596,48 @@ export const MIGRATIONS: readonly Migration[] = [
         where direction = 'in' and status = 'included' and asset_kind = 'native';
     `,
   },
+  {
+    version: 8,
+    name: 'partial-block-index',
+    // ------------------------------------------------------------------------------------------
+    // ONE PARTIAL INDEX, AND IT IS WHAT MAKES A NARROWED ADDRESS RECORD RECOVERABLE INSTEAD OF LOST.
+    //
+    // Following one Litecoin block costs about 2 MB with indexes, and the largest part of it is
+    // `address_activity` — written for every address the block touched, on purpose, because six
+    // products wanted the general record. That cost tracks the chain's transaction volume and not
+    // the number of customers: the watched set did not move across the measurement that produced
+    // the number. A second UTXO chain on the same disk fills it, and an indexer out of disk stops
+    // observing deposits on every chain at once.
+    //
+    // So a block may now be walked with only the watched addresses recorded, and when it is, it
+    // says so in `blocks.detail` under the key `btcsource.ts` names. That marker is the difference
+    // between a decision that can be revisited and one that cannot: a block written this way is
+    // finished for the address set that was watched at the time, and adding an address later means
+    // rescanning it. Without a way to FIND those blocks, "rescan them" is a full table scan of
+    // every block this service has ever walked, which is the kind of answer that means the rescan
+    // never happens.
+    //
+    // Partial, so it indexes only the blocks that need redoing and costs nothing on a deployment
+    // that never turns the switch on. Leading on (chain, network, height) so that the question the
+    // read API actually asks — the LOWEST height from which the record narrows, which is where an
+    // answer about an unwatched address stops being trustworthy — is the first row of a scan rather
+    // than an aggregate over the table.
+    //
+    // **The `watched_addresses` comment in migration 4 is now conditional, and it stays as written.**
+    // It says `address_activity` is written for EVERY address a block touches. That is still the
+    // behaviour with the switch off and is no longer the behaviour with it on, but the text of a
+    // released migration is part of its checksum — editing it would make `migrate()` refuse the
+    // whole set on every replica that has already applied it. The correction lives here, where a
+    // reader walking the migrations in order reaches it after the claim it qualifies.
+    //
+    // Index-only and additive: the previous release neither writes the marker nor reads the index,
+    // so a replica still running it is unaffected.
+    up: `
+      create index if not exists blocks_partial_idx
+        on blocks (chain, network, height)
+        where detail->>'partial' is not null;
+    `,
+  },
 ]
 
 /**

@@ -267,6 +267,7 @@ function workerFor(
     fault?: (method: string, callIndex: number) => Error | null
     dead?: boolean
     startHeight?: number
+    watchedAddressesOnly?: boolean
   } = {},
 ): BitcoinWorker {
   const endpoints = options.dead
@@ -303,6 +304,7 @@ function workerFor(
     followBatchBlocks: options.followBatchBlocks ?? 100,
     backfillBatchBlocks: options.backfillBatchBlocks ?? 100,
     startHeight: options.startHeight ?? 0,
+    watchedAddressesOnly: options.watchedAddressesOnly ?? false,
   })
 }
 
@@ -780,3 +782,226 @@ test('a backfill runs on its own stream and never touches the follower’s check
   const followerAfter = await getCheckpoint(db(), SCOPE, TIP_STREAM)
   assert.equal(followerAfter?.height, 10, 'the follower’s stream is untouched')
 })
+
+/* ------------------------------------------------- recording only the watched addresses */
+
+/**
+ * The chain every test below walks, built once so the two modes are compared over identical blocks.
+ *
+ *   height 1..2  coinbases to the miner, so there is something to spend
+ *   height 3     the miner's block-1 reward pays ALICE, who is watched
+ *   height 4     the miner's block-2 reward pays CAROL, who is not
+ *   height 5     ALICE pays BOB (spends a WATCHED prevout), and CAROL pays BOB (an unwatched one)
+ *   height 6     someone spends an outpoint this node has never heard of (an UNRESOLVED prevout)
+ */
+const CAROL = 'tb1qcarolcarolcarolcarolcarolcarolcarol0'
+const NOWHERE = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'
+
+function narrowingNode(): FakeBitcoinNode {
+  const node = new FakeBitcoinNode()
+  node.appendMany(2)
+  node.append([
+    { inputs: [node.coinbaseOutpoint(1)], outputs: [{ address: ALICE, sats: 300_000_000n }] },
+  ])
+  node.append([
+    { inputs: [node.coinbaseOutpoint(2)], outputs: [{ address: CAROL, sats: 400_000_000n }] },
+  ])
+  node.append([
+    { inputs: [{ txid: node.txidAt(3, 1), vout: 0 }], outputs: [{ address: BOB, sats: 290_000_000n }] },
+    { inputs: [{ txid: node.txidAt(4, 1), vout: 0 }], outputs: [{ address: BOB, sats: 390_000_000n }] },
+  ])
+  node.append([{ inputs: [{ txid: NOWHERE, vout: 0 }], outputs: [{ address: BOB, sats: 1_000n }] }])
+  return node
+}
+
+async function addressesIn(table: string): Promise<string[]> {
+  const rows = await sql.unsafe(
+    `select distinct address from ${table} where chain = $1 and network = $2 order by address`,
+    [SCOPE.chain, SCOPE.network],
+  )
+  return (rows as unknown as Array<{ address: string }>).map((r) => r.address)
+}
+
+test('only the watched addresses reach address_activity, and every block says so', { skip }, async () => {
+  const node = narrowingNode()
+  await watchAddress(db(), SCOPE, ALICE, 'deposit:alice')
+  await workerFor(node, { watchedAddressesOnly: true }).follow(signal())
+
+  assert.deepEqual(
+    await addressesIn('address_activity'),
+    [ALICE],
+    'the miner, Carol and Bob are all on this chain and none of them was asked about',
+  )
+  // Both directions, so this is not passing because inbound happens to be filtered somewhere else:
+  // Alice is credited at height 3 and debited at height 5.
+  const directions = await sql<{ direction: string }[]>`
+    select direction from address_activity
+     where chain = ${SCOPE.chain} and network = ${SCOPE.network} order by direction
+  `
+  assert.deepEqual(directions.map((r) => r.direction), ['in', 'out'])
+
+  const marks = await sql<{ height: string; partial: string | null }[]>`
+    select height, detail->>'partial' as partial from blocks
+     where chain = ${SCOPE.chain} and network = ${SCOPE.network} order by height
+  `
+  assert.equal(marks.length, 7)
+  for (const row of marks) {
+    assert.equal(row.partial, 'watched-addresses-only', `block ${row.height} does not say what it is`)
+  }
+})
+
+test('with the switch off the general record is unchanged, and says THAT', { skip }, async () => {
+  const node = narrowingNode()
+  await watchAddress(db(), SCOPE, ALICE, 'deposit:alice')
+  await workerFor(node, { watchedAddressesOnly: false }).follow(signal())
+
+  assert.deepEqual(await addressesIn('address_activity'), [ALICE, BOB, CAROL, MINER].sort())
+  const marks = await sql<{ partial: string | null }[]>`
+    select detail->>'partial' as partial from blocks
+     where chain = ${SCOPE.chain} and network = ${SCOPE.network}
+  `
+  assert.equal(
+    marks.every((r) => r.partial === null),
+    true,
+    'a whole block must say it is whole, not merely omit the marker',
+  )
+  // The marker is what `partialFromHeight` reads, and a deployment that never narrows must never
+  // make the read API hedge about an address nobody registered.
+  const { partialFromHeight } = await import('./store.ts')
+  assert.equal(await partialFromHeight(db(), SCOPE), null)
+})
+
+test(
+  'a spend survives when its prevout is watched or unresolved, and only then',
+  { skip },
+  async () => {
+    const node = narrowingNode()
+    await watchAddress(db(), SCOPE, ALICE, 'deposit:alice')
+    await workerFor(node, { watchedAddressesOnly: true }).follow(signal())
+
+    const spends = await sql<{ txid: string; block_height: string }[]>`
+      select txid, block_height from spent_outpoints
+       where chain = ${SCOPE.chain} and network = ${SCOPE.network} order by block_height, txid
+    `
+    // Height 5 spends two outputs — Alice's, which is watched, and Carol's, which is not. Height 6
+    // spends an outpoint no node can resolve. Two rows: Alice's and the unresolved one.
+    assert.equal(spends.length, 2, `kept ${spends.map((s) => s.txid).join(', ')}`)
+    assert.deepEqual(
+      spends.map((s) => Number(s.block_height)),
+      [5, 6],
+    )
+    assert.equal(
+      spends.some((s) => s.txid === NOWHERE),
+      true,
+      'an unresolved prevout might have paid a watched address, so its spend is NOT droppable',
+    )
+    assert.equal(
+      spends.some((s) => s.txid === node.txidAt(4, 1)),
+      false,
+      'Carol’s output has no credit row here, so nothing exists for its spend to cancel',
+    )
+  },
+)
+
+test(
+  'THE #252 GUARANTEE: the derived UTXO total is bit-identical with the record narrowed',
+  { skip },
+  async () => {
+    // The whole point of the change is that it may not move a solvency number by one satoshi. Run
+    // the same chain twice over the same watched set and compare the derivation itself, not a
+    // count of rows: `unspentOutputTotals` is what `custody.ts` sums and what `micro-ledger`
+    // reconciles against, and it is the only comparison that would catch a spend row dropped one
+    // case too eagerly.
+    const { unspentOutputTotals } = await import('./store.ts')
+
+    const run = async (watchedAddressesOnly: boolean): Promise<Map<string, bigint>> => {
+      await sql.unsafe(`truncate ${CHAIN_TABLES.join(', ')}, outbox, inbox restart identity cascade`)
+      const node = narrowingNode()
+      await watchAddress(db(), SCOPE, ALICE, 'deposit:alice')
+      await watchAddress(db(), SCOPE, BOB, 'deposit:bob')
+      await workerFor(node, { watchedAddressesOnly }).follow(signal())
+      return await unspentOutputTotals(db(), SCOPE, [ALICE, BOB], 6)
+    }
+
+    const whole = await run(false)
+    const narrowed = await run(true)
+
+    assert.deepEqual([...narrowed.entries()].sort(), [...whole.entries()].sort())
+    // And the number is the right one rather than two matching zeroes: Alice was paid 3 BTC and
+    // spent all of it, Bob holds the two payments plus the dust from the unresolved spend.
+    assert.equal(narrowed.get(ALICE) ?? 0n, 0n, 'Alice’s only output was spent at height 5')
+    assert.equal(narrowed.get(BOB), 290_000_000n + 390_000_000n + 1_000n)
+  },
+)
+
+test(
+  'an unwatched address gets "unknown", never an empty page that reads as "never paid"',
+  { skip },
+  async () => {
+    const node = narrowingNode()
+    await watchAddress(db(), SCOPE, ALICE, 'deposit:alice')
+    await workerFor(node, { watchedAddressesOnly: true }).follow(signal())
+    const reads = postgresReadStore(sql as unknown as Db)
+
+    const carol = await reads.activity(SCOPE, CAROL, 20, null)
+    assert.deepEqual(carol.items, [], 'nothing was recorded for her, which is the premise')
+    assert.equal(carol.incomplete?.reason, 'address_not_watched')
+    assert.equal(carol.incomplete?.fromHeight, 0, 'the record narrows from the first block walked')
+
+    const alice = await reads.activity(SCOPE, ALICE, 20, null)
+    assert.equal(alice.items.length, 2)
+    assert.equal(alice.incomplete, undefined, 'a watched address is answered for, not hedged about')
+  },
+)
+
+async function backfillStreams(): Promise<string[]> {
+  const rows = await sql<{ stream: string }[]>`
+    select stream from checkpoints
+     where chain = ${SCOPE.chain} and network = ${SCOPE.network} and range_to is not null
+     order by stream
+  `
+  return rows.map((r) => r.stream)
+}
+
+test(
+  'an address registered late is answered for by a rescan, and the rescan actually fills it in',
+  { skip },
+  async () => {
+    const node = narrowingNode()
+    await watchAddress(db(), SCOPE, ALICE, 'deposit:alice')
+    const worker = workerFor(node, { watchedAddressesOnly: true })
+    await worker.follow(signal())
+    const reads = postgresReadStore(sql as unknown as Db)
+
+    // A freshly derived key needs nothing walked again: there is nothing behind it to find, and
+    // the claim already covers the one block that could have been in flight. This is the path
+    // micro-wallet takes for every deposit address, on a retry job, so it is the one that has to
+    // stay free.
+    await reads.watch(SCOPE, `${BOB}-new`, 'deposit:fresh', 'head')
+    assert.deepEqual(await backfillStreams(), [], 'a derived key has no history to go and find')
+
+    // An operator stating a history is the opposite case: those blocks were walked without this
+    // address in the set, so the rows are simply not there.
+    assert.equal(await countOf('address_activity', `and address = '${CAROL}'`), 0)
+    await reads.watch(SCOPE, CAROL, 'treasury:btc:testnet', 0)
+    assert.deepEqual(await backfillStreams(), ['backfill:0-6'])
+
+    // Idempotent: micro-wallet's retry pass re-registers blindly, and a registration that lowered
+    // nothing must not enqueue the range a second time.
+    await reads.watch(SCOPE, CAROL, 'treasury:btc:testnet', 0)
+    assert.deepEqual(await backfillStreams(), ['backfill:0-6'], 'nothing changed, nothing to redo')
+
+    const outcome = await worker.backfill(signal())
+    assert.equal(outcome.complete, true)
+    assert.equal(outcome.blocksIndexed, 7)
+
+    // The point of the whole mechanism: Carol's history is now here, exactly as if she had been
+    // watched all along — one credit at height 4 and one debit at height 5.
+    const carol = await reads.activity(SCOPE, CAROL, 20, null)
+    assert.equal(carol.incomplete, undefined, 'she is watched now, so she is answered for')
+    assert.deepEqual(
+      carol.items.map((i) => `${i.direction}@${i.blockHeight}`).sort(),
+      ['in@4', 'out@5'],
+    )
+  },
+)

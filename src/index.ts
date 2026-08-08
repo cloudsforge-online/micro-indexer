@@ -130,7 +130,10 @@ for (const chain of env.chains) {
   workers.set(
     key,
     family === 'bitcoin'
-      ? new BitcoinWorker(common)
+      ? // Bitcoin-family only, and the asymmetry is the point: this is where the bytes are, and it
+        // is the family whose read consumers are the platform's own money paths rather than
+        // arbitrary-address lookups. See `env.ts` for the full argument.
+        new BitcoinWorker({ ...common, watchedAddressesOnly: env.watchedAddressesOnly })
       : family === 'solana'
         ? new SolanaWorker(common)
         : new EvmWorker({ ...common, family }),

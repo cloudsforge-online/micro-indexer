@@ -67,6 +67,7 @@ import {
   TRANSACTIONS_INDEXED_TOTAL,
   depthBucket,
 } from './metrics.ts'
+import { markPartial } from './btcsource.ts'
 import { DEPOSIT_CONFIRMED, DEPOSIT_OBSERVED, withOutbox, type Db } from './outbox.ts'
 import { RpcError, RpcUnavailableError, type RpcPool } from './rpc.ts'
 import {
@@ -240,11 +241,39 @@ export function outpointKey(txid: string, vout: number): string {
   return `${txid}:${vout}`
 }
 
+/**
+ * A spend, with enough about the output it consumes to decide whether the row is worth keeping.
+ *
+ * `spent_outpoints` is the double-spend invariant and it is also the debit half of the UTXO
+ * balance `custody.ts` derives, which is a sum of credits that no spend row cancels. So the
+ * question "may this row be dropped" is really "can a credit row for this outpoint exist", and
+ * that is a question about the *prevout's* address, not the spending transaction's. The two facts
+ * are carried out of extraction because this is where they are known: after this function returns,
+ * the prevout map has been consumed and the answer would have to be re-derived.
+ */
+export interface ExtractedSpend extends SpendInput {
+  /**
+   * Whether the output being spent was resolved at all.
+   *
+   * False is the dangerous case and is deliberately distinguishable from "resolved to nobody": an
+   * unresolved prevout might have paid a watched address, and dropping its spend row would leave
+   * the credit uncancelled and overstate the derived balance. Overstatement is the direction that
+   * reads at the ledger as negative drift, which freezes an asset that is in fact solvent.
+   */
+  readonly prevoutResolved: boolean
+  /**
+   * Who that output paid, canonicalised the same way `activity` canonicalises it so the two can be
+   * compared against one watched set. Null when the prevout resolved to a script naming no address
+   * — bare multisig, a raw script — and null when it did not resolve.
+   */
+  readonly prevoutAddress: string | null
+}
+
 export interface ExtractedBitcoinBlock {
   readonly block: BlockInput
   readonly transactions: readonly TransactionInput[]
   readonly activity: readonly ActivityInput[]
-  readonly spends: readonly SpendInput[]
+  readonly spends: readonly ExtractedSpend[]
   /** Inputs whose prevout could not be resolved. Reported, never guessed at. */
   readonly unresolvedInputs: number
 }
@@ -293,7 +322,7 @@ export function extractBitcoinBlock(
 
   const transactions: TransactionInput[] = []
   const activity: ActivityInput[] = []
-  const spends: SpendInput[] = []
+  const spends: ExtractedSpend[] = []
   let unresolvedInputs = 0
 
   for (let index = 0; index < raw.tx.length; index++) {
@@ -321,18 +350,24 @@ export function extractBitcoinBlock(
         continue
       }
 
+      const resolved =
+        vin.prevout !== undefined
+          ? { value: vin.prevout.value, address: addressOf(vin.prevout.scriptPubKey) }
+          : prevouts.get(outpointKey(vin.txid, vin.vout))
+
+      // Recorded whether or not the prevout resolved, because the row's first job is to say this
+      // outpoint is spent and that is true either way. What resolution decides is only whether the
+      // row can later be recognised as one nobody needs.
       spends.push({
         txid: vin.txid,
         vout: vin.vout,
         spendingTxHash: tx.txid,
         blockHeight: height,
         blockHash,
+        prevoutResolved: resolved !== undefined,
+        prevoutAddress: resolved?.address ? canonicalBitcoinAddress(resolved.address) : null,
       })
 
-      const resolved =
-        vin.prevout !== undefined
-          ? { value: vin.prevout.value, address: addressOf(vin.prevout.scriptPubKey) }
-          : prevouts.get(outpointKey(vin.txid, vin.vout))
       if (!resolved) {
         allInputsResolved = false
         unresolvedInputs += 1
@@ -483,6 +518,12 @@ export interface BitcoinWorkerDeps {
   readonly followBatchBlocks: number
   readonly backfillBatchBlocks: number
   readonly startHeight: number | undefined
+  /**
+   * Write `address_activity` only for addresses in `watched_addresses`. See `env.ts` for the
+   * arithmetic that makes it the default and for what it costs. Optional here, and defaulting to
+   * the old behaviour, because a test that is not about this switch should not have to state it.
+   */
+  readonly watchedAddressesOnly?: boolean
   readonly maxReorgWalk?: number
   readonly confirmBatch?: number
 }
@@ -862,6 +903,40 @@ export class BitcoinWorker implements ChainWorker {
     return checkpoint?.height ?? null
   }
 
+  /**
+   * Whether a spend row has to be kept when only watched addresses are being recorded.
+   *
+   * `spent_outpoints` costs about as much per block as the address record does, so dropping the
+   * rows nobody can use is most of the saving. But a spend row is what cancels a credit in the
+   * UTXO balance `custody.ts` derives, and a missing cancellation overstates the balance — which
+   * arrives at the ledger as negative drift and freezes an asset that is solvent. So the rule is
+   * conservative in exactly one direction: keep the row unless it is *provable* that no credit for
+   * that outpoint exists.
+   *
+   * There are three cases and only one of them is a drop:
+   *
+   *   * **The prevout did not resolve.** Keep it. We do not know who it paid, and a guess here is
+   *     the freeze above.
+   *   * **It resolved to a watched address.** Keep it. This is the row's whole purpose.
+   *   * **It resolved to an unwatched address, or to a script naming no address.** Drop it. A
+   *     credit row is written only for an output that both names an address and carries a non-zero
+   *     amount, and only when that address was watched — so an outpoint paying nobody, or paying
+   *     someone this service was never told to watch, has no credit anywhere for this row to
+   *     cancel. Note the zero-amount corner is covered by the same argument rather than by a
+   *     separate check: an output worth nothing produces no credit either.
+   *
+   * The cost of keeping the unresolved ones is a small number of rows that match no credit, which
+   * is inert. The cost of dropping the unwatched ones is real but bounded: `markConflictedSpends`
+   * can no longer tell that a transaction spending only unwatched prevouts lost a race, so such a
+   * transaction stays `orphaned` where it would once have become `conflicted`. That distinction is
+   * reported, not acted on, and it is never about platform money — a transaction that touches no
+   * watched address is not one this estate sent or received.
+   */
+  #spendIsNeeded(spend: ExtractedSpend, watched: ReadonlySet<string>): boolean {
+    if (!spend.prevoutResolved) return true
+    return spend.prevoutAddress !== null && watched.has(spend.prevoutAddress)
+  }
+
   /** One block, one transaction. Rows, spends, events and the checkpoint commit together. */
   async #indexBlock(raw: RawBtcBlock, stream: string, signal: AbortSignal): Promise<void> {
     const prevouts = await this.#prevouts(raw, signal)
@@ -869,17 +944,30 @@ export class BitcoinWorker implements ChainWorker {
     const extracted = extractBitcoinBlock(raw, prevouts, asset)
     const addresses = [...new Set(extracted.activity.map((a) => a.address))]
 
+    const selective = this.#d.watchedAddressesOnly === true
+
     let observed = 0
     await withOutbox(this.#d.sql, this.#d.producer, async (tx, emit) => {
       const watched = await filterWatched(tx, this.#d.scope, addresses)
 
-      await upsertBlock(tx, this.#d.scope, extracted.block)
+      // The block says what was stored for it. `null` — whole — is written explicitly rather than
+      // left off, because a row with no marker is a row from a build that could not tell you, and
+      // that is the one case nobody may read as "complete".
+      await upsertBlock(tx, this.#d.scope, {
+        ...extracted.block,
+        detail: markPartial(extracted.block.detail, selective ? 'watched-addresses-only' : null),
+      })
       for (const transaction of extracted.transactions) {
         await upsertTransaction(tx, this.#d.scope, transaction)
       }
       // After the transactions, because `spent_outpoints` carries a foreign key to them.
-      await recordSpends(tx, this.#d.scope, extracted.spends)
+      await recordSpends(
+        tx,
+        this.#d.scope,
+        selective ? extracted.spends.filter((s) => this.#spendIsNeeded(s, watched)) : extracted.spends,
+      )
       for (const mv of extracted.activity) {
+        if (selective && !watched.has(mv.address)) continue
         const { inserted } = await upsertActivity(tx, this.#d.scope, mv)
         this.#d.metrics.increment(ACTIVITY_TOTAL, {
           ...this.#labels,

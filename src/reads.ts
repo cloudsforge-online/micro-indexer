@@ -47,9 +47,12 @@ import {
   blockWithTransactions,
   canonicalCoverage,
   confirmationOf,
+  custodyAddressHistory,
   ensureBackfill,
   getCheckpoint,
+  headBlock,
   listProviderHealth,
+  partialFromHeight,
   recentReorgs,
   tokenBalancesAt,
   transactionByHash,
@@ -138,6 +141,25 @@ export interface ActivityPageView {
   readonly requiredConfirmations: number
   readonly items: readonly ActivityView[]
   readonly nextCursor: string | null
+  /**
+   * Present exactly when the page is not this address's record, and absent when it is.
+   *
+   * `address_activity` was written for every address a block touched, which is what let the block
+   * explorer and `wallet`'s portfolio ask about addresses nobody registered. A deployment running
+   * `INDEXER_WATCHED_ADDRESSES_ONLY` no longer records those, and the answer for one of them is an
+   * empty page — which reads as "this address has never transacted" and is a different, false
+   * statement. So the page says which it is. An empty `items` with this field set means **unknown**;
+   * an empty `items` without it means **nothing happened**.
+   *
+   * `fromHeight` is the height at which the recorded set narrows: below it every address was
+   * recorded, at and above it only watched ones were. It is read off the head block rather than
+   * searched for, so it is the conservative answer — the whole record above the point the switch
+   * was last seen on is suspect, including any window in which it was switched back off.
+   */
+  readonly incomplete?: {
+    readonly reason: 'address_not_watched'
+    readonly fromHeight: number
+  }
 }
 
 export interface TransactionView {
@@ -286,9 +308,13 @@ export interface ReadStore {
   /**
    * `historyFromHeight` is the registrar's claim that this address had no chain activity below
    * that height — the input `custody.ts` needs before it will derive a UTXO balance. Null means
-   * nobody said, which is a refusal there and not a zero. `'head'` resolves the claim to this
-   * service's current head at write time, which is what a caller that has just derived the key can
-   * say truthfully without having to know the height itself.
+   * nobody said, which is a refusal there and not a zero. `'head'` resolves the claim against this
+   * service's own view of the chain at write time, which is what a caller that has just derived the
+   * key can say truthfully without having to know the height itself.
+   *
+   * A stated NUMBER also enqueues a rescan of the range it names, because on a deployment that
+   * records only watched addresses the blocks below the registration do not contain this one. See
+   * the implementation for why `'head'` deliberately does not need one.
    */
   watch(
     scope: ChainScope,
@@ -357,10 +383,17 @@ export function postgresReadStore(sql: Db): ReadStore {
 
     async activity(scope, address, limit, cursor) {
       const asset = assetOf(scope.chain)
-      const [checkpoint, page] = await Promise.all([
+      const [checkpoint, page, partialFrom] = await Promise.all([
         getCheckpoint(exec, scope, TIP_STREAM),
         activityForAddress(exec, scope, address, limit, cursor),
+        partialFromHeight(exec, scope),
       ])
+      // Only asked when the record can be narrow. On a scope that still holds every address the
+      // question has one answer and it is not worth a round trip; on one that does not, an empty
+      // page for an unregistered address is indistinguishable from an address that has never been
+      // paid, and this is the query that tells them apart.
+      const watched =
+        partialFrom === null || (await custodyAddressHistory(exec, scope, [address])).length > 0
       const tipHeight = checkpoint?.tipHeight ?? null
       return {
         chain: scope.chain,
@@ -408,6 +441,9 @@ export function postgresReadStore(sql: Db): ReadStore {
           }
         }),
         nextCursor: page.nextCursor,
+        ...(watched || partialFrom === null
+          ? {}
+          : { incomplete: { reason: 'address_not_watched' as const, fromHeight: partialFrom } }),
       }
     },
 
@@ -596,7 +632,39 @@ export function postgresReadStore(sql: Db): ReadStore {
     },
 
     async watch(scope, address, label, historyFromHeight = null) {
-      await watchAddress(exec, scope, address, label, historyFromHeight)
+      const outcome = await watchAddress(exec, scope, address, label, historyFromHeight)
+
+      // ── Making a newly-watched address answerable, when the record no longer holds everything.
+      //
+      // Once a block records only the addresses that were watched when it was walked, registering
+      // an address does not retroactively put it in those blocks. Somebody has to walk them again,
+      // and the mechanism for walking a range again already exists — so this enqueues one rather
+      // than growing a second kind of catch-up.
+      //
+      // It fires for exactly one of the two claims, and the asymmetry is the whole argument:
+      //
+      //   * `'head'` is the claim of a caller that has JUST DERIVED THE KEY. There is nothing
+      //     behind it to find, by construction, and the one block that could have been walked
+      //     between reading the head and committing the row is already inside the claim — see
+      //     `watchAddress`, which resolves `'head'` against the tip and not the head for precisely
+      //     this reason. `micro-wallet` registers every deposit address this way, on a retry job
+      //     that re-registers blindly, so this is also the path that must stay free.
+      //   * A NUMBER is an operator stating that this address has history from a height, which is
+      //     the case where the walked record demonstrably does not contain it. That range is
+      //     rescanned, and it is deliberately NOT clamped to what has already been walked: an
+      //     address funded before this service ever ran is the case the claim exists for, and
+      //     narrowing the range to the part that is easy would answer a different question.
+      //
+      // And only when something changed. A re-registration that lowers nothing has nothing to
+      // redo, which is what keeps `micro-wallet`'s blunt retry pass from enqueueing a range per
+      // address per sweep.
+      const changed = outcome.firstWatch || outcome.claimLowered
+      if (typeof historyFromHeight === 'number' && changed && outcome.historyFromHeight !== null) {
+        const head = (await headBlock(exec, scope))?.height ?? null
+        if (head !== null && outcome.historyFromHeight <= head) {
+          await ensureBackfill(exec, scope, outcome.historyFromHeight, head)
+        }
+      }
     },
 
     async requestBackfill(scope, from, to) {

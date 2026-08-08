@@ -162,6 +162,21 @@ test('batch sizes and deadlines are bounded, because an unbounded tick outlives 
   assert.equal(loadEnv({ ...BASE, INDEXER_FOLLOW_BATCH_BLOCKS: '100' }).followBatchBlocks, 100)
 })
 
+test('the narrowed address record defaults ON, and a typo cannot silently turn it off', () => {
+  assert.equal(loadEnv(BASE).watchedAddressesOnly, true, 'the disk arithmetic is the default')
+  assert.equal(loadEnv({ ...BASE, INDEXER_WATCHED_ADDRESSES_ONLY: 'false' }).watchedAddressesOnly, false)
+  assert.equal(loadEnv({ ...BASE, INDEXER_WATCHED_ADDRESSES_ONLY: ' TRUE ' }).watchedAddressesOnly, true)
+  // The usual `raw !== 'false'` would read every one of these as ON while the operator believed
+  // otherwise, and the difference between those two beliefs is which addresses get recorded.
+  for (const typo of ['0', '1', 'no', 'yes', 'off', 'ture']) {
+    assert.throws(
+      () => loadEnv({ ...BASE, INDEXER_WATCHED_ADDRESSES_ONLY: typo }),
+      EnvError,
+      `${typo} was guessed at rather than refused`,
+    )
+  }
+})
+
 test('the custody set has a default, and an empty definition of it is refused', () => {
   // The default is the prefix micro-wallet actually writes plus the one micro-settlement will need.
   assert.deepEqual([...loadEnv(BASE).custodyLabelPrefixes], ['deposit:', 'treasury:'])
