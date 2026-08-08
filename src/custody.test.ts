@@ -228,7 +228,7 @@ test('one address is read at the aggregate’s height, from the same proved bloc
   // 2026-08-05 reproduced by its own fix.
   await walkChain()
   const chain = honestChain()
-  chain.balances.set('0xcc', '0x15af1d78b58c400000') // 25.1e18
+  chain.balances.set('0xcc', '0x15c551d03b64e0000') // 25.1e18
 
   const observed = await observer(chain).balance(SCOPE, '0xcc')
 
