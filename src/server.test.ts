@@ -33,6 +33,9 @@ import {
 /** What the fake store was asked, so a test can assert the normalisation that happened first. */
 const asked: Array<{ what: string; scope: ChainScope; arg?: string | number }> = []
 
+/** The history claim each `/watch` call resolved to, in order. See `historyClaimFrom`. */
+const claims: Array<number | 'head' | null | undefined> = []
+
 const HASH = `0x${'a'.repeat(64)}`
 const ADDRESS = `0x${'b'.repeat(40)}`
 const TOKEN = `0x${'c'.repeat(40)}`
@@ -119,8 +122,12 @@ const reads: ReadStore = {
     if (height !== 98) return null
     return { chain: scope.chain, height, hash: HASH } as unknown as BlockView
   },
-  async watch(scope, address) {
+  async watch(scope, address, _label, historyFromHeight) {
     asked.push({ what: 'watch', scope, arg: address })
+    // Recorded separately so a test can assert what the ROUTE decided the claim was. `undefined`
+    // and `null` are different answers here and the store treats them the same, so the route's
+    // reading of the body is the thing under test.
+    claims.push(historyFromHeight)
   },
   async requestBackfill(scope, from, to) {
     asked.push({ what: 'backfill', scope, arg: from })
@@ -510,9 +517,50 @@ test('both new routes are anonymous like every other read', async () => {
 test('the write routes need indexer:write and validate their input', async () => {
   const watchPath = `/watch/ember/testnet/${ADDRESS}`
   assert.equal((await call(watchPath, { token: 'reader', method: 'POST', body: {} })).status, 403)
+  claims.length = 0
   const watched = await call(watchPath, { token: 'writer', method: 'POST', body: { label: 'a' } })
   assert.equal(watched.status, 202)
   assert.equal(watched.body['address'], ADDRESS)
+  // No claim in the body is no claim at the store. Null and not zero: on a UTXO chain "nobody
+  // said" must reach `custody.deriveTotal` as an unknown it can refuse, and a zero would be an
+  // assertion the caller never made.
+  assert.deepEqual(claims, [null])
+
+  // `freshlyDerived` is the claim a caller that has just derived the key can make truthfully, and
+  // it resolves to a height at the store rather than in the caller, which cannot know one.
+  claims.length = 0
+  assert.equal(
+    (await call(watchPath, { token: 'writer', method: 'POST', body: { freshlyDerived: true } }))
+      .status,
+    202,
+  )
+  assert.deepEqual(claims, ['head'])
+
+  // The operator's escape hatch: an explicit height, taken as given.
+  claims.length = 0
+  assert.equal(
+    (await call(watchPath, { token: 'writer', method: 'POST', body: { historyFromHeight: 12 } }))
+      .status,
+    202,
+  )
+  assert.deepEqual(claims, [12])
+
+  // And everything that is not a height is a 400 rather than a coerced one. A `-1` or a `"12"`
+  // accepted here becomes a floor the derivation trusts.
+  claims.length = 0
+  for (const value of [-1, 1.5, '12', true]) {
+    const rejected = await call(watchPath, {
+      token: 'writer',
+      method: 'POST',
+      body: { historyFromHeight: value },
+    })
+    assert.equal(rejected.status, 400, String(value))
+    assert.equal(
+      (rejected.body['error'] as Record<string, string>)['code'],
+      'bad_history_from_height',
+    )
+  }
+  assert.deepEqual(claims, [])
 
   const bad = await call('/backfills/ember/testnet', {
     token: 'writer',

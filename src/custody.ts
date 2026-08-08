@@ -123,6 +123,30 @@
  * the answer carries `addresses` and `labelPrefixes` — on 2026-08-08 those two fields were what
  * showed the operator that the sum included a treasury nobody had booked. The boundary stated
  * above is real; what needed correcting is the assumption about which direction crossing it hurts.
+ *
+ * ## Correction, 2026-08-08: Bitcoin IS built here now, and it is derived rather than read
+ *
+ * The section above — "Why the balance is read from the chain and NOT derived from
+ * `address_activity`" — is still the whole argument for the EVM families and is unchanged for them.
+ * It also said of Bitcoin and Solana that "both could in principle be summed from rows. Neither is
+ * built here." Bitcoin now is, because `family_not_supported` had become the thing blocking G6:
+ * `LTC` is in the ledger's `chain_assets` (migration 14), which makes `liability_sum` illegal for
+ * it, so naming LTC in `LEDGER_RECONCILE_ASSETS` against a build that cannot observe it does not
+ * check Litecoin — it freezes Litecoin for ever, since only a clean OBSERVED run lifts a freeze.
+ * micro-org#252.
+ *
+ * What is derived is NOT `in − out`. That formulation is the one the section above rejects, and it
+ * is wrong here for a reason specific to this worker: `bitcoin.ts` writes an outbound movement only
+ * when the input's prevout RESOLVES, while it records the spend unconditionally. So `in − out` is
+ * over-stated by every unresolved spend — negative drift, a freeze while solvent. The derivation
+ * used instead is *outputs paying us that nothing has spent*, which asks only for rows that exist
+ * whether or not a prevout ever resolved. `store.unspentOutputTotal` carries the full argument.
+ *
+ * The honest boundary moves rather than disappearing: a derived balance is only as complete as the
+ * record it is derived from, so `deriveTotal` proves contiguous coverage and requires that nothing
+ * in the set could have had activity below where the record starts. Solana stays unbuilt and stays
+ * `family_not_supported`, because its movements are pre/post balance deltas and this derivation
+ * does not describe them.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
@@ -130,7 +154,17 @@ import { chainSpec } from '@cloudsforge/contracts-chain'
 import { assetOf, familyOf, requiredConfirmations, scopeKey, type ChainScope } from './chains.ts'
 import type { Db } from './outbox.ts'
 import { RpcError, RpcUnavailableError } from './rpc.ts'
-import { TIP_STREAM, blockAtHeight, custodyAddresses, getCheckpoint, headBlock } from './store.ts'
+import {
+  TIP_STREAM,
+  blockAtHeight,
+  canonicalCoverage,
+  custodyAddressHistory,
+  custodyAddresses,
+  getCheckpoint,
+  headBlock,
+  unspentOutputTotal,
+  type CustodyAddress,
+} from './store.ts'
 import { toBlockParam, type RpcCaller } from './tokenstate.ts'
 
 /**
@@ -153,6 +187,11 @@ export type CustodyTotalFault =
   | 'custody_set_too_large'
   | 'address_unreadable'
   | 'rpc_unavailable'
+  // The two the derived families add. Both mean "this build cannot see far enough back", and they
+  // are separate codes because one is repaired by an operator stating a fact and the other by a
+  // backfill, which are different mornings.
+  | 'history_unknown'
+  | 'history_not_walked'
 
 /**
  * The observation could not be made, and it says which of the reasons applied.
@@ -309,6 +348,8 @@ const DEFAULT_CONCURRENCY = 8
  */
 interface ConfirmedAnchor {
   readonly caller: RpcCaller
+  /** Decides how a balance is obtained and how the node's block hash is asked for. */
+  readonly family: string
   readonly confirmations: number
   /** `head − confirmations + 1`. */
   readonly at: number
@@ -318,18 +359,38 @@ interface ConfirmedAnchor {
   readonly tipHeight: number | null
 }
 
+/**
+ * Families whose balance is READ FROM THE CHAIN, one call per address at the confirmed height.
+ *
+ * The account model makes this possible: an account has a balance the node will state, including
+ * every fee it ever paid and every internal transfer it ever received, whatever this service
+ * walked. Nothing here depends on our own record being complete.
+ */
+const CHAIN_READ_FAMILIES: ReadonlySet<string> = new Set(['evm', 'ember'])
+
+/**
+ * Families whose balance is DERIVED from this service's own walked record.
+ *
+ * Bitcoin — and Litecoin, which `bitcoin.ts` serves — has no counterpart to `eth_getBalance`.
+ * Stock Core keeps no address index, so an address the node's own wallet does not own has no
+ * balance the node will state at all, at any height. What exists instead is the UTXO definition of
+ * a balance: the outputs paying the address that nothing has spent. Both halves of that are facts
+ * this service recorded while following, so the balance is derivable — but ONLY over a range it
+ * actually walked, which is why `store.canonicalCoverage` and the per-address history claim are
+ * checked before a single satoshi is summed. See `deriveTotal`.
+ *
+ * Solana is deliberately absent. Its movements come from pre/post balance deltas rather than from
+ * outputs, so the same derivation does not apply to it, and `getBalance` at a historical slot needs
+ * an archive node. It stays `family_not_supported` until someone writes its own argument.
+ */
+const DERIVED_FAMILIES: ReadonlySet<string> = new Set(['bitcoin'])
+
 async function confirmedAnchor(
   deps: CustodyObserverDeps,
   scope: ChainScope,
 ): Promise<ConfirmedAnchor> {
   const family = familyOf(scope.chain)
-  // Bitcoin and Solana are followed by this build and their balances are NOT read here. There
-  // is no `getBalance` on a UTXO chain without an address index, and a Solana balance at a
-  // historical slot needs an archive node — so both would need a derivation from stored
-  // movements, which is a different implementation with a different correctness argument. It
-  // is honest to say "this build cannot" and let the ledger freeze, and dishonest to sum the
-  // rows with the EVM derivation and call it a balance.
-  if (family !== 'evm' && family !== 'ember') {
+  if (!CHAIN_READ_FAMILIES.has(family) && !DERIVED_FAMILIES.has(family)) {
     throw new CustodyTotalUnavailableError(
       'family_not_supported',
       `${family} custody balances are not readable by this build`,
@@ -387,10 +448,11 @@ async function confirmedAnchor(
     )
   }
 
-  await assertNodeAgrees(caller, at, anchor.hash)
+  await assertNodeAgrees(caller, family, at, anchor.hash)
 
   return {
     caller,
+    family,
     confirmations,
     at,
     hash: anchor.hash,
@@ -434,15 +496,27 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
         )
       }
 
-      const balances = await readAll(caller, found, at, deps.concurrency ?? DEFAULT_CONCURRENCY)
-      let total = 0n
-      for (const balance of balances) total += balance
+      const total = DERIVED_FAMILIES.has(anchor.family)
+        ? await deriveTotal(deps, scope, anchor, found)
+        : await sumFromChain(
+            caller,
+            found.map((entry) => entry.address),
+            at,
+            deps.concurrency ?? DEFAULT_CONCURRENCY,
+          )
 
       // The closing hash check. See the header: `eth_getBalance` takes a height, so a reorg during
       // the sweep would have some balances answered from a chain that no longer exists, and the
       // sum of two chains is a number no state ever had. Refusing here costs one call and is the
       // only place that difference is visible.
-      await assertNodeAgrees(caller, at, anchor.hash)
+      //
+      // It is made on the derived families too, where the argument is not the same one and is just
+      // as necessary. Nothing is read from the node there, so nothing can be answered from two
+      // chains — but the sum is taken from rows this service wrote about a chain it believed in,
+      // and this is the one check that asks whether the node still believes in it. A deep reorg
+      // that arrived between the opening proof and the query would otherwise produce a confident
+      // total about a fork.
+      await assertNodeAgrees(caller, anchor.family, at, anchor.hash)
 
       const asset = assetOf(scope.chain)
       return {
@@ -466,26 +540,31 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
       const anchor = await confirmedAnchor(deps, scope)
       const { caller, at } = anchor
 
-      // `readAll` rather than `balanceOf` directly, so the single-address reading goes through the
-      // identical failure mapping: every RPC fault is a refusal and none of them is a zero. A
-      // caller booking an opening balance from a zero that meant "the provider would not say" would
-      // write a permanent understatement into the ledger and freeze the asset for ever after.
-      const [value] = await readAll(caller, [address], at, 1)
-      // Unreachable — `readAll` fills every slot or throws — and written as a refusal rather than
-      // a `?? 0n` on purpose, because `?? 0n` is precisely the defaulting this whole file exists to
-      // refuse, and a default that is unreachable today is a default that is reachable after the
-      // next edit to `readAll`.
-      if (value === undefined) {
-        throw new CustodyTotalUnavailableError(
-          'address_unreadable',
-          `no balance was produced for ${address} at height ${at}`,
-        )
+      let value: bigint
+      if (DERIVED_FAMILIES.has(anchor.family)) {
+        // The claim this address carries, if it is watched at all. An address nobody has registered
+        // has made no claim, and `deriveTotal` treats an absent claim as the weakest TRUE statement
+        // available — "no activity below height 0" — rather than as a licence. On a chain walked
+        // from genesis that is a theorem and the derivation proceeds; on one walked from a
+        // cold-start height it is refused, which is the honest answer for an address whose history
+        // this service has never seen.
+        const [watched] = await custodyAddressHistory(deps.sql, scope, [address])
+        value = await deriveTotal(deps, scope, anchor, [
+          { address, historyFromHeight: watched?.historyFromHeight ?? null },
+        ])
+      } else {
+        // `sumFromChain` rather than `balanceOf` directly, so the single-address reading goes
+        // through the identical failure mapping: every RPC fault is a refusal and none of them is a
+        // zero. A caller booking an opening balance from a zero that meant "the provider would not
+        // say" would write a permanent understatement into the ledger and freeze the asset for ever
+        // after.
+        value = await sumFromChain(caller, [address], at, 1)
       }
 
       // The closing hash check, for the same reason `total` makes it: the balance was answered at a
       // height, and a reorg between the two proofs means it was answered about a chain that no
       // longer exists. One call, and it is the only place that difference is visible.
-      await assertNodeAgrees(caller, at, anchor.hash)
+      await assertNodeAgrees(caller, anchor.family, at, anchor.hash)
 
       const asset = assetOf(scope.chain)
       return {
@@ -514,17 +593,109 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
  * read that works on one provider and 404s on the next is a read whose answer depends on the
  * weather.
  */
-async function assertNodeAgrees(caller: RpcCaller, height: number, expected: string): Promise<void> {
-  const block = await unwrap(
-    caller.call<{ hash?: string } | null>('eth_getBlockByNumber', [toBlockParam(height), false]),
-  )
-  const served = typeof block?.hash === 'string' ? block.hash.toLowerCase() : null
-  if (served === null || served !== expected.toLowerCase()) {
+async function assertNodeAgrees(
+  caller: RpcCaller,
+  family: string,
+  height: number,
+  expected: string,
+): Promise<void> {
+  const served = DERIVED_FAMILIES.has(family)
+    ? // Bitcoin Core's `getblockhash` answers with the hash on the node's ACTIVE chain at that
+      // height, which is precisely the question. `getblock` would work too and would transfer a
+      // whole block to compare one field.
+      await unwrap(caller.call<string | null>('getblockhash', [height]))
+    : ((await unwrap(
+        caller.call<{ hash?: string } | null>('eth_getBlockByNumber', [toBlockParam(height), false]),
+      ))?.hash ?? null)
+  const hash = typeof served === 'string' ? served.toLowerCase() : null
+  if (hash === null || hash !== expected.toLowerCase()) {
     throw new CustodyTotalUnavailableError(
       'head_diverged',
-      `the provider serves ${served ?? 'no block'} at height ${height}; this service walked ${expected}`,
+      `the provider serves ${hash ?? 'no block'} at height ${height}; this service walked ${expected}`,
     )
   }
+}
+
+/**
+ * Σ balance over a set, DERIVED from this service's own record, and the two proofs that entitle it
+ * to be called a balance at all.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * The sum itself is one query (`store.unspentOutputTotal`) and is the easy part. What makes the
+ * number true is what is checked before it:
+ *
+ * **1. Contiguous canonical coverage from `lo` to the confirmed height.** A hole loses receipts
+ * (understates → positive drift) and loses spends (overstates → negative drift), with nothing
+ * bounding either, so a gap is not a degradation of the answer — it is a different answer with the
+ * same shape. `history_not_walked`.
+ *
+ * **2. No activity below `lo` for any address in the set.** This service cannot see below its own
+ * record, so it cannot establish this and does not try. It is a claim, made by whoever registered
+ * the address, at the moment they registered it — and the only party who can make it truthfully is
+ * one that has just derived the key, because nothing can have paid an address that did not exist.
+ *
+ * **An absent claim is treated as height 0, and that is a tautology rather than a default.** "This
+ * address had no activity below block 0" is true of every address on every chain, because there is
+ * nothing below block 0. So the comparison `claim ≥ lo` reduces, for an unclaimed address, to
+ * `lo = 0` — a chain this service walked from genesis, where the record IS the whole history and no
+ * claim was ever needed. On a chain walked from a cold-start height the same address refuses with
+ * `history_unknown`, which is the honest answer and the one the two `ltc:mainnet` deposit rows
+ * registered by earlier builds will get.
+ *
+ * This is the one place in this file where a null becomes a number, and it is written out at length
+ * because everywhere else in it a null becoming a number is the defect.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+async function deriveTotal(
+  deps: CustodyObserverDeps,
+  scope: ChainScope,
+  anchor: ConfirmedAnchor,
+  entries: readonly CustodyAddress[],
+): Promise<bigint> {
+  const coverage = await canonicalCoverage(deps.sql, scope, anchor.at)
+  const lo = coverage.lowestHeight
+  if (lo === null || coverage.highestHeight === null) {
+    // Unreachable: `confirmedAnchor` already proved a canonical block exists at `at`. Written as a
+    // refusal rather than a `!` because the alternative to this branch is summing over a record
+    // that is not there, which would answer zero.
+    throw new CustodyTotalUnavailableError(
+      'nothing_indexed',
+      `no canonical block at or below height ${anchor.at} on ${scopeKey(scope)}`,
+    )
+  }
+  // One canonical block per height is already enforced by `blocks_canonical_height_uniq`, so the
+  // count comparison is the whole contiguity check — a duplicate cannot stand in for a missing
+  // neighbour. `highestHeight` is checked too: a record that stops below the confirmed height has
+  // no hole in it and is still not evidence about `anchor.at`.
+  const needed = anchor.at - lo + 1
+  if (coverage.highestHeight !== anchor.at || coverage.blocks !== needed) {
+    throw new CustodyTotalUnavailableError(
+      'history_not_walked',
+      `the canonical record from ${lo} to ${anchor.at} has ${coverage.blocks} blocks up to ` +
+        `${coverage.highestHeight} and needs ${needed} up to ${anchor.at} — a derived balance over ` +
+        'a record with a hole in it is wrong in both directions at once. Backfill the gap.',
+    )
+  }
+  for (const entry of entries) {
+    const claim = entry.historyFromHeight ?? 0
+    if (claim < lo) {
+      throw new CustodyTotalUnavailableError(
+        entry.historyFromHeight === null ? 'history_unknown' : 'history_not_walked',
+        entry.historyFromHeight === null
+          ? `nobody has stated from which height ${entry.address} could have had activity, and ` +
+            `this service's record on ${scopeKey(scope)} starts at ${lo} — so coin it received ` +
+            'before that is invisible here and would be missing from the total'
+          : `${entry.address} is claimed to have no activity below ${claim}, but this service's ` +
+            `record starts at ${lo}, leaving ${lo - claim} blocks of its possible history unwalked`,
+      )
+    }
+  }
+  return await unspentOutputTotal(
+    deps.sql,
+    scope,
+    entries.map((entry) => entry.address),
+    anchor.at,
+  )
 }
 
 /**
@@ -537,6 +708,30 @@ async function assertNodeAgrees(caller: RpcCaller, height: number, expected: str
  * four-hundred-call burst answers with 429s, and every 429 here is a refusal, so unbounded
  * parallelism would convert a healthy provider into a frozen asset.
  */
+async function sumFromChain(
+  caller: RpcCaller,
+  addresses: readonly string[],
+  height: number,
+  concurrency: number,
+): Promise<bigint> {
+  const balances = await readAll(caller, addresses, height, concurrency)
+  let total = 0n
+  // A missing slot is impossible — `readAll` fills every one or throws — and it is summed with an
+  // explicit refusal rather than a `?? 0n` on purpose: `?? 0n` is exactly the defaulting this file
+  // exists to refuse, and a default that is unreachable today is reachable after the next edit.
+  for (let index = 0; index < addresses.length; index++) {
+    const balance = balances[index]
+    if (balance === undefined) {
+      throw new CustodyTotalUnavailableError(
+        'address_unreadable',
+        `no balance was produced for ${addresses[index]} at height ${height}`,
+      )
+    }
+    total += balance
+  }
+  return total
+}
+
 async function readAll(
   caller: RpcCaller,
   addresses: readonly string[],

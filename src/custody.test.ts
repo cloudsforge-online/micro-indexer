@@ -27,7 +27,18 @@ import { CHAIN_TABLES, MIGRATIONS } from './migrations.ts'
 import type { Db } from './outbox.ts'
 import { RpcError, RpcUnavailableError } from './rpc.ts'
 import type { RpcCaller } from './tokenstate.ts'
-import { TIP_STREAM, haltChain, setCheckpoint, upsertBlock, watchAddress } from './store.ts'
+import {
+  TIP_STREAM,
+  activityEntryKey,
+  custodyAddressHistory,
+  haltChain,
+  recordSpends,
+  setCheckpoint,
+  upsertActivity,
+  upsertBlock,
+  upsertTransaction,
+  watchAddress,
+} from './store.ts'
 
 /* ------------------------------------------------------------------ pure */
 
@@ -468,18 +479,334 @@ test('a chain this replica follows no provider for is refused, never answered fr
 })
 
 test('a family this build cannot read is refused rather than derived from movements', () => {
-  // Bitcoin's and Solana's native balances are derivable from stored movements and EVM's is not
-  // (gas leaves no `out` row, internal transfers leave no row at all). Neither derivation is built
-  // here, and summing the rows with the wrong one would produce a plausible, wrong number.
+  // Solana. Its movements come from pre/post balance deltas rather than from outputs, so the UTXO
+  // derivation `bitcoin` now uses does not apply to it, and `getBalance` at a historical slot needs
+  // an archive node — so neither route to its balance is built here. Summing its rows with the
+  // wrong derivation would produce a plausible, wrong number, and a plausible wrong number is what
+  // this whole file exists to refuse. `btc` was the subject of this test until 2026-08-08, when the
+  // derivation landed (micro-org#252); it is now covered by the derivation tests below.
   const observe = rpcCustodyObserver({
     sql,
-    callers: new Map([['btc:mainnet', fakeCaller(honestChain())]]),
+    callers: new Map([['sol:mainnet', fakeCaller(honestChain())]]),
     labelPrefixes: ['deposit:'],
     maxAddresses: 10,
   })
   return assert.rejects(
-    () => observe.total({ chain: 'btc', network: 'mainnet' }),
+    () => observe.total({ chain: 'sol', network: 'mainnet' }),
     (err: unknown) =>
       err instanceof CustodyTotalUnavailableError && err.code === 'family_not_supported',
   )
+})
+
+/* --------------------------------------- the derived families (UTXO) */
+
+/**
+ * Litecoin, whose balance is not read from anywhere.
+ *
+ * There is no `eth_getBalance` on this family — stock Core keeps no address index, so an address
+ * the node's wallet does not own has no balance the node will state at any height. The balance is
+ * therefore DERIVED from this service's own record, and every test below is about the two proofs
+ * that entitle the derivation to be called a balance: that the record has no hole in it, and that
+ * it reaches back below any activity the addresses could have had. See `custody.deriveTotal` and
+ * micro-org#252.
+ */
+const LTC: ChainScope = { chain: 'ltc', network: 'testnet' }
+const LTC_CONFIRMATIONS = 12
+const LTC_HEAD = 100
+const LTC_AT = LTC_HEAD - LTC_CONFIRMATIONS + 1
+
+/** A node that agrees with everything this service walked. `getblockhash`, not `eth_*`. */
+function ltcCaller(over: Partial<{ hashAt: (height: number) => string | null }> = {}): {
+  caller: RpcCaller
+  calls: string[]
+} {
+  const calls: string[] = []
+  const at = over.hashAt ?? hashAt
+  return {
+    calls,
+    caller: {
+      async call<T>(method: string, params?: readonly unknown[]): Promise<T> {
+        calls.push(method)
+        if (method === 'getblockhash') return at(Number(params?.[0] ?? -1)) as T
+        throw new Error(`unexpected method ${method}`)
+      },
+    },
+  }
+}
+
+function ltcObserver(caller: RpcCaller): CustodyObserver {
+  return rpcCustodyObserver({
+    sql,
+    callers: new Map([['ltc:testnet', caller]]),
+    labelPrefixes: ['deposit:', 'treasury:'],
+    maxAddresses: 2_000,
+  })
+}
+
+/** Canonical blocks `from..to`, and a tip checkpoint at `to`. `from > 0` is a cold start. */
+async function walkLtc(from: number, to: number): Promise<void> {
+  for (let height = from; height <= to; height += 1) {
+    await upsertBlock(sql, LTC, {
+      height,
+      hash: hashAt(height),
+      parentHash: hashAt(height === 0 ? 0 : height - 1),
+      blockTime: new Date(1_700_000_000_000 + height * 150_000),
+      txCount: 0,
+      detail: {},
+    })
+  }
+  await setCheckpoint(sql, LTC, TIP_STREAM, to, hashAt(to))
+}
+
+/** An output of `amount` paying `address`, at `height`, as vout `vout` of `txid`. */
+async function fund(
+  height: number,
+  txid: string,
+  vout: number,
+  address: string,
+  amount: bigint,
+): Promise<void> {
+  await upsertTransaction(sql, LTC, {
+    hash: txid,
+    blockHash: hashAt(height),
+    blockHeight: height,
+    txIndex: 0,
+    from: null,
+    to: address,
+    value: amount,
+    fee: null,
+    status: 'success',
+    nonceOrSequence: null,
+    rawRef: {},
+  })
+  await upsertActivity(sql, LTC, {
+    address,
+    direction: 'in',
+    assetCode: 'LTC',
+    assetKind: 'native',
+    tokenAddress: null,
+    amount,
+    txHash: txid,
+    entryKey: activityEntryKey(vout, 'in', address),
+    logIndex: vout,
+    blockHeight: height,
+    blockHash: hashAt(height),
+  })
+}
+
+/** `spendingTx` consumes `txid:vout` at `height`. */
+async function spend(
+  height: number,
+  spendingTx: string,
+  txid: string,
+  vout: number,
+): Promise<void> {
+  await upsertTransaction(sql, LTC, {
+    hash: spendingTx,
+    blockHash: hashAt(height),
+    blockHeight: height,
+    txIndex: 0,
+    from: null,
+    to: null,
+    value: 0n,
+    fee: null,
+    status: 'success',
+    nonceOrSequence: null,
+    rawRef: {},
+  })
+  await recordSpends(sql, LTC, [
+    { txid, vout, spendingTxHash: spendingTx, blockHeight: height, blockHash: hashAt(height) },
+  ])
+}
+
+test('a UTXO total is the outputs nothing has spent, at the confirmed depth', { skip }, async () => {
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await watchAddress(sql, LTC, 'ltc1qbb', 'treasury:hot')
+
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 500n)
+  await fund(11, 'tx-b', 1, 'ltc1qaa', 300n)
+  await fund(12, 'tx-c', 0, 'ltc1qbb', 200n)
+  // Spent, so it is not a balance: 500 leaves, 300 + 200 remain.
+  await spend(20, 'tx-spend', 'tx-a', 0)
+
+  const { caller, calls } = ltcCaller()
+  const observed = await ltcObserver(caller).total(LTC)
+
+  assert.equal(observed.total, '500')
+  assert.equal(observed.addresses, 2)
+  assert.equal(observed.assetCode, 'LTC')
+  assert.equal(observed.requiredConfirmations, LTC_CONFIRMATIONS)
+  assert.equal(observed.observedAtBlock, LTC_AT)
+  assert.equal(observed.observedAtBlockHash, hashAt(LTC_AT))
+  // Nothing was read from the node — the sum is this service's own record. The only calls are the
+  // two `getblockhash` proofs that the node still serves the chain those rows describe.
+  assert.deepEqual(calls, ['getblockhash', 'getblockhash'])
+})
+
+test('an outbound movement row is not subtracted, because the derivation never looks at one', { skip }, async () => {
+  // The defect this formulation exists to make unrepresentable. `bitcoin.ts` records the spend
+  // from the txin outpoint UNCONDITIONALLY but writes the outbound MOVEMENT only when the prevout
+  // resolves — so `in − out` is over-stated by every spend whose prevout could not be fetched, and
+  // an over-stated custody total reads at the ledger as NEGATIVE drift, which freezes a solvent
+  // asset. Here the `out` row is present AND the outpoint is unspent: `in − out` would answer 400,
+  // outputs-minus-spends answers 1000, and 1000 is the balance.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 1000n)
+  await upsertTransaction(sql, LTC, {
+    hash: 'tx-out',
+    blockHash: hashAt(11),
+    blockHeight: 11,
+    txIndex: 0,
+    from: 'ltc1qaa',
+    to: null,
+    value: 600n,
+    fee: null,
+    status: 'success',
+    nonceOrSequence: null,
+    rawRef: {},
+  })
+  await upsertActivity(sql, LTC, {
+    address: 'ltc1qaa',
+    direction: 'out',
+    assetCode: 'LTC',
+    assetKind: 'native',
+    tokenAddress: null,
+    amount: 600n,
+    txHash: 'tx-out',
+    entryKey: activityEntryKey(0, 'out', 'ltc1qaa'),
+    logIndex: 0,
+    blockHeight: 11,
+    blockHash: hashAt(11),
+  })
+
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '1000')
+})
+
+test('a spend above the confirmed height has not happened yet, and neither has a credit', { skip }, async () => {
+  // Both halves are bounded at the same height, because a total assembled from rows at two
+  // different depths is a number no state of the chain ever had.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 700n)
+  await fund(LTC_AT + 1, 'tx-late', 0, 'ltc1qaa', 900n)
+  await spend(LTC_AT + 2, 'tx-spend', 'tx-a', 0)
+
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '700')
+})
+
+test('an orphaned credit is not money and an orphaned spend did not happen', { skip }, async () => {
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 400n)
+  await fund(11, 'tx-b', 0, 'ltc1qaa', 250n)
+  await spend(12, 'tx-spend', 'tx-a', 0)
+  // The reorg: `tx-b`'s credit was retracted, and the spend of `tx-a` went with the block that
+  // carried it. Taking either at face value moves the total in the direction of the unrepaired
+  // half — 250 too high, or 400 too low.
+  await sql`
+    update address_activity set status = 'orphaned'
+     where chain = 'ltc' and network = 'testnet' and tx_hash = 'tx-b'
+  `
+  await sql`
+    update spent_outpoints set status = 'orphaned'
+     where chain = 'ltc' and network = 'testnet' and spending_tx_hash = 'tx-spend'
+  `
+
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '400')
+})
+
+test('a hole in the walked record refuses, because it is wrong in both directions at once', { skip }, async () => {
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 400n)
+  // One block below the confirmed height is gone. It contains receipts that will be missing from
+  // the sum AND spends that will be missing from the subtraction, with nothing bounding either.
+  await sql`
+    delete from blocks where chain = 'ltc' and network = 'testnet' and height = 40
+  `
+
+  await assertRefusal(() => ltcObserver(ltcCaller().caller).total(LTC), 'history_not_walked')
+})
+
+test('a cold-started record refuses for an address nobody claimed a history for', { skip }, async () => {
+  // `ltc:mainnet` is walked from a cold-start height, and the deposit rows registered by earlier
+  // builds carry no claim. This is the answer they get, and it is the honest one: coin received
+  // before this service started looking is invisible here and would be missing from the total.
+  await walkLtc(20, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(30, 'tx-a', 0, 'ltc1qaa', 400n)
+
+  await assertRefusal(() => ltcObserver(ltcCaller().caller).total(LTC), 'history_unknown')
+})
+
+test('a claim at or above the walked floor is what makes a cold-started record answerable', { skip }, async () => {
+  // The claim only its registrar can make truthfully: nothing can have paid an address that did
+  // not exist yet. `micro-wallet` and `micro-settlement` make it at derivation time.
+  await walkLtc(20, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1', 25)
+  await fund(30, 'tx-a', 0, 'ltc1qaa', 400n)
+
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '400')
+})
+
+test('a claim BELOW the walked floor refuses: the gap is history this service never saw', { skip }, async () => {
+  await walkLtc(20, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1', 5)
+  await fund(30, 'tx-a', 0, 'ltc1qaa', 400n)
+
+  await assertRefusal(() => ltcObserver(ltcCaller().caller).total(LTC), 'history_not_walked')
+})
+
+test('an unclaimed address is answerable on a genesis-walked chain, and that is a theorem', { skip }, async () => {
+  // "No activity below block 0" is true of every address on every chain, so the claim reduces to
+  // `lo = 0` — which is why EMBER's own chain and a regtest Litecoin need no claim at all.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(30, 'tx-a', 0, 'ltc1qaa', 400n)
+
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '400')
+})
+
+test('the lowest claim wins when an address is re-registered', { skip }, async () => {
+  // `watchAddress` takes `least(existing, incoming)`. A re-registration that arrives after the
+  // address has been in use must not be able to RAISE the floor: a higher claim would assert the
+  // absence of activity this service may already have recorded below it.
+  await walkLtc(20, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1', 25)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1', 60)
+  await fund(30, 'tx-a', 0, 'ltc1qaa', 400n)
+
+  const [entry] = await custodyAddressHistory(sql, LTC, ['ltc1qaa'])
+  assert.equal(entry?.historyFromHeight, 25)
+})
+
+test('a single derived balance is the same derivation, with the same refusals', { skip }, async () => {
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 900n)
+  await fund(11, 'tx-b', 0, 'ltc1qbb', 100n)
+  await spend(12, 'tx-spend', 'tx-a', 0)
+  await fund(13, 'tx-c', 2, 'ltc1qaa', 250n)
+
+  const read = await ltcObserver(ltcCaller().caller).balance(LTC, 'ltc1qaa')
+  // 900 spent, 250 not; `ltc1qbb` is somebody else's coin and is not in this answer.
+  assert.equal(read.balance, '250')
+  assert.equal(read.observedAtBlock, LTC_AT)
+
+  // And on a cold-started record the single reading refuses exactly as the total does.
+  await sql`delete from blocks where chain = 'ltc' and network = 'testnet' and height < 5`
+  await assertRefusal(() => ltcObserver(ltcCaller().caller).balance(LTC, 'ltc1qaa'), 'history_unknown')
+})
+
+test('a node serving a different chain at the confirmed height is a refusal, not a total', { skip }, async () => {
+  // The derivation reads nothing from the node, so this is the ONLY check that asks whether the
+  // node still believes in the chain the summed rows describe.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 400n)
+
+  const { caller } = ltcCaller({ hashAt: (h) => (h === LTC_AT ? `0x${'e'.repeat(64)}` : hashAt(h)) })
+  await assertRefusal(() => ltcObserver(caller).total(LTC), 'head_diverged')
 })
