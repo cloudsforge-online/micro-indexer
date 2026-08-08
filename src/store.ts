@@ -884,8 +884,15 @@ export async function watchAddress(
   `
 }
 
-/** One member of the custody set, with whatever claim its registrar made about its history. */
-export interface CustodyAddress {
+/**
+ * An address and whatever claim its registrar made about its history — whether or not it is
+ * custody's.
+ *
+ * Separate from `CustodyAddress` below because the single-address read is entitled to ask about an
+ * address nobody has labelled, and a type demanding a bucket for it would have to be answered with
+ * an invented one.
+ */
+export interface AddressHistory {
   readonly address: string
   /**
    * The height below which the registrar asserts this address had no chain activity, or null for
@@ -893,6 +900,20 @@ export interface CustodyAddress {
    * approximated — see `custody.ts`, `history_unknown`.
    */
   readonly historyFromHeight: number | null
+}
+
+/** One member of the custody set: an address history, plus the bucket its label put it in. */
+export interface CustodyAddress extends AddressHistory {
+  /**
+   * Which configured prefix this address's label matched — the FIRST one in the configured order,
+   * so an address labelled with two of them lands in exactly one bucket and always the same one.
+   *
+   * It is the bucket the aggregate is broken down by, and it is carried per address rather than
+   * re-derived from the label at the point of summing so that the grouping and the membership test
+   * are the same decision, made once. An address that reaches this type matched something — the
+   * query returns nothing else — so this is never null.
+   */
+  readonly labelPrefix: string
 }
 
 /**
@@ -928,9 +949,36 @@ export async function unspentOutputTotal(
   addresses: readonly string[],
   height: number,
 ): Promise<bigint> {
-  if (addresses.length === 0) return 0n
-  const rows = await exec<{ total: string | null }[]>`
-    select coalesce(sum(credit.amount), 0)::text as total
+  let total = 0n
+  for (const amount of (await unspentOutputTotals(exec, scope, addresses, height)).values()) {
+    total += amount
+  }
+  return total
+}
+
+/**
+ * The same sum, kept per address, so the aggregate can be broken down without being measured twice.
+ *
+ * A freeze reason that prints one observed number tells an operator that the estate and the chain
+ * disagree; it does not tell them WHERE. Grouping this map by each address's label prefix does, and
+ * the grouping is only trustworthy if it is the same arithmetic as the total. So the total is the
+ * sum of this map rather than its own query: there is no second SELECT that could drift from the
+ * first, and no ordering in which the parts fail to add up to the whole.
+ *
+ * **An address absent from the result holds nothing**, and that is a fact about the record rather
+ * than a default: the query returns a row per address that has an unspent credit at or below
+ * `height`, so an address missing from it has no such credit. The caller supplies the zero, which is
+ * why this returns a map keyed by address rather than an array the caller must align by index.
+ */
+export async function unspentOutputTotals(
+  exec: Exec,
+  scope: ChainScope,
+  addresses: readonly string[],
+  height: number,
+): Promise<Map<string, bigint>> {
+  if (addresses.length === 0) return new Map()
+  const rows = await exec<{ address: string; total: string | null }[]>`
+    select credit.address as address, coalesce(sum(credit.amount), 0)::text as total
       from address_activity credit
      where credit.chain = ${scope.chain}
        and credit.network = ${scope.network}
@@ -949,8 +997,9 @@ export async function unspentOutputTotal(
             and spend.status = 'included'
             and spend.block_height <= ${height}
        )
+     group by credit.address
   `
-  return BigInt(rows[0]?.total ?? '0')
+  return new Map(rows.map((row) => [row.address, BigInt(row.total ?? '0')]))
 }
 
 /**
@@ -998,8 +1047,8 @@ export async function custodyAddresses(
   limit: number,
 ): Promise<readonly CustodyAddress[]> {
   if (labelPrefixes.length === 0) return []
-  const rows = await exec<{ address: string; history_from_height: string | null }[]>`
-    select address, history_from_height from watched_addresses
+  const rows = await exec<{ address: string; label: string; history_from_height: string | null }[]>`
+    select address, label, history_from_height from watched_addresses
      where chain = ${scope.chain} and network = ${scope.network}
        and label is not null
        and exists (
@@ -1009,14 +1058,30 @@ export async function custodyAddresses(
      order by address
      limit ${limit}
   `
-  return rows.map((r) => ({
-    address: r.address,
-    // `bigint` columns arrive as strings from this driver. `Number(null)` is 0 and 0 is a
-    // meaningful height, so the null is carried through as null rather than coerced — the
-    // difference between "no activity below genesis" and "nobody said" is the difference between
-    // an observation and a refusal.
-    historyFromHeight: r.history_from_height === null ? null : Number(r.history_from_height),
-  }))
+  return rows.flatMap((r) => {
+    // The same `starts_with` the WHERE clause applied, re-applied here to learn WHICH prefix
+    // matched. `find` rather than `filter` is the tie-break: configured order decides, so a label
+    // matching two prefixes is counted once, under the earlier one, and the breakdown always sums
+    // to the total.
+    const labelPrefix = labelPrefixes.find((prefix) => r.label.startsWith(prefix))
+    // Unreachable — the query returned this row because some prefix matched. Dropped rather than
+    // defaulted, because a row assigned to a bucket it does not belong to would make the breakdown
+    // disagree with the total it is meant to explain, and a silently wrong explanation of a freeze
+    // is worse than a missing one. If it ever fires, the address is also absent from `addresses`
+    // and the count no longer matches the set, which is visible.
+    if (labelPrefix === undefined) return []
+    return [
+      {
+        address: r.address,
+        // `bigint` columns arrive as strings from this driver. `Number(null)` is 0 and 0 is a
+        // meaningful height, so the null is carried through as null rather than coerced — the
+        // difference between "no activity below genesis" and "nobody said" is the difference
+        // between an observation and a refusal.
+        historyFromHeight: r.history_from_height === null ? null : Number(r.history_from_height),
+        labelPrefix,
+      },
+    ]
+  })
 }
 
 /**
@@ -1032,7 +1097,7 @@ export async function custodyAddressHistory(
   exec: Exec,
   scope: ChainScope,
   addresses: readonly string[],
-): Promise<readonly CustodyAddress[]> {
+): Promise<readonly AddressHistory[]> {
   if (addresses.length === 0) return []
   const rows = await exec<{ address: string; history_from_height: string | null }[]>`
     select address, history_from_height from watched_addresses
