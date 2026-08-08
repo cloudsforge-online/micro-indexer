@@ -16,7 +16,10 @@ on:
     # `release/**` builds too. A release branch carries the estate-wide version bump, and it
     # has to publish its images before testnet can be deployed from it — which is what proves
     # the release before anything is merged. Mainnet is unaffected: it pins a version tag.
-    branches: [main, 'release/**']
+    # `feat/**` builds too, for the same reason `release/**` does: a change that has to be proved
+    # on testnet before it merges needs a published image to deploy, and the estate deploys images
+    # rather than source. Mainnet is unaffected — it pins a version tag.
+    branches: [main, 'release/**', 'feat/**']
   pull_request:
     branches: [main]
 
