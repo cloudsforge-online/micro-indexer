@@ -138,6 +138,30 @@ export function basicAuthFor(url: string): string | undefined {
   return `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`
 }
 
+/**
+ * **None, and no scope could ever apply here.**
+ *
+ * This module's peers are not CloudsForge services. They are chain nodes — a self-hosted
+ * `litecoind`, or a third-party JSON-RPC endpoint — and the credential above is HTTP Basic read out
+ * of the endpoint's own URL, or a provider's API key in its query string. Neither is minted by
+ * `micro-identity`, neither is validated against `@cloudsforge/contracts-auth`, and granting this
+ * service a scope would not change one byte that leaves this file.
+ *
+ * It is stated because `micro-deploy`'s `derive-grants.mjs` reads a module that builds an
+ * `HttpClient` and names a bearer as one presenting an estate credential, and by that test this
+ * file — which says `authorization` in as many words — qualifies. The test is deliberately loose
+ * (derive-grants.mjs:265: a false negative yields NO grant, which is worse than a wide one), so the
+ * module that knows the answer is the one that says it. Same verdict, same reason, as
+ * `mint/src/index.ts`: "they dial public chain nodes outside this estate."
+ *
+ * `Object.freeze([])` and not `NO_SCOPES_REQUIRED` — which is the spelling to prefer, and is what
+ * `foresight/src/pricingclient.ts` uses — for one boring reason: `@cloudsforge/contracts-auth` is
+ * not a dependency of this repository, and taking one on so a constant can be empty in a
+ * better-looking way would put a new package into this service's image build for no runtime effect.
+ * The derivation reads both forms identically (derive-grants.mjs:386, :404).
+ */
+export const RPC_SCOPES: readonly string[] = Object.freeze([])
+
 export class RpcPool {
   readonly #scope: ChainScope
   readonly #endpoints: readonly RpcEndpoint[]
