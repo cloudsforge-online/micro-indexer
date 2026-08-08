@@ -32,6 +32,8 @@ import {
   activityEntryKey,
   custodyAddressHistory,
   haltChain,
+  markConflictedSpends,
+  orphanAbove,
   recordSpends,
   setCheckpoint,
   upsertActivity,
@@ -606,32 +608,59 @@ function ltcObserver(caller: RpcCaller): CustodyObserver {
   })
 }
 
-/** Canonical blocks `from..to`, and a tip checkpoint at `to`. `from > 0` is a cold start. */
-async function walkLtc(from: number, to: number): Promise<void> {
+/**
+ * The chain that WINS a reorg at `ancestor`: the same blocks up to the fork, different ones above.
+ *
+ * A replacement block has to be a DIFFERENT block, or the re-walk would upsert the incumbent on
+ * `(chain, network, hash)` and the test would prove nothing about a reorg. Below the fork it must
+ * be the SAME block, so the winner's first replacement still names a parent that is on the record.
+ */
+const afterReorgAt =
+  (ancestor: number) =>
+  (height: number): string =>
+    height <= ancestor ? hashAt(height) : `0x${(height + 1_000_000).toString(16).padStart(64, '0')}`
+
+/**
+ * Canonical blocks `from..to`, and a tip checkpoint at `to`. `from > 0` is a cold start.
+ *
+ * `hashOf` is how the winning chain is walked after a reorg: same heights, different blocks. It
+ * defaults to `hashAt`, so every test that predates the reorg cases is unchanged.
+ */
+async function walkLtc(
+  from: number,
+  to: number,
+  hashOf: (height: number) => string = hashAt,
+): Promise<void> {
   for (let height = from; height <= to; height += 1) {
     await upsertBlock(sql, LTC, {
       height,
-      hash: hashAt(height),
-      parentHash: hashAt(height === 0 ? 0 : height - 1),
+      hash: hashOf(height),
+      parentHash: height === 0 ? hashOf(0) : hashOf(height - 1),
       blockTime: new Date(1_700_000_000_000 + height * 150_000),
       txCount: 0,
       detail: {},
     })
   }
-  await setCheckpoint(sql, LTC, TIP_STREAM, to, hashAt(to))
+  await setCheckpoint(sql, LTC, TIP_STREAM, to, hashOf(to))
 }
 
-/** An output of `amount` paying `address`, at `height`, as vout `vout` of `txid`. */
+/**
+ * An output of `amount` paying `address`, at `height`, as vout `vout` of `txid`.
+ *
+ * `blockHash` defaults to the block this fixture's original chain has at that height. The reorg
+ * cases pass the winner's, because a movement's block hash is what says WHICH chain carried it.
+ */
 async function fund(
   height: number,
   txid: string,
   vout: number,
   address: string,
   amount: bigint,
+  blockHash: string = hashAt(height),
 ): Promise<void> {
   await upsertTransaction(sql, LTC, {
     hash: txid,
-    blockHash: hashAt(height),
+    blockHash,
     blockHeight: height,
     txIndex: 0,
     from: null,
@@ -653,7 +682,7 @@ async function fund(
     entryKey: activityEntryKey(vout, 'in', address),
     logIndex: vout,
     blockHeight: height,
-    blockHash: hashAt(height),
+    blockHash,
   })
 }
 
@@ -663,10 +692,11 @@ async function spend(
   spendingTx: string,
   txid: string,
   vout: number,
+  blockHash: string = hashAt(height),
 ): Promise<void> {
   await upsertTransaction(sql, LTC, {
     hash: spendingTx,
-    blockHash: hashAt(height),
+    blockHash,
     blockHeight: height,
     txIndex: 0,
     from: null,
@@ -678,7 +708,7 @@ async function spend(
     rawRef: {},
   })
   await recordSpends(sql, LTC, [
-    { txid, vout, spendingTxHash: spendingTx, blockHeight: height, blockHash: hashAt(height) },
+    { txid, vout, spendingTxHash: spendingTx, blockHeight: height, blockHash },
   ])
 }
 
@@ -778,6 +808,111 @@ test('an orphaned credit is not money and an orphaned spend did not happen', { s
   `
 
   assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '400')
+})
+
+test('a reorg retracts credits and spends TOGETHER, and the total is what proves it', { skip }, async () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THE TEST ABOVE SETS THE STATUSES BY HAND. THIS ONE DRIVES THE REORG PATH ITSELF.
+  //
+  // The derivation reads two tables — `address_activity` for the credits and `spent_outpoints` for
+  // the spends — and it is correct only if a reorg retracts BOTH. Nothing else in this suite pins
+  // that: `store.orphanAbove` could lose its `spent_outpoints` statement tomorrow and every
+  // existing assertion here would still pass, because they all arrange the statuses themselves.
+  //
+  // The single number below sees either failure, and sees which one it was:
+  //
+  //   500  both tables were retracted together — the record and the chain agree
+  //     0  the credits were retracted and the SPENDS SURVIVED — an under-statement, which reaches
+  //        the ledger as POSITIVE drift and freezes the asset
+  //   800  the spends were retracted and the CREDITS SURVIVED — an over-statement, which reaches
+  //        the ledger as NEGATIVE drift and freezes the asset WHILE THE PLATFORM IS SOLVENT, the
+  //        2026-08-05 shape and the whole reason micro-org#252 is not `in − out`
+  //
+  // A reorg is also the moment a reconciliation is most likely to be running, so this is not a
+  // corner: it is the busiest hour on the worst day.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  const ANCESTOR = 79
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  // Below the fork, and therefore untouched by the reorg. This is the coin whose fate the whole
+  // assertion turns on: it is spent on the losing chain and unspent on the winning one.
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 500n)
+  // Both above the fork: one credit and one spend, so a one-sided retraction is visible.
+  await fund(80, 'tx-b', 0, 'ltc1qaa', 300n)
+  await spend(85, 'tx-spend', 'tx-a', 0)
+
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '300')
+
+  await orphanAbove(sql, LTC, ANCESTOR, LTC_HEAD - ANCESTOR)
+
+  // ── WHAT A REORG ACTUALLY DOES TO THIS OBSERVATION, WHICH IS NOT WHAT IT LOOKS LIKE ──────────
+  //
+  // It does NOT refuse, and the coverage proof is not what reacts. Orphaning the blocks moves the
+  // canonical HEAD down with them — 100 to 79 — so `confirmedAnchor` re-anchors and the confirmed
+  // height drops from `LTC_AT` to `79 − 12 + 1`. The record below the fork is untouched and still
+  // contiguous, so the derivation proceeds, honestly, at a shallower depth.
+  //
+  // That is the right behaviour and it is worth stating plainly rather than assumed: a reorg is
+  // not a hole. `history_not_walked` is for a record with a GAP in it; a reorg leaves a shorter
+  // record, not a broken one. What tells the caller the depth moved is `headHeight` and
+  // `observedAtBlock`, which travel with every observation for exactly this reason, and the
+  // separate closing `getblockhash` check is what catches a reorg landing mid-observation.
+  const shallow = await ltcObserver(ltcCaller().caller).total(LTC)
+  assert.equal(shallow.headHeight, ANCESTOR)
+  assert.equal(shallow.observedAtBlock, ANCESTOR - LTC_CONFIRMATIONS + 1)
+  // Both retracted rows are above this height anyway, so this number is already the proof: the
+  // credit at 80 and the spend at 85 are gone together, and the 500 below the fork is ours again.
+  assert.equal(shallow.total, '500')
+
+  const winner = afterReorgAt(ANCESTOR)
+  await walkLtc(ANCESTOR + 1, LTC_HEAD, winner)
+
+  // And once the winner is walked the depth returns to `LTC_AT` with the same answer — which is
+  // the assertion that matters, because now the retracted rows are BELOW the confirmed height and
+  // would be counted if the reorg had left either of them `included`.
+  const observed = await ltcObserver(ltcCaller({ hashAt: winner }).caller).total(LTC)
+  assert.equal(observed.total, '500')
+  assert.equal(observed.observedAtBlockHash, winner(LTC_AT))
+})
+
+test('a coin the winning chain spends stays spent, and the loser is conflicted rather than resurrected', { skip }, async () => {
+  // The other half of the reorg contract. Above, the winner did not re-spend the outpoint; here it
+  // spends it with a DIFFERENT transaction, which is the double-spend a UTXO chain can produce and
+  // an account chain cannot.
+  //
+  // What is pinned is that the derivation matches on ANY canonical spend of the outpoint rather
+  // than on the transaction it first saw spend it. `unspentOutputTotal`'s `not exists` is keyed on
+  // `(txid, vout)` and not on the spender, so the replacement spender suppresses the credit exactly
+  // as the original did. Keying it on the spender would leave this coin counted for ever after —
+  // an over-statement, negative drift, a freeze while solvent.
+  const ANCESTOR = 79
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 500n)
+  // The losing chain: `tx-spend` takes the 500 and pays 490 of change back to the same address, so
+  // the loser owns a credit as well as a spend and both must come off the record together.
+  await spend(85, 'tx-spend', 'tx-a', 0)
+  await fund(85, 'tx-spend', 1, 'ltc1qaa', 490n)
+
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '490')
+
+  await orphanAbove(sql, LTC, ANCESTOR, LTC_HEAD - ANCESTOR)
+  const winner = afterReorgAt(ANCESTOR)
+  await walkLtc(ANCESTOR + 1, LTC_HEAD, winner)
+  // The winning chain spends the same outpoint with a different transaction, and pays us nothing.
+  await spend(85, 'tx-rival', 'tx-a', 0, winner(85))
+
+  assert.equal((await ltcObserver(ltcCaller({ hashAt: winner }).caller).total(LTC)).total, '0')
+
+  // And the bookkeeping the worker does next must not move the number. `tx-spend` can never be
+  // re-mined — its input is gone — so it becomes `dropped` and its change output becomes
+  // `conflicted` rather than staying `orphaned`. A conflicted credit is not money either, which is
+  // why `unspentOutputTotal` tests `status = 'included'` rather than `status <> 'orphaned'`.
+  const killed = await markConflictedSpends(sql, LTC)
+  assert.equal(killed.transactions, 1)
+  assert.equal(killed.activity, 1)
+
+  assert.equal((await ltcObserver(ltcCaller({ hashAt: winner }).caller).total(LTC)).total, '0')
 })
 
 test('a hole in the walked record refuses, because it is wrong in both directions at once', { skip }, async () => {
