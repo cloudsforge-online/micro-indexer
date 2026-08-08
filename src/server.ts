@@ -55,6 +55,7 @@ import {
 } from './chains.ts'
 import { CustodyTotalUnavailableError, type CustodyObserver } from './custody.ts'
 import type { ReadStore } from './reads.ts'
+import type { HistoryClaim } from './store.ts'
 import { TokenStateUnavailableError, type TokenObserver } from './tokenstate.ts'
 
 /** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
@@ -657,10 +658,11 @@ async function watchAddress(ctx: RequestContext, deps: ServerDeps): Promise<Repl
   const address = addressFrom(ctx, scope.chain)
   const body = await readJson(ctx.req)
   const label = typeof body['label'] === 'string' ? body['label'].slice(0, 200) : null
+  const history = historyClaimFrom(body)
 
   const done = deps.lifecycle.track()
   try {
-    await deps.reads.watch(scope, address, label)
+    await deps.reads.watch(scope, address, label, history)
     ctx.log.info('address watched', {
       chain: scope.chain,
       network: scope.network,
@@ -671,6 +673,45 @@ async function watchAddress(ctx: RequestContext, deps: ServerDeps): Promise<Repl
   } finally {
     done()
   }
+}
+
+/**
+ * What the caller is claiming about this address's history, and it is optional on purpose.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * A UTXO balance is derived from what this service walked (`custody.ts`), so it is only complete if
+ * nothing happened to the address below the first block in the record. This service cannot check
+ * that. The registrar can — for exactly one address, at exactly one moment: the one it has just
+ * derived a key for, which nothing can have paid yet.
+ *
+ * `freshlyDerived: true` is that claim, and it is deliberately a BOOLEAN rather than a height. A
+ * caller that sent a height would be sending one it believes about a chain it does not follow; the
+ * store resolves the claim against this service's own canonical head, which is the only height that
+ * is comparable with the record the derivation reads.
+ *
+ * `historyFromHeight: <n>` is the operator's escape hatch, and it is the narrower, more dangerous
+ * one: it is a person stating a fact about an address funded before this service existed. It is
+ * accepted because the alternative — a permanently unobservable address — is worse, and because a
+ * wrong value here fails SAFE in the common case (too low a number refuses; there is no value that
+ * silently invents coin, since the sum only ever counts outputs that were actually walked).
+ *
+ * Neither is required. An absent claim leaves NULL, which the EVM families do not read at all and
+ * the derived families refuse on. That is the correct default for a field whose whole content is a
+ * statement somebody has to be willing to make.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+function historyClaimFrom(body: Record<string, unknown>): HistoryClaim {
+  const explicit = body['historyFromHeight']
+  if (explicit !== undefined && explicit !== null) {
+    if (typeof explicit !== 'number' || !Number.isSafeInteger(explicit) || explicit < 0) {
+      throw new BadRequestError(
+        'bad_history_from_height',
+        'historyFromHeight must be a non-negative integer block height',
+      )
+    }
+    return explicit
+  }
+  return body['freshlyDerived'] === true ? 'head' : null
 }
 
 async function requestBackfill(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {

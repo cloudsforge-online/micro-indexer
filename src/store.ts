@@ -842,17 +842,115 @@ export async function listProviderHealth(
 
 /* ------------------------------------------------------------------ watched addresses */
 
+/**
+ * What a registrar is claiming about an address's history, if anything.
+ *
+ * `'head'` is the claim a service that has JUST DERIVED THE KEY is entitled to make and the one it
+ * can make without knowing anything about the chain: "nothing can have paid this address before
+ * now". It is resolved here, against this service's own canonical head, rather than by the caller —
+ * a caller-supplied height would be a height this service might not have walked, and the whole
+ * purpose of the column is to be comparable with what it walked.
+ *
+ * A number is an operator stating a fact deliberately about an address whose funding history they
+ * know. Null is silence, and silence is refused rather than assumed downstream.
+ */
+export type HistoryClaim = number | 'head' | null
+
 export async function watchAddress(
   exec: Exec,
   scope: ChainScope,
   address: string,
   label: string | null,
+  history: HistoryClaim = null,
 ): Promise<void> {
+  // Read outside the insert, and a stale head is safe in the only direction that matters: it is a
+  // LOWER claim than the truth, and a lower claim can only make a later observation refuse.
+  const historyFromHeight = history === 'head' ? ((await headBlock(exec, scope))?.height ?? 0) : history
   await exec`
-    insert into watched_addresses (chain, network, address, label)
-    values (${scope.chain}, ${scope.network}, ${address}, ${label})
-    on conflict (chain, network, address) do update set label = excluded.label
+    insert into watched_addresses (chain, network, address, label, history_from_height)
+    values (${scope.chain}, ${scope.network}, ${address}, ${label}, ${historyFromHeight})
+    on conflict (chain, network, address) do update
+      set label = excluded.label,
+          -- LEAST, and it ignores nulls in postgres, so this keeps the LOWEST claim either
+          -- registration made and never loses one to a re-registration that made none. The
+          -- direction matters: the column says "no activity below this height", so a lower number
+          -- is a STRONGER statement and a higher one would quietly narrow what the derivation is
+          -- allowed to see. A re-watch is routine — micro-wallet re-registers on a retry job —
+          -- and routine must not be able to weaken a solvency input.
+          history_from_height = least(
+            watched_addresses.history_from_height,
+            excluded.history_from_height
+          )
   `
+}
+
+/** One member of the custody set, with whatever claim its registrar made about its history. */
+export interface CustodyAddress {
+  readonly address: string
+  /**
+   * The height below which the registrar asserts this address had no chain activity, or null for
+   * "nobody said". Null is the reason a UTXO observation is refused rather than the reason it is
+   * approximated — see `custody.ts`, `history_unknown`.
+   */
+  readonly historyFromHeight: number | null
+}
+
+/**
+ * Σ unspent output value over `addresses` as of `height`, from this service's own walked record.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **Outputs minus spent outpoints, and NOT `in` minus `out`.** The two look interchangeable and
+ * are not, because of one line in `bitcoin.ts`: the spend record is pushed from the txin outpoint
+ * unconditionally, while the outbound MOVEMENT is only written when the prevout resolves to a value
+ * and an address. An input whose prevout could not be fetched increments `unresolvedInputs` and
+ * leaves no `out` row behind — so a balance summed as `in − out` is over-stated by every such
+ * spend. Over-stated reads at the ledger as NEGATIVE drift, which freezes the asset while the
+ * platform is entirely solvent. That is the 2026-08-05 shape, and it would arrive here as a data
+ * artefact rather than as a bookkeeping mistake, which is far harder to recognise.
+ *
+ * This formulation cannot express that error. It asks two questions of the record — was this output
+ * paid to us, and has it since been spent — and both are answered by rows that exist whether or not
+ * any prevout ever resolved.
+ *
+ * `status = 'included'` on both sides. An orphaned or conflicted credit is not money, and an
+ * orphaned or conflicted spend did not happen; taking either at face value would move the total in
+ * the direction of whichever reorg is currently unrepaired.
+ *
+ * The caller is responsible for the two facts this query cannot establish: that the record is
+ * contiguous down to a height below any activity these addresses have ever had, and that `height`
+ * is at the chain's confirmation depth. Without those it returns a number that is arithmetically
+ * correct about an incomplete record, which is the most dangerous kind of correct.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export async function unspentOutputTotal(
+  exec: Exec,
+  scope: ChainScope,
+  addresses: readonly string[],
+  height: number,
+): Promise<bigint> {
+  if (addresses.length === 0) return 0n
+  const rows = await exec<{ total: string | null }[]>`
+    select coalesce(sum(credit.amount), 0)::text as total
+      from address_activity credit
+     where credit.chain = ${scope.chain}
+       and credit.network = ${scope.network}
+       and credit.direction = 'in'
+       and credit.status = 'included'
+       and credit.asset_kind = 'native'
+       and credit.block_height <= ${height}
+       and credit.address = any(${[...addresses]}::text[])
+       and not exists (
+         select 1
+           from spent_outpoints spend
+          where spend.chain = credit.chain
+            and spend.network = credit.network
+            and spend.txid = credit.tx_hash
+            and spend.vout = credit.log_index
+            and spend.status = 'included'
+            and spend.block_height <= ${height}
+       )
+  `
+  return BigInt(rows[0]?.total ?? '0')
 }
 
 /**
@@ -898,10 +996,10 @@ export async function custodyAddresses(
   scope: ChainScope,
   labelPrefixes: readonly string[],
   limit: number,
-): Promise<readonly string[]> {
+): Promise<readonly CustodyAddress[]> {
   if (labelPrefixes.length === 0) return []
-  const rows = await exec<{ address: string }[]>`
-    select address from watched_addresses
+  const rows = await exec<{ address: string; history_from_height: string | null }[]>`
+    select address, history_from_height from watched_addresses
      where chain = ${scope.chain} and network = ${scope.network}
        and label is not null
        and exists (
@@ -911,7 +1009,40 @@ export async function custodyAddresses(
      order by address
      limit ${limit}
   `
-  return rows.map((r) => r.address)
+  return rows.map((r) => ({
+    address: r.address,
+    // `bigint` columns arrive as strings from this driver. `Number(null)` is 0 and 0 is a
+    // meaningful height, so the null is carried through as null rather than coerced — the
+    // difference between "no activity below genesis" and "nobody said" is the difference between
+    // an observation and a refusal.
+    historyFromHeight: r.history_from_height === null ? null : Number(r.history_from_height),
+  }))
+}
+
+/**
+ * The history claims carried by named addresses, whether or not they are custody's.
+ *
+ * `custodyAddresses` answers "who is in the set"; this answers "what has been claimed about these
+ * specific ones", which is what the single-address balance read needs. An address that is not
+ * watched at all is simply absent from the result — not an error here, because the caller is
+ * entitled to ask about an address it is about to register, and the absence of a claim is a fact
+ * the caller must weigh rather than a failure of this query.
+ */
+export async function custodyAddressHistory(
+  exec: Exec,
+  scope: ChainScope,
+  addresses: readonly string[],
+): Promise<readonly CustodyAddress[]> {
+  if (addresses.length === 0) return []
+  const rows = await exec<{ address: string; history_from_height: string | null }[]>`
+    select address, history_from_height from watched_addresses
+     where chain = ${scope.chain} and network = ${scope.network}
+       and address = any(${[...addresses]}::text[])
+  `
+  return rows.map((r) => ({
+    address: r.address,
+    historyFromHeight: r.history_from_height === null ? null : Number(r.history_from_height),
+  }))
 }
 
 /* ------------------------------------------------------------------ confirmation sweep */

@@ -11,6 +11,7 @@ import {
   activityEntryKey,
   activityForAddress,
   blockAtHeight,
+  custodyAddressHistory,
   ensureBackfill,
   filterWatched,
   getCheckpoint,
@@ -201,6 +202,37 @@ test('a watch on one network does not watch the other', { skip }, async () => {
   await watchAddress(db(), TESTNET, SHARED, 'testnet only')
   assert.deepEqual([...(await filterWatched(db(), TESTNET, [SHARED]))], [SHARED])
   assert.deepEqual([...(await filterWatched(db(), MAINNET, [SHARED]))], [])
+})
+
+test("a 'head' history claim is resolved here, against this network's own head", { skip }, async () => {
+  // The caller that can make the claim truthfully — one that has just derived the key — is the one
+  // that cannot know a height. So it says `freshlyDerived` and the height is stamped here, from
+  // the record of the network being watched. Stamping it in the caller would mean trusting a
+  // number produced by a service with no view of this chain at all.
+  await upsertBlock(db(), TESTNET, {
+    height: 77,
+    hash: '0x77',
+    parentHash: '0x76',
+    blockTime: new Date(1_700_000_000_000),
+    txCount: 0,
+    detail: {},
+  })
+  await watchAddress(db(), TESTNET, SHARED, 'deposit:u-1', 'head')
+  assert.equal((await custodyAddressHistory(db(), TESTNET, [SHARED]))[0]?.historyFromHeight, 77)
+
+  // The same claim on a network with nothing walked is 0, not null: "no activity below block 0" is
+  // true of every address, and it is the WEAKEST claim available rather than a licence. It lets a
+  // genesis-walked chain proceed and still refuses a cold-started one, which is exactly right —
+  // an indexer with no blocks cannot have missed any.
+  await watchAddress(db(), MAINNET, SHARED, 'deposit:u-1', 'head')
+  assert.equal((await custodyAddressHistory(db(), MAINNET, [SHARED]))[0]?.historyFromHeight, 0)
+
+  // And an address watched with no claim at all keeps the null, which is the refusal.
+  await watchAddress(db(), TESTNET, `${SHARED}-x`, 'deposit:u-2')
+  assert.equal(
+    (await custodyAddressHistory(db(), TESTNET, [`${SHARED}-x`]))[0]?.historyFromHeight,
+    null,
+  )
 })
 
 test('checkpoints, halts and backfill ranges are per network', { skip }, async () => {

@@ -55,6 +55,7 @@ import {
   transactionByHash,
   watchAddress,
   type Exec,
+  type HistoryClaim,
 } from './store.ts'
 
 export interface ProviderView {
@@ -282,7 +283,19 @@ export interface ReadStore {
     atBlock: number | null,
   ): Promise<TokenBalancesView>
   block(scope: ChainScope, height: number): Promise<BlockView | null>
-  watch(scope: ChainScope, address: string, label: string | null): Promise<void>
+  /**
+   * `historyFromHeight` is the registrar's claim that this address had no chain activity below
+   * that height — the input `custody.ts` needs before it will derive a UTXO balance. Null means
+   * nobody said, which is a refusal there and not a zero. `'head'` resolves the claim to this
+   * service's current head at write time, which is what a caller that has just derived the key can
+   * say truthfully without having to know the height itself.
+   */
+  watch(
+    scope: ChainScope,
+    address: string,
+    label: string | null,
+    historyFromHeight?: HistoryClaim,
+  ): Promise<void>
   requestBackfill(scope: ChainScope, from: number, to: number): Promise<string>
 }
 
@@ -582,8 +595,8 @@ export function postgresReadStore(sql: Db): ReadStore {
       }
     },
 
-    async watch(scope, address, label) {
-      await watchAddress(exec, scope, address, label)
+    async watch(scope, address, label, historyFromHeight = null) {
+      await watchAddress(exec, scope, address, label, historyFromHeight)
     },
 
     async requestBackfill(scope, from, to) {

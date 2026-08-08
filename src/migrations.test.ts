@@ -140,11 +140,18 @@ test('every chain in CHAIN_IDS is allowed by the schema, from one definition and
   }
 })
 
-test('the final migration converges every chain-scoped table, whenever the database was created', () => {
+test('the converging migration repairs every chain-scoped table, whenever the database was created', () => {
   // A live ALTER fixes only the databases that already exist. Without this, a freshly provisioned
   // environment comes up with the old constraint and the failure looks like a code bug.
-  const converge = MIGRATIONS[MIGRATIONS.length - 1]
-  assert.ok(converge)
+  //
+  // Found by NAME and not as the last element. It was written last and read as `MIGRATIONS.at(-1)`,
+  // which conflated "the migration that converges" with "whatever ran most recently" — so the next
+  // unrelated migration (7, `utxo-custody-history`) failed this test while converging nothing and
+  // un-converging nothing. The invariant is that the repair is in the list at all; every table's
+  // constraint is asserted against the whole DDL by the two tests above regardless of which
+  // migration carries it.
+  const converge = MIGRATIONS.find((m) => m.name === 'chain-check-converge')
+  assert.ok(converge, 'the converging migration is gone; a fresh database no longer gets the repair')
   for (const table of CHAIN_TABLES) {
     assert.match(
       converge.up,
