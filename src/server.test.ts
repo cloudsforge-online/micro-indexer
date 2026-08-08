@@ -189,6 +189,14 @@ const custody: CustodyObserver = {
       total: '7000000000000000000',
       addresses: 3,
       labelPrefixes: ['deposit:', 'treasury:'],
+      // Two buckets summing to the whole, in the order `labelPrefixes` gives — the shape the route
+      // is contracted to emit, so that the transport test carries a realistic body rather than a
+      // minimal one. The arithmetic (parts == whole) is `custody.test.ts`'s property, not this
+      // file's; here it only has to be present and serialisable.
+      byLabelPrefix: [
+        { prefix: 'deposit:', addresses: 2, total: '4000000000000000000' },
+        { prefix: 'treasury:', addresses: 1, total: '3000000000000000000' },
+      ],
       requiredConfirmations: 60,
       observedAtBlock: 39,
       observedAtBlockHash: HASH,

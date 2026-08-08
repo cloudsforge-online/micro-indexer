@@ -219,6 +219,69 @@ test('a complete read of a complete custody set is a total at the confirmed dept
   assert.equal(chain.calls.filter((c) => c === 'eth_getBlockByNumber').length, 2)
 })
 
+test('the total carries the same total split by bucket, and still discloses no address', { skip }, async () => {
+  // Step 5 of micro-org#248: a freeze must name its own cause. Two numbers say the estate and the
+  // chain disagree; they do not say WHERE, and deposits and treasury float are different money held
+  // by different code. The split is what turns "drift 3" into "drift 3, and it is all in treasury".
+  await walkChain()
+  await watchAddress(sql, SCOPE, '0xaa', 'deposit:u-1')
+  await watchAddress(sql, SCOPE, '0xbb', 'deposit:u-2')
+  await watchAddress(sql, SCOPE, '0xcc', 'treasury:hot')
+  // Not custody, so it is in neither bucket and in no total. The parts-equal-whole assertion is
+  // only worth something if the set it is taken over is the set that was summed.
+  await watchAddress(sql, SCOPE, '0xdd', 'member:u-9')
+
+  const chain = honestChain()
+  chain.balances.set('0xaa', '0x1')
+  chain.balances.set('0xbb', '0x2')
+  chain.balances.set('0xcc', '0x4')
+
+  const observed = await observer(chain).total(SCOPE)
+
+  assert.equal(observed.total, '7')
+  assert.equal(observed.addresses, 3)
+  assert.deepEqual(observed.byLabelPrefix, [
+    { prefix: 'deposit:', addresses: 2, total: '3' },
+    { prefix: 'treasury:', addresses: 1, total: '4' },
+  ])
+  // In CONFIGURED order, which is the order the freeze message will read in — not whichever order
+  // the rows happened to arrive in.
+  assert.deepEqual(
+    observed.byLabelPrefix.map((b) => b.prefix),
+    [...observed.labelPrefixes],
+  )
+  // The property the aggregate promises and asserts internally, re-proved from outside: the parts
+  // add up to the whole, in both money and cardinality. A breakdown that does not is worse than
+  // none, because it is read during an incident by somebody deciding who is wrong.
+  assert.equal(
+    observed.byLabelPrefix.reduce((sum, b) => sum + BigInt(b.total), 0n).toString(),
+    observed.total,
+  )
+  assert.equal(
+    observed.byLabelPrefix.reduce((sum, b) => sum + b.addresses, 0),
+    observed.addresses,
+  )
+  // And no address travels with it. The disclosure argument is unchanged by the split: the caller
+  // must not learn the set, and two aggregates disclose no more of it than one did.
+  const wire = JSON.stringify(observed)
+  for (const address of ['0xaa', '0xbb', '0xcc', '0xdd']) assert.ok(!wire.includes(address))
+})
+
+test('a prefix that matched nothing is reported at zero, not left out', { skip }, async () => {
+  // An absent bucket is ambiguous — empty, or the definition changed underneath the operator? —
+  // and that ambiguity would be read at three in the morning. Every configured prefix answers.
+  await walkChain()
+  await watchAddress(sql, SCOPE, '0xaa', 'deposit:u-1')
+  const chain = honestChain()
+  chain.balances.set('0xaa', '0x5')
+
+  const observed = await observer(chain).total(SCOPE)
+  assert.deepEqual(observed.byLabelPrefix, [
+    { prefix: 'deposit:', addresses: 1, total: '5' },
+    { prefix: 'treasury:', addresses: 0, total: '0' },
+  ])
+})
+
 test('a balance of zero at every address IS a total, because every address was read', { skip }, async () => {
   // The distinction the whole release turns on: a measured zero is an answer, an unmeasured zero
   // is a lie. This is the first kind, and it must not be refused.
@@ -798,6 +861,33 @@ test('a single derived balance is the same derivation, with the same refusals', 
   // And on a cold-started record the single reading refuses exactly as the total does.
   await sql`delete from blocks where chain = 'ltc' and network = 'testnet' and height < 5`
   await assertRefusal(() => ltcObserver(ltcCaller().caller).balance(LTC, 'ltc1qaa'), 'history_unknown')
+})
+
+test('the derived total splits by bucket too, and a fully-spent address is a zero in one', { skip }, async () => {
+  // The split has to hold on BOTH summing paths or the freeze message means different things on
+  // different chains. This path is the harder of the two: the derivation returns a row only for an
+  // address that still has unspent credit, so an address whose coin has all been spent is ABSENT
+  // from the measurement — and absent must land in its bucket as a counted zero, not be dropped.
+  // Dropping it would leave the parts short of the whole and refuse the whole observation.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await watchAddress(sql, LTC, 'ltc1qbb', 'deposit:u-2')
+  await watchAddress(sql, LTC, 'ltc1qtt', 'treasury:hot')
+
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 500n)
+  await fund(11, 'tx-b', 0, 'ltc1qbb', 300n)
+  await fund(12, 'tx-t', 0, 'ltc1qtt', 900n)
+  // `ltc1qbb` is swept empty: measured zero, still one address of the deposit set.
+  await spend(20, 'tx-sweep', 'tx-b', 0)
+
+  const observed = await ltcObserver(ltcCaller().caller).total(LTC)
+
+  assert.equal(observed.total, '1400')
+  assert.equal(observed.addresses, 3)
+  assert.deepEqual(observed.byLabelPrefix, [
+    { prefix: 'deposit:', addresses: 2, total: '500' },
+    { prefix: 'treasury:', addresses: 1, total: '900' },
+  ])
 })
 
 test('a node serving a different chain at the confirmed height is a refusal, not a total', { skip }, async () => {

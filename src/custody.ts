@@ -162,7 +162,8 @@ import {
   custodyAddresses,
   getCheckpoint,
   headBlock,
-  unspentOutputTotal,
+  unspentOutputTotals,
+  type AddressHistory,
   type CustodyAddress,
 } from './store.ts'
 import { toBlockParam, type RpcCaller } from './tokenstate.ts'
@@ -192,6 +193,11 @@ export type CustodyTotalFault =
   // backfill, which are different mornings.
   | 'history_unknown'
   | 'history_not_walked'
+  // The breakdown and the total disagree. Unreachable by construction — see `groupByPrefix` — and
+  // given its own code anyway, because the other codes all name something an operator can go and
+  // look at, and this one names a defect in this file. Reusing `address_unreadable` for it would
+  // send whoever read the freeze to the node, which is the one place the answer would not be.
+  | 'breakdown_inconsistent'
 
 /**
  * The observation could not be made, and it says which of the reasons applied.
@@ -216,6 +222,16 @@ export class CustodyTotalUnavailableError extends Error {
  * `Number()` on an 18-decimal balance silently loses the low digits — which is precisely where a
  * reconciliation drift shows up. The whole point of the number is the digits a float would drop.
  */
+/** One bucket of the custody set: everything whose label matched this prefix. */
+export interface CustodyBucket {
+  /** The configured prefix, verbatim — `deposit:`, `treasury:`. */
+  readonly prefix: string
+  /** How many custody addresses fell in this bucket. Zero is a legitimate, reportable answer. */
+  readonly addresses: number
+  /** Smallest units, decimal string, for the same reason `total` is. */
+  readonly total: string
+}
+
 export interface CustodyTotalObservation {
   readonly chain: string
   readonly network: string
@@ -228,6 +244,29 @@ export interface CustodyTotalObservation {
   readonly addresses: number
   /** The label prefixes that defined the set. The definition travels with the answer. */
   readonly labelPrefixes: readonly string[]
+  /**
+   * The same total, split by which prefix each address's label matched.
+   *
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   * **THIS EXISTS SO THAT A FREEZE CAN NAME ITS OWN CAUSE.** A drift beyond tolerance stops
+   * withdrawals, and the message an operator reads first used to be two numbers — the ledger's
+   * custody total and this one. Two numbers say the estate and the chain disagree. They do not say
+   * WHERE, and "where" is the whole of the next hour's work: deposits and treasury float are
+   * different money, held by different code, and a drift in one is a different incident from a
+   * drift in the other. The 2026-08-05 freeze was a treasury registration and read, from the
+   * message, exactly like a deposit-sweep shortfall.
+   *
+   * One entry per CONFIGURED prefix, in configured order, including prefixes that matched nothing
+   * — `treasury:` at zero over zero addresses is a fact worth printing, and an operator should not
+   * have to know whether an absent bucket means empty or means the definition changed underneath
+   * them. Each address is counted under exactly one prefix (the first it matches), so these sum
+   * to `total` and to `addresses` exactly; that is asserted rather than assumed.
+   *
+   * **No address appears here.** The route's whole disclosure argument is that the SET is what the
+   * caller must not learn, and two aggregates disclose no more of the set than one did.
+   * ════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  readonly byLabelPrefix: readonly CustodyBucket[]
   readonly requiredConfirmations: number
   /** The height every balance was read at: `head − confirmations + 1`. */
   readonly observedAtBlock: number
@@ -496,8 +535,11 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
         )
       }
 
-      const total = DERIVED_FAMILIES.has(anchor.family)
-        ? await deriveTotal(deps, scope, anchor, found)
+      // Per address, not a single number, and the total is the sum of it below. Measuring once and
+      // dividing cannot disagree with itself; measuring the whole and then the parts can, and the
+      // parts exist precisely to be believed when a freeze is being diagnosed.
+      const balances = DERIVED_FAMILIES.has(anchor.family)
+        ? await deriveBalances(deps, scope, anchor, found)
         : await sumFromChain(
             caller,
             found.map((entry) => entry.address),
@@ -518,6 +560,8 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
       // total about a fork.
       await assertNodeAgrees(caller, anchor.family, at, anchor.hash)
 
+      const { total, byLabelPrefix } = groupByPrefix(found, balances, deps.labelPrefixes)
+
       const asset = assetOf(scope.chain)
       return {
         chain: scope.chain,
@@ -527,6 +571,7 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
         total: total.toString(),
         addresses: found.length,
         labelPrefixes: deps.labelPrefixes,
+        byLabelPrefix,
         requiredConfirmations: anchor.confirmations,
         observedAtBlock: at,
         observedAtBlockHash: anchor.hash,
@@ -543,22 +588,32 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
       let value: bigint
       if (DERIVED_FAMILIES.has(anchor.family)) {
         // The claim this address carries, if it is watched at all. An address nobody has registered
-        // has made no claim, and `deriveTotal` treats an absent claim as the weakest TRUE statement
-        // available — "no activity below height 0" — rather than as a licence. On a chain walked
-        // from genesis that is a theorem and the derivation proceeds; on one walked from a
+        // has made no claim, and `deriveBalances` treats an absent claim as the weakest TRUE
+        // statement available — "no activity below height 0" — rather than as a licence. On a chain
+        // walked from genesis that is a theorem and the derivation proceeds; on one walked from a
         // cold-start height it is refused, which is the honest answer for an address whose history
         // this service has never seen.
+        //
+        // No bucket is supplied and none is needed: `deriveBalances` takes an `AddressHistory`,
+        // which is the half of a custody entry the derivation actually reads. Grouping is the
+        // aggregate's business, and this route answers ONE named address, so there is nothing to
+        // group. The narrower parameter is what makes that structural rather than a convention —
+        // there is no field here to fill in wrongly.
         const [watched] = await custodyAddressHistory(deps.sql, scope, [address])
-        value = await deriveTotal(deps, scope, anchor, [
+        const derived = await deriveBalances(deps, scope, anchor, [
           { address, historyFromHeight: watched?.historyFromHeight ?? null },
         ])
+        // Absent means no unspent credit at this height, which for one address is a measured zero
+        // — the same reading `total` takes, and the reason this is not `?? undefined`.
+        value = derived.get(address) ?? 0n
       } else {
         // `sumFromChain` rather than `balanceOf` directly, so the single-address reading goes
         // through the identical failure mapping: every RPC fault is a refusal and none of them is a
         // zero. A caller booking an opening balance from a zero that meant "the provider would not
         // say" would write a permanent understatement into the ledger and freeze the asset for ever
         // after.
-        value = await sumFromChain(caller, [address], at, 1)
+        // `sumFromChain` fills every requested address or throws, so this key is present.
+        value = (await sumFromChain(caller, [address], at, 1)).get(address)!
       }
 
       // The closing hash check, for the same reason `total` makes it: the balance was answered at a
@@ -646,12 +701,12 @@ async function assertNodeAgrees(
  * because everywhere else in it a null becoming a number is the defect.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
-async function deriveTotal(
+async function deriveBalances(
   deps: CustodyObserverDeps,
   scope: ChainScope,
   anchor: ConfirmedAnchor,
-  entries: readonly CustodyAddress[],
-): Promise<bigint> {
+  entries: readonly AddressHistory[],
+): Promise<Map<string, bigint>> {
   const coverage = await canonicalCoverage(deps.sql, scope, anchor.at)
   const lo = coverage.lowestHeight
   if (lo === null || coverage.highestHeight === null) {
@@ -690,7 +745,7 @@ async function deriveTotal(
       )
     }
   }
-  return await unspentOutputTotal(
+  return await unspentOutputTotals(
     deps.sql,
     scope,
     entries.map((entry) => entry.address),
@@ -713,10 +768,10 @@ async function sumFromChain(
   addresses: readonly string[],
   height: number,
   concurrency: number,
-): Promise<bigint> {
+): Promise<Map<string, bigint>> {
   const balances = await readAll(caller, addresses, height, concurrency)
-  let total = 0n
-  // A missing slot is impossible — `readAll` fills every one or throws — and it is summed with an
+  const out = new Map<string, bigint>()
+  // A missing slot is impossible — `readAll` fills every one or throws — and it is read with an
   // explicit refusal rather than a `?? 0n` on purpose: `?? 0n` is exactly the defaulting this file
   // exists to refuse, and a default that is unreachable today is reachable after the next edit.
   for (let index = 0; index < addresses.length; index++) {
@@ -727,9 +782,67 @@ async function sumFromChain(
         `no balance was produced for ${addresses[index]} at height ${height}`,
       )
     }
-    total += balance
+    // `set`, not `+=`: `custodyAddresses` reads one row per address, so a repeat here would mean a
+    // duplicate in the watch list, and adding a balance to itself is how a set becomes a total that
+    // over-states the chain. Last write wins and the count stays honest.
+    out.set(addresses[index]!, balance)
   }
-  return total
+  return out
+}
+
+/**
+ * The total, and the same total split by bucket, from one measurement.
+ *
+ * The assertion at the end is the point of the function rather than a guard on it: a breakdown that
+ * does not add up to the total it explains is worse than no breakdown, because it will be read
+ * during an incident by somebody deciding whether the chain or the ledger is wrong. If the parts and
+ * the whole ever disagree, this refuses the whole observation — which freezes the asset, which is
+ * the direction this file always fails in.
+ */
+function groupByPrefix(
+  entries: readonly CustodyAddress[],
+  balances: ReadonlyMap<string, bigint>,
+  labelPrefixes: readonly string[],
+): { total: bigint; byLabelPrefix: readonly CustodyBucket[] } {
+  const sums = new Map<string, { addresses: number; total: bigint }>()
+  for (const prefix of labelPrefixes) sums.set(prefix, { addresses: 0, total: 0n })
+
+  let total = 0n
+  for (const entry of entries) {
+    // Absent means "no unspent credit at this height", which is a measured zero on the derived
+    // path — `unspentOutputTotals` returns a row only for an address that has one. On the RPC path
+    // every address is present or `sumFromChain` has already thrown.
+    const balance = balances.get(entry.address) ?? 0n
+    total += balance
+    const bucket = sums.get(entry.labelPrefix)
+    if (bucket === undefined) {
+      // Unreachable: `custodyAddresses` assigns `labelPrefix` from this same list. Refused rather
+      // than dropped, because dropping it would leave the buckets short of the total.
+      throw new CustodyTotalUnavailableError(
+        'breakdown_inconsistent',
+        `${entry.address} is labelled with a prefix that is not configured — the breakdown cannot ` +
+          'be reconciled with the total',
+      )
+    }
+    bucket.addresses += 1
+    bucket.total += balance
+  }
+
+  const byLabelPrefix = labelPrefixes.map((prefix) => {
+    const bucket = sums.get(prefix)!
+    return { prefix, addresses: bucket.addresses, total: bucket.total.toString() }
+  })
+
+  const parts = byLabelPrefix.reduce((sum, bucket) => sum + BigInt(bucket.total), 0n)
+  const counted = byLabelPrefix.reduce((sum, bucket) => sum + bucket.addresses, 0)
+  if (parts !== total || counted !== entries.length) {
+    throw new CustodyTotalUnavailableError(
+      'breakdown_inconsistent',
+      `the custody breakdown sums to ${parts} over ${counted} addresses but the set totals ` +
+        `${total} over ${entries.length} — refusing to report either`,
+    )
+  }
+  return { total, byLabelPrefix }
 }
 
 async function readAll(
