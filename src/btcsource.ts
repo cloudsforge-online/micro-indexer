@@ -67,6 +67,58 @@ export interface SourcedBlock {
 }
 
 /**
+ * Why a block's rows are not the whole block, in the two ways that can happen.
+ *
+ * `SourcedBlock.complete` says whether the transactions were fetched. It is not the only way a
+ * block can end up holding less than the chain put in it, and the two ways have to be told apart
+ * by whoever decides what a rescan must redo:
+ *
+ *   - **`transactions-not-fetched`** — the light source proved no transaction in the block
+ *     concerned the watched set and never downloaded the body. Nothing about the block is stored
+ *     beyond its header.
+ *   - **`watched-addresses-only`** — the whole block was fetched and every transaction is stored,
+ *     but `address_activity` was written only for addresses that were watched at the time. The
+ *     block's transactions are complete; its address record is not.
+ *
+ * Both mean the same thing to a backfill — rescan this block if the address set has grown since —
+ * and they mean different things to a reader, because the second still answers "was this
+ * transaction mined" for any hash and the first does not.
+ */
+export type PartialBlockReason = 'transactions-not-fetched' | 'watched-addresses-only'
+
+/**
+ * The key `blocks.detail` carries the marker under.
+ *
+ * Named here rather than spelled in each writer because two of them write it and a reader that
+ * looked for a different spelling than the writer used would conclude, silently and wrongly, that
+ * every block is complete.
+ */
+export const PARTIAL_DETAIL_KEY = 'partial'
+
+/**
+ * Stamp a block's `detail` with what was and was not stored for it.
+ *
+ * `null` means the block is whole and says so explicitly. That is worth a key of its own: a block
+ * row written by an older build carries neither marker, and "no marker" has to keep meaning
+ * "written before this service could tell you", not "complete". A reader that treats absence as
+ * completeness would vouch for exactly the blocks nobody can vouch for.
+ */
+export function markPartial(
+  detail: Record<string, unknown>,
+  reason: PartialBlockReason | null,
+): Record<string, unknown> {
+  return { ...detail, [PARTIAL_DETAIL_KEY]: reason }
+}
+
+/**
+ * There is deliberately no `partialReason(detail)` reader here. Everything in this service that
+ * asks about the marker asks it of many blocks at once — "is any block in range narrow" — and
+ * answers it in SQL against the partial index, not by pulling `detail` back into JavaScript one
+ * row at a time. A helper that existed only to be available would be the mistake this file's own
+ * machinery already made once.
+ */
+
+/**
  * The watched address set, as a source needs it.
  *
  * A light source must know the scripts *before* it decides whether to download a block, which is

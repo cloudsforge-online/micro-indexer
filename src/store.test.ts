@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import postgres from 'postgres'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
+import { PARTIAL_DETAIL_KEY } from './btcsource.ts'
 import type { ChainScope } from './chains.ts'
 import { CHAIN_TABLES, MIGRATIONS } from './migrations.ts'
 import type { Db } from './outbox.ts'
@@ -73,6 +74,20 @@ test('every statement that touches a chain table interpolates both halves of the
     const first = statement.split('\n')[1]?.trim() ?? statement.slice(0, 60)
     assert.ok(statement.includes('scope.chain'), `statement does not scope the chain: ${first}`)
     assert.ok(statement.includes('scope.network'), `statement does not scope the network: ${first}`)
+  }
+})
+
+test('the reader and the index look for the marker under the name the writer writes it', () => {
+  // `markPartial` in btcsource.ts writes the key; `partialFromHeight` and the partial index in
+  // migration 8 both look for it as a SQL literal, because a bind parameter would stop Postgres
+  // proving the query implies the index predicate and the whole point of that index is to find
+  // these blocks without a table scan. Two hardcoded spellings against one constant is exactly the
+  // divergence that would answer "every block is complete" for a record full of narrow ones — and
+  // the migration's copy cannot be corrected later, since a released migration's text is frozen.
+  const literal = `detail->>'${PARTIAL_DETAIL_KEY}'`
+  for (const file of ['./store.ts', './migrations.ts']) {
+    const source = readFileSync(new URL(file, import.meta.url), 'utf8')
+    assert.ok(source.includes(literal), `${file} does not read the marker as ${literal}`)
   }
 })
 
@@ -233,6 +248,50 @@ test("a 'head' history claim is resolved here, against this network's own head",
     (await custodyAddressHistory(db(), TESTNET, [`${SHARED}-x`]))[0]?.historyFromHeight,
     null,
   )
+
+  // The TIP wins when it is higher, and that is not a rounding-up of the claim — it is the only
+  // version of it that survives a record which no longer holds every address. A block between the
+  // head and the observed tip may be mid-flight, having already asked which addresses were watched
+  // and been told this one was not. Claiming the head leaves that block inside the range a balance
+  // is derived over and outside the range this address was recorded in; claiming the tip does not,
+  // and "nothing has paid it below the tip" is exactly as true for a key derived a moment ago.
+  await recordTip(db(), TESTNET, 90)
+  await watchAddress(db(), TESTNET, `${SHARED}-y`, 'deposit:u-3', 'head')
+  assert.equal(
+    (await custodyAddressHistory(db(), TESTNET, [`${SHARED}-y`]))[0]?.historyFromHeight,
+    90,
+    'the head is 77 and the tip is 90 — the higher of the two is the only safe claim',
+  )
+})
+
+test('a re-watch is free, and a lower claim is not', { skip }, async () => {
+  // `micro-wallet` re-registers every unwatched deposit address on a blunt retry pass, so the
+  // difference between "this address is watched" and "this address is watched further back than it
+  // was" has to be reported. The second means blocks already walked were walked without it; the
+  // first means nothing at all, and treating them alike is a rescan per address per sweep.
+  const first = await watchAddress(db(), TESTNET, SHARED, 'deposit:u-1', 500)
+  assert.deepEqual(first, { historyFromHeight: 500, firstWatch: true, claimLowered: false })
+
+  const again = await watchAddress(db(), TESTNET, SHARED, 'deposit:u-1', 500)
+  assert.deepEqual(again, { historyFromHeight: 500, firstWatch: false, claimLowered: false })
+
+  // A HIGHER claim is ignored by `least` and is therefore not a lowering either — the row still
+  // says 500, and nothing needs redoing.
+  const higher = await watchAddress(db(), TESTNET, SHARED, 'deposit:u-1', 900)
+  assert.deepEqual(higher, { historyFromHeight: 500, firstWatch: false, claimLowered: false })
+
+  const lower = await watchAddress(db(), TESTNET, SHARED, 'deposit:u-1', 200)
+  assert.deepEqual(lower, { historyFromHeight: 200, firstWatch: false, claimLowered: true })
+
+  // Null is not a low claim, it is no claim — so a row that had none and now has one has reached
+  // further back than it did, whatever the number is.
+  await watchAddress(db(), TESTNET, `${SHARED}-z`, 'deposit:u-4')
+  const stated = await watchAddress(db(), TESTNET, `${SHARED}-z`, 'deposit:u-4', 4_000_000)
+  assert.deepEqual(stated, {
+    historyFromHeight: 4_000_000,
+    firstWatch: false,
+    claimLowered: true,
+  })
 })
 
 test('checkpoints, halts and backfill ranges are per network', { skip }, async () => {

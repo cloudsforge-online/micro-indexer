@@ -31,6 +31,7 @@ import {
   TIP_STREAM,
   activityEntryKey,
   custodyAddressHistory,
+  ensureBackfill,
   haltChain,
   markConflictedSpends,
   orphanAbove,
@@ -955,6 +956,56 @@ test('a claim BELOW the walked floor refuses: the gap is history this service ne
   await fund(30, 'tx-a', 0, 'ltc1qaa', 400n)
 
   await assertRefusal(() => ltcObserver(ltcCaller().caller).total(LTC), 'history_not_walked')
+})
+
+test('a rescan in flight refuses, because a contiguity check cannot see it', { skip }, async () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THE FAILURE THAT HIDES FROM PROOF 1, AND THE ONLY REASON PROOF 3 EXISTS.
+  //
+  // Registering an address on a deployment that records only watched addresses enqueues a walk of
+  // blocks that ALREADY EXIST — the rows for the new address are missing from them, but the blocks
+  // themselves are all there. So the coverage is contiguous, `history_not_walked` never fires, and
+  // the sum runs over a record that is half rewritten. It understates, which is positive drift,
+  // which freezes an asset over a repair that was in progress the whole time.
+  //
+  // Every other refusal in this file is triggered by something absent. This one is triggered by
+  // something present and unfinished, which is why it is checked separately rather than folded in.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(30, 'tx-a', 0, 'ltc1qaa', 400n)
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '400')
+
+  // A backfill on a record that holds every address is HARMLESS and must not refuse. It rewrites
+  // blocks that already exist to what they already say — the writes are idempotent and nothing is
+  // deleted first — so freezing an asset for the length of an operator's catch-up would be a cost
+  // with no defect behind it.
+  await ensureBackfill(sql, LTC, 10, 50)
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '400')
+
+  // Once the blocks say they were walked for a partial address set, that same pending backfill is
+  // a repair of rows the sum reads, and the number is withheld until it lands.
+  await sql`
+    update blocks set detail = jsonb_set(detail, '{partial}', '"watched-addresses-only"')
+     where chain = 'ltc' and network = 'testnet'
+  `
+  await assertRefusal(() => ltcObserver(ltcCaller().caller).total(LTC), 'backfill_in_flight')
+
+  // A range that ends BELOW nothing the sum reads is still refused, because it starts inside it —
+  // the check is on where the walk begins, not on where it has reached, since a walk that has
+  // reached height 40 has rewritten 10 to 40 and not the rest.
+  await setCheckpoint(sql, LTC, 'backfill:10-50', 40, hashAt(40))
+  await assertRefusal(() => ltcObserver(ltcCaller().caller).total(LTC), 'backfill_in_flight')
+
+  // Finished, and the number comes back rather than the refusal becoming permanent. A freeze that
+  // no completed repair can lift is worse than the drift it was protecting against.
+  await setCheckpoint(sql, LTC, 'backfill:10-50', 50, hashAt(50))
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '400')
+
+  // And a rescan entirely above the confirmed height does not refuse at all: it cannot be
+  // rewriting a block this sum reads.
+  await ensureBackfill(sql, LTC, LTC_AT + 1, LTC_HEAD)
+  assert.equal((await ltcObserver(ltcCaller().caller).total(LTC)).total, '400')
 })
 
 test('an unclaimed address is answerable on a genesis-walked chain, and that is a theorem', { skip }, async () => {

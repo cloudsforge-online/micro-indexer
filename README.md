@@ -303,6 +303,7 @@ balance-probing this service replaces (`src/env.ts`):
 | `INDEXER_FOLLOW_BATCH_BLOCKS` | `25` | 1–500. **A tick must finish inside its lease.** Raising this without raising the lease hands the same heights to a second replica; every write is idempotent, but the duplicated RPC traffic is what gets a provider to rate-limit us (`src/env.ts`, reasoning) |
 | `INDEXER_BACKFILL_BATCH_BLOCKS` | `50` | 1–1000; separate because backfill is allowed to be slower (`src/env.ts`) |
 | `INDEXER_RPC_DEADLINE_MS` | `8000` | 250–120000; the absolute wall-clock ceiling for one RPC call across the transport's own retries (`src/env.ts`) |
+| `INDEXER_WATCHED_ADDRESSES_ONLY` | `true` | **Bitcoin family only.** Writes `address_activity` for watched addresses only. On, because following `ltc:mainnet` costs 2.05 MB per block with indexes and the watched set does not move across that measurement — the cost is the chain's transaction volume, so adding `btc:mainnet` fills the host's disk in under two months. Off restores the general record, which the block explorer and `wallet`'s portfolio read for addresses nobody registered, at that price. Every block written under it is marked in `blocks.detail` (`src/env.ts`, reasoning; `src/btcsource.ts` for the marker) |
 | `INDEXER_TEST_DATABASE_URL` | — | tests only; unset, every database-backed test skips |
 | `INDEXER_HEARTH_RPC_URL` | `http://127.0.0.1:8545` | tests only (`src/hearth.test.ts`) |
 
