@@ -96,6 +96,33 @@
  *
  * That boundary is the same one `ledger/src/reconcile.ts` states about its own input: "the database
  * can refuse a run that never had evidence, and it cannot audit evidence it is handed."
+ *
+ * ## Correction, 2026-08-08: treasury addresses ARE registered, and the drift went the other way
+ *
+ * Two claims above have expired, and the second expired in the direction the first did not predict.
+ *
+ * `micro-settlement` holds `indexer:write` today (`IDENTITY_SERVICE_TOKEN_GRANTS` in
+ * `deploy/compose/docker-compose.estate.yml`), and it uses it: `settlement/src/migrations.ts:367`
+ * registers `treasury:${chain}:${network}` at the moment it pins a treasury, which it did on
+ * mainnet on 2026-08-05. So `treasury:` is no longer watched by nobody — it is watched by default,
+ * and `INDEXER_CUSTODY_LABEL_PREFIXES` has carried `deposit:,treasury:` all along.
+ *
+ * The passage above reasoned that the gap would make this service **under**-report, "which reads as
+ * positive drift and freezes: the safe direction". What actually happened on mainnet was the
+ * reverse. A treasury holds the platform's own float — coin owed to nobody, with no liability and
+ * therefore no custody position behind it. Summing it here adds to one side of the reconciliation
+ * and nothing to the other, so the drift is **negative**: `-25.000021 EMBER`, EMBER frozen,
+ * withdrawals refused estate-wide from 2026-08-05 until the float was given a ledger position on
+ * 2026-08-08. `deploy/scripts/ember-seed.js:415` had named this exact failure in advance — "an
+ * invented insolvency" — and warned that a faucet float must therefore not be registered.
+ *
+ * Nothing in this file was wrong to sum. An address the platform controls IS platform-held, which
+ * is what the label asserts, and this service is right to count it. The defect is one level up: an
+ * address may be registered here without anything guaranteeing it has a ledger position, and the
+ * reconciliation then compares a total over both kinds of coin with a total over one. That is why
+ * the answer carries `addresses` and `labelPrefixes` — on 2026-08-08 those two fields were what
+ * showed the operator that the sum included a treasury nobody had booked. The boundary stated
+ * above is real; what needed correcting is the assumption about which direction crossing it hurts.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
