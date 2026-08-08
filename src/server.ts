@@ -168,6 +168,7 @@ const DOMAIN: ReadonlyArray<readonly [string, string, Handler]> = [
   ['GET', '/transactions/:chain/:network/:hash/confirmations', transactionConfirmations],
   ['GET', '/tokens/:chain/:network/:address', tokenObservation],
   ['GET', '/custody/:chain/:network/total', custodyTotal],
+  ['GET', '/custody/:chain/:network/addresses/:address', custodyAddressBalance],
   ['GET', '/blocks/:chain/:network/:height', blockByHeight],
   ['POST', '/watch/:chain/:network/:address', watchAddress],
   ['POST', '/backfills/:chain/:network', requestBackfill],
@@ -590,6 +591,44 @@ async function custodyTotal(ctx: RequestContext, deps: ServerDeps): Promise<Repl
     // impossible.
     const observed = await deps.custody.total(scope)
     return { status: 200, body: observed }
+  } finally {
+    done()
+  }
+}
+
+/**
+ * One named address's confirmed native balance, at the depth and against the block hash the
+ * aggregate above uses.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS IS A READ ABOUT AN ADDRESS THE CALLER NAMED, AND IT IS STILL BEHIND `indexer:read`.**
+ *
+ * The rule that opened the other reads applies squarely: the caller supplies the address, so the
+ * answer is one anybody can obtain from a node, and no set is disclosed. On that argument alone it
+ * could be anonymous like `/addresses/:chain/:network/:address/activity`.
+ *
+ * It is not, for a reason about use rather than about disclosure. The only caller is a service
+ * booking a ledger position for an address it is about to register as the platform's, and that
+ * booking is an input to the estate's solvency arithmetic. A route whose answer becomes a journal
+ * entry should fail closed the way `/custody/.../total` does — a caller without the grant gets a
+ * 403, the booking does not happen, the registration is not marked complete, and the recurring job
+ * retries. Anonymous, the same misconfiguration would let anything on the port influence what the
+ * platform believes it holds.
+ *
+ * It deliberately does NOT require the address to be watched. Its caller measures *before* it
+ * registers, precisely so that the balance it books is not one already counted by an aggregate.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+async function custodyAddressBalance(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
+  await authorise(ctx, deps, READ_SCOPE)
+  const scope = scopeFrom(ctx)
+  const address = addressFrom(ctx, scope.chain)
+  const done = deps.lifecycle.track()
+  try {
+    // No fallback, exactly as `custodyTotal` has none. Every failure inside is a
+    // `CustodyTotalUnavailableError` and every one must reach `handle` as a non-200, because a 200
+    // carrying a defaulted balance is a number that would be journalled.
+    return { status: 200, body: await deps.custody.balance(scope, address) }
   } finally {
     done()
   }

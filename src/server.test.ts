@@ -17,6 +17,7 @@ import type {
 } from './reads.ts'
 import {
   CustodyTotalUnavailableError,
+  type CustodyAddressObservation,
   type CustodyObserver,
   type CustodyTotalFault,
   type CustodyTotalObservation,
@@ -188,6 +189,27 @@ const custody: CustodyObserver = {
       tipHeight: 100,
       observedAt: '2026-01-01T00:00:00.000Z',
     } satisfies CustodyTotalObservation
+  },
+
+  async balance(scope, address) {
+    asked.push({ what: 'custody-balance', scope })
+    // The same armed fault serves both, because the refusal is one decision taken in one place and
+    // the property under test at this layer is that it survives the transport either way.
+    if (custodyFault) throw new CustodyTotalUnavailableError(custodyFault, `armed: ${custodyFault}`)
+    return {
+      chain: scope.chain,
+      network: scope.network,
+      assetCode: 'EMBER',
+      decimals: 18,
+      address,
+      balance: '25100000000000000000',
+      requiredConfirmations: 60,
+      observedAtBlock: 39,
+      observedAtBlockHash: HASH,
+      headHeight: 98,
+      tipHeight: 100,
+      observedAt: '2026-01-01T00:00:00.000Z',
+    } satisfies CustodyAddressObservation
   },
 }
 
@@ -666,6 +688,59 @@ test('every refusal leaves as a non-200 carrying its code — never a 200, never
   assert.equal((await call('/custody/ember/testnet/total', { token: 'reader' })).status, 200)
 })
 
+/* --------------------------------------- one address, the same measurement */
+
+test('a named address is answered at the aggregate’s depth, and still behind indexer:read', async () => {
+  // The caller names the address, so nothing about the custody SET is disclosed and the rule that
+  // opened the anonymous reads would allow this one too. It is still gated, because its only
+  // caller turns the answer into a journal entry: a service booking an opening position for an
+  // address it is about to register. A misconfigured deploy must fail closed — no answer, no
+  // booking, no registration marked complete — rather than let anything on the port influence what
+  // the platform believes it holds.
+  const path = `/custody/ember/testnet/addresses/${ADDRESS}`
+  assert.equal((await call(path)).status, 401)
+  assert.equal((await call(path, { token: 'unscoped' })).status, 403)
+  assert.equal((await call(path, { token: 'player' })).status, 403)
+
+  const answer = await call(path, { token: 'reader' })
+  assert.equal(answer.status, 200)
+  // A STRING, for the reason the total is one: an 18-decimal balance does not survive a JSON
+  // number, and the digits a float drops are the digits a drift is made of.
+  assert.equal(answer.body['balance'], '25100000000000000000')
+  assert.equal(typeof answer.body['balance'], 'string')
+  // Measured at the SAME height and against the SAME proved hash as the aggregate. This is the
+  // whole point of the route: a caller booking this number must be booking what the reconciler
+  // will later count, not an `eth_getBalance` at `latest` that includes unconfirmed coin.
+  assert.equal(answer.body['observedAtBlock'], 39)
+  assert.equal(answer.body['requiredConfirmations'], 60)
+  // And it echoes the address, which the aggregate may never do. The caller supplied it, so there
+  // is no set to leak, and echoing it is what lets an operator confirm a booked opening entry was
+  // measured about the address they think it was.
+  assert.equal(answer.body['address'], ADDRESS.toLowerCase())
+})
+
+test('an address balance refuses exactly as the total does — never a 200, never a zero', async () => {
+  const path = `/custody/ember/testnet/addresses/${ADDRESS}`
+  for (const code of ['rpc_unavailable', 'head_diverged', 'chain_halted'] as CustodyTotalFault[]) {
+    custodyFault = code
+    const answer = await call(path, { token: 'reader' })
+    assert.equal(answer.status, 503, `${code} must answer 503`)
+    assert.equal((answer.body['error'] as Record<string, string>)['code'], code)
+    // The failure that would be journalled: a 200 carrying a balance, or a 404 a client files as
+    // "this address holds nothing" — which is a zero wearing a status code.
+    assert.equal(answer.body['balance'], undefined)
+    assert.notEqual(answer.status, 404)
+  }
+  custodyFault = null
+  assert.equal((await call(path, { token: 'reader' })).status, 200)
+})
+
+test('a malformed address is refused before any provider is asked', async () => {
+  const answer = await call('/custody/ember/testnet/addresses/nonsense', { token: 'reader' })
+  assert.equal(answer.status, 400)
+  assert.equal((answer.body['error'] as Record<string, string>)['code'], 'bad_address')
+})
+
 /* --------------------------------------- the table two other repositories read */
 
 test('the served route table is exactly this, in both spellings', () => {
@@ -682,6 +757,7 @@ test('the served route table is exactly this, in both spellings', () => {
       'GET /v1/transactions/:chain/:network/:hash/confirmations',
       'GET /v1/tokens/:chain/:network/:address',
       'GET /v1/custody/:chain/:network/total',
+      'GET /v1/custody/:chain/:network/addresses/:address',
       'GET /v1/blocks/:chain/:network/:height',
       'POST /v1/watch/:chain/:network/:address',
       'POST /v1/backfills/:chain/:network',
@@ -692,6 +768,7 @@ test('the served route table is exactly this, in both spellings', () => {
       'GET /transactions/:chain/:network/:hash/confirmations',
       'GET /tokens/:chain/:network/:address',
       'GET /custody/:chain/:network/total',
+      'GET /custody/:chain/:network/addresses/:address',
       'GET /blocks/:chain/:network/:height',
       'POST /watch/:chain/:network/:address',
       'POST /backfills/:chain/:network',

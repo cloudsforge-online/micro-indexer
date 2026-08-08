@@ -120,8 +120,17 @@ function observer(chain: FakeChain, over: Partial<{ maxAddresses: number }> = {}
 
 /** Assert the observation was withheld, and withheld for the stated reason. */
 async function refuses(observe: CustodyObserver, code: CustodyTotalFault): Promise<void> {
+  await assertRefusal(() => observe.total(SCOPE), code)
+}
+
+/** The same, for the single-address reading. Same decision, same code, different entry point. */
+async function refusesBalance(observe: CustodyObserver, code: CustodyTotalFault): Promise<void> {
+  await assertRefusal(() => observe.balance(SCOPE, '0xaa'), code)
+}
+
+async function assertRefusal(act: () => Promise<unknown>, code: CustodyTotalFault): Promise<void> {
   await assert.rejects(
-    () => observe.total(SCOPE),
+    act,
     (err: unknown) => {
       assert.ok(
         err instanceof CustodyTotalUnavailableError,
@@ -207,6 +216,85 @@ test('a balance of zero at every address IS a total, because every address was r
   const chain = honestChain()
   chain.balances.set('0xaa', '0x0')
   assert.equal((await observer(chain).total(SCOPE)).total, '0')
+})
+
+/* --------------------------------------- one address, the same measurement */
+
+test('one address is read at the aggregate’s height, from the same proved block', { skip }, async () => {
+  // THE PROPERTY THE CALLER'S CORRECTNESS RESTS ON. A service booking an opening position for an
+  // address it is about to register must book what the aggregate will later count for it. If this
+  // read were taken at `latest` it would include coin below the confirmation depth, the book would
+  // be high by exactly that, and a zero-tolerance asset would freeze — which is the incident of
+  // 2026-08-05 reproduced by its own fix.
+  await walkChain()
+  const chain = honestChain()
+  chain.balances.set('0xcc', '0x15af1d78b58c400000') // 25.1e18
+
+  const observed = await observer(chain).balance(SCOPE, '0xcc')
+
+  assert.equal(observed.balance, '25100000000000000000')
+  assert.equal(observed.address, '0xcc')
+  assert.equal(observed.assetCode, 'EMBER')
+  assert.equal(observed.requiredConfirmations, CONFIRMATIONS)
+  assert.equal(observed.observedAtBlock, AT)
+  assert.equal(observed.observedAtBlockHash, hashAt(AT))
+  assert.equal(observed.headHeight, HEAD)
+  // Read once, and the hash proved before and after — the same two-sided proof the aggregate makes,
+  // because a single balance answered across a reorg is as wrong as a sum answered across one.
+  assert.equal(chain.calls.filter((c) => c === 'eth_getBalance').length, 1)
+  assert.equal(chain.calls.filter((c) => c === 'eth_getBlockByNumber').length, 2)
+})
+
+test('an UNWATCHED address is answered, because the caller measures before it registers', { skip }, async () => {
+  // Deliberate, and the whole ordering depends on it. The caller reads the balance, THEN watches,
+  // THEN books. Demanding registration first would force the opposite order and reopen the window
+  // this route was added to close. Nothing here consults `watched_addresses` at all.
+  await walkChain()
+  const chain = honestChain()
+  chain.balances.set('0xdd', '0x7b')
+  assert.equal((await observer(chain).balance(SCOPE, '0xdd')).balance, '123')
+})
+
+test('a measured zero is an answer here too, and an unreadable address is still a refusal', { skip }, async () => {
+  await walkChain()
+  const chain = honestChain()
+  chain.balances.set('0xaa', '0x0')
+  assert.equal((await observer(chain).balance(SCOPE, '0xaa')).balance, '0')
+
+  // And the address the provider will not answer for. Zero would be booked as a permanent
+  // understatement, so it must arrive as a refusal that leaves the row unregistered and retried.
+  await assert.rejects(
+    () => observer(chain).balance(SCOPE, '0xbb'),
+    (err: unknown) => {
+      assert.ok(err instanceof CustodyTotalUnavailableError)
+      assert.equal(err.code, 'address_unreadable')
+      return true
+    },
+  )
+})
+
+test('every refusal the aggregate makes about the CHAIN, one address makes too', { skip }, async () => {
+  // The anchor is shared code, so this is really asserting that it stayed shared: a halted chain, a
+  // node serving a different block, and a chain with nothing walked are all decisions about the
+  // height being read at, and they cannot be true for the set and false for one member of it.
+  const chain = honestChain()
+  chain.balances.set('0xaa', '0x1')
+
+  // Nothing walked at all.
+  await refusesBalance(observer(chain), 'nothing_indexed')
+
+  // A node serving a different block at the confirmed height, refused BEFORE the balance is read.
+  await walkChain()
+  const liar = honestChain()
+  liar.balances.set('0xaa', '0x1')
+  liar.blockHashAt = () => hashAt(999)
+  await refusesBalance(observer(liar), 'head_diverged')
+  assert.equal(liar.calls.filter((c) => c === 'eth_getBalance').length, 0)
+
+  // And a halted chain. `haltChain` is one-way on purpose — a machine deciding a reorg assumption
+  // has come back is a machine deciding it is safe to credit money again — so this goes last.
+  await haltChain(sql, SCOPE, 'an alarming reorg')
+  await refusesBalance(observer(chain), 'chain_halted')
 })
 
 /* --------------------------------------- the refusals */

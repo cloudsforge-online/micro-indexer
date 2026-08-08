@@ -201,9 +201,66 @@ export interface CustodyTotalObservation {
   readonly observedAt: string
 }
 
+/**
+ * What the chain says ONE NAMED address holds, measured exactly the way `total` measures the set.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS EXISTS SO THAT AN ADDRESS CAN BE BOOKED AT THE MOMENT IT STARTS BEING WATCHED.**
+ *
+ * `total` has a property its own header advertises as a feature: registering an address that has
+ * been accumulating coin for months makes its **entire** balance visible on the very next
+ * observation, because the balance is read from the chain rather than replayed from movements.
+ * That is what makes the aggregate self-healing, and on 2026-08-05 it is also what froze EMBER
+ * withdrawals estate-wide for three days: `micro-settlement` registered a treasury holding
+ * 25.000021 EMBER of platform float, the aggregate rose by all of it, the ledger's custody total
+ * did not move because nothing had ever booked it, and a zero-tolerance asset froze on a drift of
+ * −25000020999999996000 while the platform held MORE coin than it owed. An invented insolvency.
+ *
+ * The repair is that a service registering an address must also give the ledger a position for it,
+ * and the amount it books has to be *the same measurement the reconciler will make* — not the
+ * drift (booking the drift would paper over a genuine shortfall, which is the one thing the check
+ * exists to find) and not the caller's own `eth_getBalance` at `latest` (which counts coin that
+ * has not reached the confirmation depth this file reads at, so the book would be high by whatever
+ * arrived in the last 60 blocks and the asset would freeze for exactly that).
+ *
+ * So the caller does not measure. It asks the service that will do the measuring, at the depth it
+ * will do it, against a block hash it has proved twice. What remains is a genuine race — coin
+ * arriving between this reading and the next aggregate — which is the same race any external
+ * transfer into a watched address already is, and it is not narrowable further from here.
+ *
+ * **`address` is echoed back.** The caller named it, so there is no set to disclose, and echoing
+ * it is what lets an operator reading a booked opening entry beside a freeze confirm that the
+ * number was measured about the address they think it was.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export interface CustodyAddressObservation {
+  readonly chain: string
+  readonly network: string
+  readonly assetCode: string
+  readonly decimals: number
+  /** Canonical for the family, as the caller sent it. */
+  readonly address: string
+  /** Smallest units, decimal string — a `bigint` for the same reason `total` is. */
+  readonly balance: string
+  readonly requiredConfirmations: number
+  readonly observedAtBlock: number
+  readonly observedAtBlockHash: string
+  readonly headHeight: number
+  readonly tipHeight: number | null
+  readonly observedAt: string
+}
+
 export interface CustodyObserver {
   /** Resolves with a total, or throws. It never resolves with an incomplete one. */
   total(scope: ChainScope): Promise<CustodyTotalObservation>
+  /**
+   * One named address's balance at the same confirmed height `total` reads at.
+   *
+   * Deliberately does NOT require the address to be watched. The caller that needs this is
+   * booking an address it is *about* to register, and demanding registration first would force
+   * the exact ordering — watch, then measure — whose window this call exists to close.
+   */
+  balance(scope: ChainScope, address: string): Promise<CustodyAddressObservation>
 }
 
 export interface CustodyObserverDeps {
@@ -238,75 +295,115 @@ export interface CustodyObserverDeps {
 
 const DEFAULT_CONCURRENCY = 8
 
+/**
+ * The height every balance in an observation is read at, and the proof the node still serves it.
+ *
+ * Factored out because there are now TWO readings that must be taken at the same depth against the
+ * same proved block — the aggregate, and one named address — and the whole value of the second is
+ * that it is the first one's measurement narrowed to a single account. Two copies of this sequence
+ * would be two copies that could drift apart, and the failure mode of drifting apart here is that
+ * a service books an opening balance the reconciler then disagrees with, which is the incident
+ * this call was added to prevent, reproduced by the fix for it.
+ *
+ * Every branch throws. There is no anchor-shaped answer that means "approximately".
+ */
+interface ConfirmedAnchor {
+  readonly caller: RpcCaller
+  readonly confirmations: number
+  /** `head − confirmations + 1`. */
+  readonly at: number
+  /** The hash this service walked at `at`, already proved to be the node's once. */
+  readonly hash: string
+  readonly headHeight: number
+  readonly tipHeight: number | null
+}
+
+async function confirmedAnchor(
+  deps: CustodyObserverDeps,
+  scope: ChainScope,
+): Promise<ConfirmedAnchor> {
+  const family = familyOf(scope.chain)
+  // Bitcoin and Solana are followed by this build and their balances are NOT read here. There
+  // is no `getBalance` on a UTXO chain without an address index, and a Solana balance at a
+  // historical slot needs an archive node — so both would need a derivation from stored
+  // movements, which is a different implementation with a different correctness argument. It
+  // is honest to say "this build cannot" and let the ledger freeze, and dishonest to sum the
+  // rows with the EVM derivation and call it a balance.
+  if (family !== 'evm' && family !== 'ember') {
+    throw new CustodyTotalUnavailableError(
+      'family_not_supported',
+      `${family} custody balances are not readable by this build`,
+    )
+  }
+  const caller = deps.callers.get(scopeKey(scope))
+  if (!caller) {
+    throw new CustodyTotalUnavailableError(
+      'chain_not_followed',
+      `this replica follows no provider for ${scopeKey(scope)}`,
+    )
+  }
+
+  const [head, checkpoint] = await Promise.all([
+    headBlock(deps.sql, scope),
+    getCheckpoint(deps.sql, scope, TIP_STREAM),
+  ])
+  if (!head) {
+    throw new CustodyTotalUnavailableError(
+      'nothing_indexed',
+      'no canonical block has been walked for this chain yet',
+    )
+  }
+  // A halt means an alarming reorg went past the depth this observation is entirely made of.
+  // `tokenstate` reports a halt and answers anyway, because its answer depends on one block it
+  // has just proved the node still serves; this one is an input to a solvency decision whose
+  // only defence is that depth, so it refuses — as `reads.tokenBalances` does, and for the same
+  // reason.
+  if (checkpoint?.halted === true) {
+    throw new CustodyTotalUnavailableError(
+      'chain_halted',
+      `this service has stopped vouching for ${scopeKey(scope)}: ${checkpoint.haltReason ?? 'halted'}`,
+    )
+  }
+
+  const confirmations = requiredConfirmations(scope.chain)
+  // `head − confirmations + 1`, because the block containing a transaction is its first
+  // confirmation — the same off-by-one `chains.confirmationsAt` carries the argument for. At
+  // this height `confirmationsAt(head, at)` is exactly `confirmations`.
+  const at = head.height - confirmations + 1
+  if (at < 0) {
+    throw new CustodyTotalUnavailableError(
+      'below_confirmation_depth',
+      `the chain has ${head.height + 1} blocks and ${confirmations} confirmations are required`,
+    )
+  }
+  const anchor = await blockAtHeight(deps.sql, scope, at)
+  if (!anchor) {
+    // The follower cold-starts at `tip − 2 × depth`, so this is reachable on a fresh replica
+    // whose head is high but whose record does not reach back to the confirmed height yet.
+    // Without our own block there we cannot prove the node's chain is the chain we walked.
+    throw new CustodyTotalUnavailableError(
+      'depth_not_walked',
+      `this service has not walked height ${at}, so it cannot vouch for the node's block there`,
+    )
+  }
+
+  await assertNodeAgrees(caller, at, anchor.hash)
+
+  return {
+    caller,
+    confirmations,
+    at,
+    hash: anchor.hash,
+    headHeight: head.height,
+    tipHeight: checkpoint?.tipHeight ?? null,
+  }
+}
+
 export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
   return {
     async total(scope) {
-      const family = familyOf(scope.chain)
-      // Bitcoin and Solana are followed by this build and their balances are NOT read here. There
-      // is no `getBalance` on a UTXO chain without an address index, and a Solana balance at a
-      // historical slot needs an archive node — so both would need a derivation from stored
-      // movements, which is a different implementation with a different correctness argument. It
-      // is honest to say "this build cannot" and let the ledger freeze, and dishonest to sum the
-      // rows with the EVM derivation and call it a balance.
-      if (family !== 'evm' && family !== 'ember') {
-        throw new CustodyTotalUnavailableError(
-          'family_not_supported',
-          `${family} custody balances are not readable by this build`,
-        )
-      }
-      const caller = deps.callers.get(scopeKey(scope))
-      if (!caller) {
-        throw new CustodyTotalUnavailableError(
-          'chain_not_followed',
-          `this replica follows no provider for ${scopeKey(scope)}`,
-        )
-      }
-
-      const [head, checkpoint] = await Promise.all([
-        headBlock(deps.sql, scope),
-        getCheckpoint(deps.sql, scope, TIP_STREAM),
-      ])
-      if (!head) {
-        throw new CustodyTotalUnavailableError(
-          'nothing_indexed',
-          'no canonical block has been walked for this chain yet',
-        )
-      }
-      // A halt means an alarming reorg went past the depth this observation is entirely made of.
-      // `tokenstate` reports a halt and answers anyway, because its answer depends on one block it
-      // has just proved the node still serves; this one is an input to a solvency decision whose
-      // only defence is that depth, so it refuses — as `reads.tokenBalances` does, and for the same
-      // reason.
-      if (checkpoint?.halted === true) {
-        throw new CustodyTotalUnavailableError(
-          'chain_halted',
-          `this service has stopped vouching for ${scopeKey(scope)}: ${checkpoint.haltReason ?? 'halted'}`,
-        )
-      }
-
-      const confirmations = requiredConfirmations(scope.chain)
-      // `head − confirmations + 1`, because the block containing a transaction is its first
-      // confirmation — the same off-by-one `chains.confirmationsAt` carries the argument for. At
-      // this height `confirmationsAt(head, at)` is exactly `confirmations`.
-      const at = head.height - confirmations + 1
-      if (at < 0) {
-        throw new CustodyTotalUnavailableError(
-          'below_confirmation_depth',
-          `the chain has ${head.height + 1} blocks and ${confirmations} confirmations are required`,
-        )
-      }
-      const anchor = await blockAtHeight(deps.sql, scope, at)
-      if (!anchor) {
-        // The follower cold-starts at `tip − 2 × depth`, so this is reachable on a fresh replica
-        // whose head is high but whose record does not reach back to the confirmed height yet.
-        // Without our own block there we cannot prove the node's chain is the chain we walked.
-        throw new CustodyTotalUnavailableError(
-          'depth_not_walked',
-          `this service has not walked height ${at}, so it cannot vouch for the node's block there`,
-        )
-      }
-
-      await assertNodeAgrees(caller, at, anchor.hash)
+      const anchor = await confirmedAnchor(deps, scope)
+      const { caller, at } = anchor
 
       const found = await custodyAddresses(
         deps.sql,
@@ -356,11 +453,53 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
         total: total.toString(),
         addresses: found.length,
         labelPrefixes: deps.labelPrefixes,
-        requiredConfirmations: confirmations,
+        requiredConfirmations: anchor.confirmations,
         observedAtBlock: at,
         observedAtBlockHash: anchor.hash,
-        headHeight: head.height,
-        tipHeight: checkpoint?.tipHeight ?? null,
+        headHeight: anchor.headHeight,
+        tipHeight: anchor.tipHeight,
+        observedAt: new Date().toISOString(),
+      }
+    },
+
+    async balance(scope, address) {
+      const anchor = await confirmedAnchor(deps, scope)
+      const { caller, at } = anchor
+
+      // `readAll` rather than `balanceOf` directly, so the single-address reading goes through the
+      // identical failure mapping: every RPC fault is a refusal and none of them is a zero. A
+      // caller booking an opening balance from a zero that meant "the provider would not say" would
+      // write a permanent understatement into the ledger and freeze the asset for ever after.
+      const [value] = await readAll(caller, [address], at, 1)
+      // Unreachable — `readAll` fills every slot or throws — and written as a refusal rather than
+      // a `?? 0n` on purpose, because `?? 0n` is precisely the defaulting this whole file exists to
+      // refuse, and a default that is unreachable today is a default that is reachable after the
+      // next edit to `readAll`.
+      if (value === undefined) {
+        throw new CustodyTotalUnavailableError(
+          'address_unreadable',
+          `no balance was produced for ${address} at height ${at}`,
+        )
+      }
+
+      // The closing hash check, for the same reason `total` makes it: the balance was answered at a
+      // height, and a reorg between the two proofs means it was answered about a chain that no
+      // longer exists. One call, and it is the only place that difference is visible.
+      await assertNodeAgrees(caller, at, anchor.hash)
+
+      const asset = assetOf(scope.chain)
+      return {
+        chain: scope.chain,
+        network: scope.network,
+        assetCode: asset,
+        decimals: chainSpec(asset).decimals,
+        address,
+        balance: value.toString(),
+        requiredConfirmations: anchor.confirmations,
+        observedAtBlock: at,
+        observedAtBlockHash: anchor.hash,
+        headHeight: anchor.headHeight,
+        tipHeight: anchor.tipHeight,
         observedAt: new Date().toISOString(),
       }
     },
