@@ -113,6 +113,44 @@ export function isNetwork(value: string): value is Network {
   return (NETWORKS as readonly string[]).includes(value)
 }
 
+/**
+ * A slug this union does not contain, DERIVED rather than chosen.
+ *
+ * ── WHY A FUNCTION SHIPS FOR SOMETHING ONLY TESTS CALL ────────────────────────────────────────
+ *
+ * Three assertions in this repository need an example of "a chain that is not a chain" — the
+ * closedness of the union in `chains.test.ts`, the `unknown_chain` 404 in `server.test.ts`, and
+ * `INDEXER_CHAINS` validation in `env.test.ts`. Each of them typed a slug in by hand, and each has
+ * already had to be edited because the slug stopped being unknown:
+ *
+ *   * `doge` stood in all three until DOGE was added to `contracts-chain`. Every one of them went
+ *     red for a merge in another repository, with no change here.
+ *   * `bnb` replaced it, which is the same landmine with a longer fuse. The comment left behind
+ *     said so: the next person to add BNB has to move all three again.
+ *
+ * micro-org#290 records both rounds and adopts the derived form as the estate's answer: ask the
+ * union at run time instead of predicting it at authoring time. `aaa`, then `aaax`, then `aaaxx`,
+ * until the union does not contain it — collision is the loop's exit condition, so there is no
+ * chain this can collide with, now or ever.
+ *
+ * It is exported from the module that owns the union rather than copied into three test files,
+ * because a rule stated three times is a rule that will be true in two places. Five lines of
+ * shipped code buys the property that adding a chain can never again make an unrelated negative
+ * assertion wrong.
+ *
+ * Lower case, because every caller that validates a chain lower-cases before it checks membership;
+ * an upper-case fixture would be exercising the normaliser instead of the union.
+ *
+ * NOTE WHICH HALF OF THIS IS LUCKY. A test asserting "DOGE is refused" fails loudly the day DOGE
+ * becomes real. A test asserting "DOGE is accepted" would have gone green for the wrong reason and
+ * said nothing at all. The derived form is correct in both directions.
+ */
+export function slugOutsideTheUnion(): string {
+  let candidate = 'aaa'
+  while (isChainId(candidate)) candidate += 'x'
+  return candidate
+}
+
 export function assetOf(chain: ChainId): AssetCode {
   return ASSET_FOR_CHAIN[chain]
 }

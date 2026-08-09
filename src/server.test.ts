@@ -4,7 +4,7 @@ import type { AddressInfo, Server } from 'node:net'
 import { TokenError, VerifierUnavailableError, type Principal } from '@cloudsforge/auth'
 import { Lifecycle } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics } from '@cloudsforge/telemetry'
-import type { ChainScope } from './chains.ts'
+import { slugOutsideTheUnion, type ChainScope } from './chains.ts'
 import { registerServiceMetrics } from './metrics.ts'
 import type {
   ActivityPageView,
@@ -383,10 +383,11 @@ test('the status route answers with the depth the pinned contract publishes', as
 })
 
 test('a chain or network this estate does not run is 404, not 400', async () => {
-  // `doge` was the example until the estate named it. A chain in the union that nothing follows is
-  // a different answer — 503 `chain_not_followed` — so the example has to be a chain
-  // `contracts-chain` does not carry at all, or this test would be asserting the wrong thing.
-  const chain = await call('/chains/bnb/mainnet/status', { token: 'reader' })
+  // `doge` was the example until the estate named it, then `bnb`. A chain IN the union that
+  // nothing follows is a different answer — 503 `chain_not_followed` — so this example must be
+  // outside the union or the test asserts the wrong thing, and it is derived rather than guessed
+  // so that adding a chain can never quietly turn this into the other test.
+  const chain = await call(`/chains/${slugOutsideTheUnion()}/mainnet/status`, { token: 'reader' })
   assert.equal(chain.status, 404)
   assert.equal((chain.body['error'] as Record<string, string>)['code'], 'unknown_chain')
   const network = await call('/chains/ember/devnet/status', { token: 'reader' })
@@ -680,7 +681,10 @@ test('the token route authorises and normalises exactly as every other read does
   const malformed = await call('/tokens/ember/testnet/0xnothex', { token: 'reader' })
   assert.equal(malformed.status, 400)
   assert.equal((malformed.body['error'] as Record<string, string>)['code'], 'bad_address')
-  assert.equal((await call(`/tokens/bnb/mainnet/${TOKEN}`, { token: 'reader' })).status, 404)
+  assert.equal(
+    (await call(`/tokens/${slugOutsideTheUnion()}/mainnet/${TOKEN}`, { token: 'reader' })).status,
+    404,
+  )
 })
 
 /* --------------------------------------- the custody aggregate */

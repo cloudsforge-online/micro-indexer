@@ -15,6 +15,7 @@ import {
   requiredConfirmations,
   sameScope,
   scopeKey,
+  slugOutsideTheUnion,
 } from './chains.ts'
 
 test('every chain slug maps to an on-chain asset, and SHARD is not one of them', () => {
@@ -24,10 +25,11 @@ test('every chain slug maps to an on-chain asset, and SHARD is not one of them',
     assert.ok(CHAINS[asset], `${asset} must exist in the pinned contract`)
   }
   assert.equal(isChainId('shard'), false, 'SHARD never exists on a chain')
-  // `doge` used to stand here as the example of an asset code that is not a chain. It is one now,
-  // so the example moved to a code `contracts-chain` does not carry at all — the assertion is that
-  // the union is closed, and it needs a member from outside the union to say so.
-  assert.equal(isChainId('bnb'), false)
+  // `doge` stood here as the example of a code that is not a chain, and `bnb` after it. Both had
+  // to be moved when the union grew. The example is derived now — the assertion is that the union
+  // is CLOSED, and it needs a member from outside the union to say so, not a bet on which codes
+  // will stay outside it.
+  assert.equal(isChainId(slugOutsideTheUnion()), false)
 })
 
 test('depths are read from the pinned contract and never restated here', () => {

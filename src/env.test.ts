@@ -30,6 +30,11 @@ const {
   rpcVarFor,
 } = await import('./env.ts')
 
+const { slugOutsideTheUnion } = await import('./chains.ts')
+
+/** Derived, never typed — `chains.ts` carries the two rounds of edits that argue for it. */
+const notAChain = slugOutsideTheUnion()
+
 test('a complete environment loads, and importing the module did not exit', () => {
   assert.equal(env.databaseUrl, BASE['INDEXER_DATABASE_URL'])
   assert.equal(SERVICE, 'indexer')
@@ -116,10 +121,10 @@ test('a non-http endpoint is refused', () => {
 
 test('the chain list refuses an unknown chain, an unknown network and a duplicate', () => {
   assert.deepEqual(parseChainList('ember:testnet'), [{ chain: 'ember', network: 'testnet' }])
-  // `doge:mainnet` stood here as the unknown chain until DOGE became one. The replacement is a
-  // chain `contracts-chain` does not name at all, because the assertion is that the list is checked
-  // against the union rather than parsed for shape.
-  assert.throws(() => parseChainList('bnb:mainnet'), EnvError)
+  // `doge:mainnet` stood here as the unknown chain until DOGE became one, and `bnb:mainnet` after
+  // it. The slug is derived now: the assertion is that the list is checked against the union rather
+  // than parsed for shape, and a fixture that can age out of the union cannot make that assertion.
+  assert.throws(() => parseChainList(`${notAChain}:mainnet`), EnvError)
   assert.throws(() => parseChainList('ember:devnet'), EnvError)
   assert.throws(() => parseChainList('ember:testnet,ember:testnet'), EnvError)
 })
