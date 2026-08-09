@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/indexer",
-  "version": "2.5.7",
+  "version": "2.5.8",
   "private": true,
   "description": "The multi-chain indexer. One normalised schema, a worker per chain family, checkpointing, reorg recovery and provider failover. Replaces balance-probing (AD-07).",
   "license": "MIT",
