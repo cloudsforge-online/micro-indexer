@@ -503,6 +503,11 @@ async function transactionConfirmations(ctx: RequestContext, deps: ServerDeps): 
  * Derived from `address_activity`, so the answer carries the coverage it was derived from and
  * withholds the balance entirely when that coverage cannot support one. See `reads.tokenBalances`:
  * a missing balance is missing, never zero, because zero is what evicts a token-gated member.
+ *
+ * That includes the case where the coverage is perfect and the rows are still not there. A
+ * deployment recording only watched addresses walks every block, so nothing about the blocks is
+ * missing and nothing about them can say so; the answer for an address nobody registered is
+ * `unavailable: 'address_not_watched'` rather than the empty sum it used to be (micro-org#281).
  */
 async function addressTokenBalances(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
   await authoriseRead(ctx, deps)

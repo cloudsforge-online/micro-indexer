@@ -260,6 +260,11 @@ export interface TokenBalanceView {
  * and `balance` are **absent** — not zero, not null. A consumer's rule is then the same as for an
  * outage, which for `micro-community`'s gate means "do not demote", and that is the correct
  * behaviour: an indexer that started following at the tip knows nothing about what anybody held.
+ *
+ * `coverage` answers that question about BLOCKS, and it is necessary rather than sufficient. Since
+ * micro-org#253 a block can be walked for only some addresses, and a complete `coverage` over such
+ * blocks says nothing about whether the rows for THIS address were ever written — so
+ * `unavailable: 'address_not_watched'` is the second half of the same guarantee. See the field.
  */
 export interface CoverageView {
   readonly fromHeight: number | null
@@ -283,8 +288,34 @@ export interface TokenBalancesView {
   readonly balances?: readonly TokenBalanceView[]
   /** Absent unless a single `contract` was asked for and the answer may be believed. */
   readonly balance?: string
-  /** Present exactly when a balance is withheld, naming which of the reasons applied. */
-  readonly unavailable?: 'nothing_indexed' | 'coverage_incomplete' | 'chain_halted' | 'negative'
+  /**
+   * Present exactly when a balance is withheld, naming which of the reasons applied.
+   *
+   * **`address_not_watched` is the one that is not about coverage**, and it was added because the
+   * other four could not express it (micro-org#281). The three that guard the sum are statements
+   * about BLOCKS; on a deployment running `INDEXER_WATCHED_ADDRESSES_ONLY` every block is present and
+   * canonical, so `coverage.complete` is true and no refusal fires — while the `address_activity`
+   * rows this sum is made of were never written for an address nobody registered. The sum is then
+   * empty, and an empty sum left as `balances: []` is a nought with an indexer's authority behind
+   * it on the read a token gate demotes from. See `activity`'s `incomplete` marker, which is the
+   * same fact about the same rows, decided by the same predicate.
+   */
+  readonly unavailable?:
+    | 'nothing_indexed'
+    | 'coverage_incomplete'
+    | 'chain_halted'
+    | 'negative'
+    | 'address_not_watched'
+  /**
+   * Set exactly when `unavailable` is `address_not_watched`: the height at which the recorded set
+   * narrows. Below it every address was recorded, at and above it only watched ones were.
+   *
+   * Carried here so this read is answerable on its own. It is the same number `activity` reports as
+   * `incomplete.fromHeight`, and it is here because without it a consumer that wanted to know how
+   * much of the record is suspect would have to go and ask the other resource — which is the
+   * coupling this field exists to let `explorer-web` delete.
+   */
+  readonly notWatchedFromHeight?: number
 }
 
 export interface ReadStore {
@@ -326,6 +357,42 @@ export interface ReadStore {
 }
 
 const iso = (value: Date | null): string | null => (value === null ? null : value.toISOString())
+
+/**
+ * The height from which this scope's record is not this address's, or null when it is this
+ * address's all the way down.
+ *
+ * **One function because two reads must not disagree.** `activity` and `tokenBalances` are built
+ * from the same `address_activity` rows, so "were those rows written for this address" has exactly
+ * one true answer, and a consumer holding both answers at once is entitled to see them agree. They
+ * did not: until micro-org#281 only `activity` asked the question, `explorer-web`'s address page
+ * had to pass the activity read's marker into its holdings panel to cover the gap, and a second
+ * consumer would have had no reason to know it needed to. Deciding it here, once, is what makes the
+ * agreement structural rather than a convention two call sites happen to share.
+ *
+ * Null on a scope that still records every address a block touches, which is every scope that has
+ * not run `INDEXER_WATCHED_ADDRESSES_ONLY`. That case costs ONE index-only scan and the second
+ * query is behind it, so the common deployment never pays for the lookup only a narrowed one
+ * needs. Measured 2026-08-09 on `postgres:17-alpine`, 200 000 blocks in one scope, after
+ * `vacuum analyze`: `Index Only Scan using blocks_partial_idx`, **1 buffer, 0 heap fetches,
+ * 0.03 ms** with no block marked, and **4 buffers, 0.05 ms** with the highest 50 000 marked. The
+ * index is partial on the marker, so an unmarked scope's entry in it is empty — which is why the
+ * price of asking is a question the planner answers rather than a scan of every block walked.
+ *
+ * The number is the LOWEST marked height, not the most recent run of them: see
+ * `store.partialFromHeight` for why over-stating how much of the record is suspect is the only
+ * direction that cannot mislead anyone.
+ */
+async function notWatchedFromHeight(
+  exec: Exec,
+  scope: ChainScope,
+  address: string,
+): Promise<number | null> {
+  const partialFrom = await partialFromHeight(exec, scope)
+  if (partialFrom === null) return null
+  const watched = (await custodyAddressHistory(exec, scope, [address])).length > 0
+  return watched ? null : partialFrom
+}
 
 export function postgresReadStore(sql: Db): ReadStore {
   const exec: Exec = sql
@@ -383,17 +450,15 @@ export function postgresReadStore(sql: Db): ReadStore {
 
     async activity(scope, address, limit, cursor) {
       const asset = assetOf(scope.chain)
-      const [checkpoint, page, partialFrom] = await Promise.all([
+      // An empty page for an unregistered address is indistinguishable from an address that has
+      // never been paid, and this is the question that tells them apart. It is asked through the
+      // same function `tokenBalances` asks it through — see `notWatchedFromHeight` — so the two
+      // reads cannot answer differently about one address.
+      const [checkpoint, page, narrowFrom] = await Promise.all([
         getCheckpoint(exec, scope, TIP_STREAM),
         activityForAddress(exec, scope, address, limit, cursor),
-        partialFromHeight(exec, scope),
+        notWatchedFromHeight(exec, scope, address),
       ])
-      // Only asked when the record can be narrow. On a scope that still holds every address the
-      // question has one answer and it is not worth a round trip; on one that does not, an empty
-      // page for an unregistered address is indistinguishable from an address that has never been
-      // paid, and this is the query that tells them apart.
-      const watched =
-        partialFrom === null || (await custodyAddressHistory(exec, scope, [address])).length > 0
       const tipHeight = checkpoint?.tipHeight ?? null
       return {
         chain: scope.chain,
@@ -441,9 +506,9 @@ export function postgresReadStore(sql: Db): ReadStore {
           }
         }),
         nextCursor: page.nextCursor,
-        ...(watched || partialFrom === null
+        ...(narrowFrom === null
           ? {}
-          : { incomplete: { reason: 'address_not_watched' as const, fromHeight: partialFrom } }),
+          : { incomplete: { reason: 'address_not_watched' as const, fromHeight: narrowFrom } }),
       }
     },
 
@@ -589,6 +654,41 @@ export function postgresReadStore(sql: Db): ReadStore {
         // membership, which is the failure the halt was raised to stop.
         if (head.halted) return { ...view, unavailable: 'chain_halted' } satisfies TokenBalancesView
 
+        // ── "NOBODY WROTE THIS ADDRESS DOWN" IS NOT NOUGHT. micro-org#281. ──────────────────────
+        //
+        // Every refusal above is a statement about BLOCKS, and that is why none of them can reach
+        // this: on a deployment running `INDEXER_WATCHED_ADDRESSES_ONLY` every block is present and
+        // canonical, `complete` is true, and the only thing missing is the per-address rows the sum
+        // below is made of. Those rows were never written for an address nobody registered, so the
+        // sum comes back empty and used to leave as `balances: []` — a nought carrying this
+        // service's authority, on the read `micro-community`'s gate demotes from.
+        //
+        // It is a refusal and not an empty answer for the same reason `custody.ts` refuses with
+        // `history_unknown` rather than summing what it happened to walk: a total over a record
+        // that was never written for this subject is a measurement nobody took, and rendering one
+        // as a number is the failure this estate has now been bitten by twice.
+        //
+        // It fires whether or not the sum found anything. Movements below `notWatchedFromHeight`
+        // were recorded for everybody, so a narrowed record can hold real rows for this address and
+        // still be missing every one above that height; summing those is a window total, which is
+        // precisely what `coverage_incomplete` exists to refuse to do.
+        //
+        // AFTER the coverage and halt checks deliberately. Both of those already answer honestly
+        // where they apply, and a consumer reads them today; moving this above them would change
+        // answers that were never wrong. This one fires exactly where the read was confidently
+        // wrong and nowhere else.
+        //
+        // Inside the same REPEATABLE READ snapshot as the rest, so the marker and the sum describe
+        // one state of the record rather than two.
+        const narrowFrom = await notWatchedFromHeight(tx, scope, address)
+        if (narrowFrom !== null) {
+          return {
+            ...view,
+            unavailable: 'address_not_watched',
+            notWatchedFromHeight: narrowFrom,
+          } satisfies TokenBalancesView
+        }
+
         const records = await tokenBalancesAt(tx, scope, address, at, contract)
         // Impossible on a complete record — nobody sends what they never received — so it means the
         // derivation is wrong rather than that the address is overdrawn. Withheld, never clamped:
@@ -601,8 +701,10 @@ export function postgresReadStore(sql: Db): ReadStore {
         return {
           ...view,
           balances,
-          // With coverage complete back to genesis, "no movement ever" IS a balance of zero, and a
-          // real answer that a gate should act on. It is derived, not defaulted.
+          // With coverage complete back to genesis AND the rows for this address actually written,
+          // "no movement ever" IS a balance of zero, and a real answer that a gate should act on.
+          // It is derived, not defaulted — and since micro-org#281 the second half of that sentence
+          // is enforced above rather than assumed here.
           ...(contract === null ? {} : { balance: balances[0]?.balance ?? '0' }),
         } satisfies TokenBalancesView
       })

@@ -170,7 +170,7 @@ outside the outbox relay.
 | `GET` | `/metrics` | **no auth** | Prometheus text (`src/server.ts`) — see Known gaps |
 | `GET` | `/chains/:chain/:network/status` | **anonymous** | checkpoint, lag, provider health, recent reorgs, halt state (`src/server.ts`, auth) |
 | `GET` | `/addresses/:chain/:network/:address/activity` | **anonymous** | paged movements. Confirmations here are against the **tip** (`src/server.ts`, auth) |
-| `GET` | `/addresses/:chain/:network/:address/token-balances` | **anonymous** | balances at a height, **absent unless coverage is complete** (`src/server.ts`, auth) |
+| `GET` | `/addresses/:chain/:network/:address/token-balances` | **anonymous** | balances at a height, **absent unless the answer may be believed** — see below (`src/server.ts`, auth) |
 | `GET` | `/transactions/:chain/:network/:hash` | **anonymous** | one transaction with its logs (`src/server.ts`, auth) |
 | `GET` | `/transactions/:chain/:network/:hash/confirmations` | **anonymous** | **the crediting decision input**: `canonical`, `confirmations` against the head, `requiredConfirmations`, `confirmed`, `halted` (`src/server.ts`, auth) |
 | `GET` | `/tokens/:chain/:network/:address` | **anonymous** | **contract state, read from the chain**: `name`, `symbol`, `decimals`, `totalSupply`, `cap`, `owner`, `mintAuthority`, `paused`, and the block it was observed at (`src/server.ts`, auth) |
@@ -189,6 +189,20 @@ first when it means the second — which is exactly what `micro-mint` did on eve
 | 404 | `not_found` | **the router's**, not this route's: a path this service does not serve. Nothing to do with any chain (`src/server.ts`) |
 | 503 | `chain_not_followed` · `nothing_indexed` · `head_diverged` · `rpc_unavailable` | we could not ask, and which of the four (`src/server.ts`) |
 | 501 | `family_not_supported` | this build cannot read contract state on that family at all, and retrying will not change it |
+
+**`GET …/token-balances` answers 200 either way, and `unavailable` is the field that decides which
+it is.** `balances` and `balance` are **absent** — not zero, not null — whenever the sum may not be
+believed, and `unavailable` names why. Zero is what evicts a token-gated member, so it is only ever
+returned when it was derived (`src/reads.ts`).
+
+| `unavailable` | Means |
+| --- | --- |
+| *(absent)* | the sum is a balance and a gate may act on it, including when it is zero |
+| `nothing_indexed` | not one block of this chain has been walked here |
+| `coverage_incomplete` | the canonical record does not run unbroken from genesis to the asked height, so the sum is a window total. The follower cold-starts near the tip, so an un-backfilled indexer always reads as this |
+| `chain_halted` | an alarming reorg means this service does not stand behind the history the sum is made of |
+| `negative` | the derivation produced a number below zero, which a complete record cannot. Withheld rather than clamped: clamping a bug to nought is an eviction |
+| `address_not_watched` | **the blocks are all there and the address rows are not.** Under `INDEXER_WATCHED_ADDRESSES_ONLY` every block is walked and stored, so coverage is complete and none of the four above can fire, while `address_activity` was never written for an address nobody registered. `notWatchedFromHeight` says where the recorded set narrows. Decided by the same predicate as `activity`'s `incomplete` marker, through one function, so the two reads cannot disagree about one address (`src/reads.ts`, micro-org#281) |
 
 **Three routes make no `authorise()` call**: `/livez`, `/readyz`, `/metrics`. They are the only
 ones — every domain route authorises on its first line.
@@ -354,7 +368,7 @@ docker run -d --rm --name indexer-pg \
 INDEXER_TEST_DATABASE_URL=postgres://indexer:indexer@127.0.0.1:55434/indexer_test pnpm test
 ```
 
-**130 `test(` declarations**, `node:test` only. **Three of them are environmental skips**
+**270 `test(` declarations**, `node:test` only. **Three of them are environmental skips**
 (`src/hearth.test.ts`) and need a **live Hearth node** at
 `INDEXER_HEARTH_RPC_URL` (default `http://127.0.0.1:8545`). They skip cleanly when the node is
 unreachable, because a developer without a local chain must get a green run

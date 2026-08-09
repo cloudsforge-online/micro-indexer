@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import postgres from 'postgres'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { Logger, Metrics } from '@cloudsforge/telemetry'
+import { PARTIAL_DETAIL_KEY } from './btcsource.ts'
 import type { ChainScope } from './chains.ts'
 import {
   ERC20_TRANSFER_TOPIC,
@@ -34,6 +35,8 @@ import { TIP_STREAM, ensureBackfill, getCheckpoint, watchAddress } from './store
 const ALICE = '0x1111111111111111111111111111111111111111'
 const BOB = '0x2222222222222222222222222222222222222222'
 const TOKEN = '0x3333333333333333333333333333333333333333'
+/** An address that never appears on the fake chain — so nothing about it was ever recorded. */
+const CAROL = '0x4444444444444444444444444444444444444444'
 
 const topicFor = (address: string): string => `0x${'0'.repeat(24)}${address.slice(2)}`
 const amountData = (value: bigint): string => `0x${value.toString(16).padStart(64, '0')}`
@@ -524,6 +527,131 @@ test(
     // rule for an outage, and for a gate that rule is "do not demote".
     assert.equal('balance' in answer, false)
     assert.equal('balances' in answer, false)
+  },
+)
+
+/**
+ * Stamp a range of already-walked blocks as recorded for watched addresses only.
+ *
+ * The marker is written by the Bitcoin source and read by `store.partialFromHeight`, and no EVM
+ * writer produces it today — micro-org#281 says so plainly and calls the defect latent. That is
+ * exactly why the state is manufactured here rather than driven through a worker: the thing under
+ * test is the READ's refusal to sum a record that was never written for an address, and the read
+ * cannot tell which family narrowed it. Waiting for an EVM writer to narrow first would leave the
+ * refusal unproven until the day it is needed, on the read a token gate demotes from.
+ *
+ * `PARTIAL_DETAIL_KEY` is imported rather than spelled: `store.test.ts` already pins the writer and
+ * the index to one spelling, and a third hardcoded copy here would be free to drift into a test
+ * that passes because it marks a key nobody reads.
+ */
+async function recordWatchedOnlyFrom(height: number): Promise<void> {
+  await sql`
+    update blocks
+       set detail = jsonb_set(detail, ${[PARTIAL_DETAIL_KEY]}, '"watched-addresses-only"'::jsonb, true)
+     where chain = ${SCOPE.chain} and network = ${SCOPE.network} and height >= ${height}
+  `
+}
+
+test(
+  'a holdings read on a narrowed record says nobody wrote the address down, rather than nought',
+  { skip },
+  async () => {
+    // micro-org#281. Every refusal the holdings read had was about BLOCKS, and a deployment that
+    // records only watched addresses has all of them: it walks every block, stores every
+    // transaction, and simply does not write `address_activity` for addresses it was not watching.
+    // So coverage is complete, no refusal fires, the sum of nothing is nothing, and the read used
+    // to hand back an empty holdings list — which is a nought with this service's authority behind
+    // it for an address it never looked at.
+    const chain = new FakeChain()
+    const transfer: TxSpec = {
+      from: ALICE,
+      to: TOKEN,
+      logs: [
+        {
+          address: TOKEN,
+          topics: [ERC20_TRANSFER_TOPIC, topicFor(ALICE), topicFor(BOB)],
+          data: amountData(5_000n),
+        },
+      ],
+    }
+    chain.appendMany(9) //      heights 1..9, genesis is 0
+    chain.append([transfer]) // height 10
+    chain.appendMany(2) //      heights 11, 12
+
+    await workerFor(chain).follow(signal())
+    const reads = postgresReadStore(db())
+
+    // While the record still holds every address, a nought IS an answer and stays one. This is the
+    // case the fix must not break: an address with no movements over a complete record has a
+    // derived balance of zero, and a gate is entitled to act on it.
+    const whole = await reads.tokenBalances(SCOPE, CAROL, TOKEN, null)
+    assert.equal(whole.coverage.complete, true)
+    assert.equal(whole.balance, '0', 'a measured nought over a whole record')
+    assert.equal(whole.unavailable, undefined)
+
+    await recordWatchedOnlyFrom(6)
+
+    const silent_ = await reads.tokenBalances(SCOPE, CAROL, TOKEN, null)
+    // The same complete coverage as above, and this is the whole point: no existing refusal could
+    // have fired here, because every block really is present and canonical.
+    assert.equal(silent_.coverage.complete, true, 'the blocks are all there — only the rows are not')
+    assert.equal(silent_.unavailable, 'address_not_watched')
+    assert.equal(silent_.notWatchedFromHeight, 6, 'where the recorded set narrows')
+    // ABSENT, not zero and not null — the same shape every other withheld balance takes, so a
+    // consumer that already handles one handles this without being taught a new rule.
+    assert.equal('balance' in silent_, false)
+    assert.equal('balances' in silent_, false)
+
+    // And it fires with rows on it. BOB was paid at height 10, above the boundary, so his stored
+    // movements are whatever happened to be written rather than all of them; summing them is a
+    // window total, which is the thing `coverage_incomplete` exists to refuse. The old read
+    // answered 5000 here — a number that is right only by luck, because this record was narrowed
+    // after the fact rather than while it was being walked.
+    const windowed = await reads.tokenBalances(SCOPE, BOB, TOKEN, null)
+    assert.equal(windowed.unavailable, 'address_not_watched')
+    assert.equal('balance' in windowed, false)
+
+    // Registering the address makes it answerable again, and the number that comes back is the one
+    // the movements say. Nothing about the balance changed; what changed is that the record is now
+    // this address's.
+    await watchAddress(db(), SCOPE, BOB, null)
+    const known = await reads.tokenBalances(SCOPE, BOB, TOKEN, null)
+    assert.equal(known.unavailable, undefined)
+    assert.equal(known.balance, '5000')
+    assert.equal('notWatchedFromHeight' in known, false, 'set only alongside the refusal')
+  },
+)
+
+test(
+  'the holdings read and the activity read agree about whether an address was written down',
+  { skip },
+  async () => {
+    // The two reads are built from the same `address_activity` rows, so the question has one true
+    // answer, and a consumer holding both is entitled to see them agree. Before micro-org#281 only
+    // `activity` asked it, and `explorer-web`'s address page had to pass the activity read's marker
+    // into its holdings panel to cover the gap — a consumer correlating two resources to find out
+    // whether one of them looked. They now share one predicate, and this is what says so.
+    const chain = new FakeChain()
+    chain.appendMany(4)
+    await workerFor(chain).follow(signal())
+    await recordWatchedOnlyFrom(2)
+
+    const reads = postgresReadStore(db())
+    for (const [address, watched] of [
+      [CAROL, false],
+      [BOB, true],
+    ] as const) {
+      if (watched) await watchAddress(db(), SCOPE, address, null)
+      const page = await reads.activity(SCOPE, address, 50, null)
+      const holdings = await reads.tokenBalances(SCOPE, address, TOKEN, null)
+      assert.equal(
+        page.incomplete?.reason ?? null,
+        holdings.unavailable === 'address_not_watched' ? 'address_not_watched' : null,
+        `the two reads disagree about ${address}`,
+      )
+      assert.equal(page.incomplete?.fromHeight ?? null, holdings.notWatchedFromHeight ?? null)
+      assert.equal(page.incomplete === undefined, watched)
+    }
   },
 )
 
