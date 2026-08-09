@@ -251,7 +251,7 @@ before(async () => {
   server = createServer({
     lifecycle,
     logger: new Logger({ service: 'indexer-test', sink: () => {} }),
-    metrics: registerServiceMetrics(registerHttpMetrics(new Metrics())),
+    metrics: registerServiceMetrics(registerHttpMetrics(new Metrics()), []),
     verifier: {
       async principal(token) {
         if (token === 'unavailable') throw new VerifierUnavailableError('jwks unreachable')

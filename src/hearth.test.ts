@@ -119,7 +119,7 @@ function poolAndWorker(startHeight: number): { pool: RpcPool; worker: EvmWorker 
       family: 'ember',
       rpc: pool,
       logger: new Logger({ service: 'indexer-test', sink: () => {} }),
-      metrics: registerServiceMetrics(new Metrics()),
+      metrics: registerServiceMetrics(new Metrics(), []),
       producer: 'indexer',
       followBatchBlocks: WINDOW,
       backfillBatchBlocks: WINDOW,

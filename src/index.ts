@@ -53,7 +53,13 @@ const logger = new Logger({
   version: env.version,
   env: env.env,
 })
-const metrics = registerServiceMetrics(registerJobMetrics(registerHttpMetrics(new Metrics())))
+// The configured scopes are handed in because `indexer_confirmation_depth` is published at
+// registration: it is configuration rather than a measurement, and the alert that reads it needs it
+// to exist before the first follower tick. See `metrics.ts`.
+const metrics = registerServiceMetrics(
+  registerJobMetrics(registerHttpMetrics(new Metrics())),
+  env.chains.map((chain) => chain.scope),
+)
 logger.info('starting', {
   version: env.version,
   schemaVersion: SCHEMA_VERSION,
