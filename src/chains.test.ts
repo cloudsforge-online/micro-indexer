@@ -24,7 +24,10 @@ test('every chain slug maps to an on-chain asset, and SHARD is not one of them',
     assert.ok(CHAINS[asset], `${asset} must exist in the pinned contract`)
   }
   assert.equal(isChainId('shard'), false, 'SHARD never exists on a chain')
-  assert.equal(isChainId('doge'), false)
+  // `doge` used to stand here as the example of an asset code that is not a chain. It is one now,
+  // so the example moved to a code `contracts-chain` does not carry at all — the assertion is that
+  // the union is closed, and it needs a member from outside the union to say so.
+  assert.equal(isChainId('bnb'), false)
 })
 
 test('depths are read from the pinned contract and never restated here', () => {
@@ -132,4 +135,66 @@ test('an ltc scope parses on both networks and cannot span them', () => {
   assert.ok(!sameScope({ chain: 'ltc', network: 'mainnet' }, { chain: 'ltc', network: 'testnet' }))
   // The confusion that would actually cost money: LTC and BTC rows must never be one scope.
   assert.ok(!sameScope({ chain: 'ltc', network: 'mainnet' }, { chain: 'btc', network: 'mainnet' }))
+})
+
+/* --------------------------- DOGE and ETC: the same two seams, and none of the same numbers */
+
+test('doge and etc are chains this indexer follows, and they resolve to their own assets', () => {
+  assert.ok(isChainId('doge'))
+  assert.ok(isChainId('etc'))
+  assert.equal(assetOf('doge'), 'DOGE')
+  assert.equal(assetOf('etc'), 'ETC')
+  assert.ok(CHAIN_IDS.includes('doge'))
+  assert.ok(CHAIN_IDS.includes('etc'))
+})
+
+test('doge is served by the BITCOIN family and etc by the EVM family, which is why neither has a worker', () => {
+  // `index.ts` selects a worker by family and nothing else. If either of these ever changes, the
+  // chain does not fail — it silently falls through to a worker that speaks a different protocol,
+  // which is why this is asserted rather than assumed. It is the whole basis for adding two chains
+  // without adding a line to `index.ts`.
+  assert.equal(familyOf('doge'), 'bitcoin')
+  assert.equal(familyOf('doge'), familyOf('btc'))
+  assert.equal(familyOf('etc'), 'evm')
+  assert.equal(familyOf('etc'), familyOf('eth'))
+})
+
+test('sharing a family must not mean sharing a depth, and on ETC the gap is three orders of magnitude', () => {
+  // The mistake family reuse invites, twice over. DOGE's blocks are ~63s against LTC's ~150s, so
+  // copying LTC's 12 would credit after 12.7 minutes where the same estate insists on 30 for
+  // Litecoin; ETC is a repeatedly 51%-attacked minority-hashrate chain whose deepest recorded reorg
+  // was ~7,000 blocks, so copying ETH's 12 would credit at a depth — 2.7 minutes of ETC — that all
+  // four of its recorded attacks went straight through.
+  assert.equal(requiredConfirmations('doge'), 30)
+  assert.notEqual(requiredConfirmations('doge'), requiredConfirmations('ltc'))
+  assert.equal(requiredConfirmations('etc'), 7500)
+  assert.notEqual(requiredConfirmations('etc'), requiredConfirmations('eth'))
+  // Read, never restated — the property the whole of `chains.ts` exists to keep.
+  assert.equal(requiredConfirmations('doge'), chainSpec('DOGE').confirmations)
+  assert.equal(requiredConfirmations('etc'), chainSpec('ETC').confirmations)
+})
+
+test('etc declares its own chain ids, which is what proves a provider is not serving Ethereum', () => {
+  // 61 on mainnet and 63 on Mordor. `evm.ts` compares `eth_chainId` against these and treats a
+  // mismatch as fatal at boot, so an `etc:mainnet` scope pointed at an Ethereum endpoint refuses to
+  // start rather than writing Ethereum blocks into rows labelled ETC.
+  assert.equal(declaredChainId('etc', 'mainnet'), 61)
+  assert.equal(declaredChainId('etc', 'testnet'), 63)
+  assert.notEqual(declaredChainId('etc', 'mainnet'), declaredChainId('eth', 'mainnet'))
+  // DOGE has none, exactly like BTC and LTC: the network binding comes from the node's own
+  // getblockchaininfo, and a number here would claim a binding the family cannot enforce.
+  assert.equal(declaredChainId('doge', 'mainnet'), undefined)
+  assert.equal(declaredChainId('doge', 'testnet'), undefined)
+})
+
+test('a doge or etc scope parses on both networks and cannot be confused with its sibling', () => {
+  assert.deepEqual(parseScope('doge:mainnet'), { chain: 'doge', network: 'mainnet' })
+  assert.deepEqual(parseScope('etc:testnet'), { chain: 'etc', network: 'testnet' })
+  assert.equal(scopeKey({ chain: 'etc', network: 'mainnet' }), 'etc:mainnet')
+  // The two pairs a reader's eye slides over. ETC and ETH differ by one character and DOGE follows
+  // the same code as LTC, so a scope that compared loosely would put one chain's blocks in the
+  // other's rows — and both pairs have a real chain id or a real block time behind them.
+  assert.ok(!sameScope({ chain: 'etc', network: 'mainnet' }, { chain: 'eth', network: 'mainnet' }))
+  assert.ok(!sameScope({ chain: 'doge', network: 'mainnet' }, { chain: 'ltc', network: 'mainnet' }))
+  assert.ok(!sameScope({ chain: 'etc', network: 'mainnet' }, { chain: 'etc', network: 'testnet' }))
 })

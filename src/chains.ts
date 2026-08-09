@@ -46,20 +46,63 @@ import {
  *
  * The depth is not shared, only the code: `requiredConfirmations('ltc')` reads LTC's own 12 out of
  * `contracts-chain`, exactly as it reads Bitcoin's 6, because no number in this file is restated.
+ *
+ * ## `doge` and `etc` are that same argument run twice, and it was checked rather than inherited
+ *
+ * **`doge` is served by `BitcoinWorker` and `etc` by `EvmWorker`, with no new code in either.**
+ * `index.ts` selects a worker by FAMILY, and `contracts-chain` gives DOGE `family: 'bitcoin'` and
+ * ETC `family: 'evm'`, so both fall out of the existing branch. What that claim rests on is the
+ * seam this repository actually uses, which was read before the union was widened:
+ *
+ *   * DOGE — the follower is `bitcoin.ts` over `btcnodesource.ts`, which speaks the five bitcoind
+ *     JSON-RPC methods Dogecoin Core also answers and takes the payee from the node's own
+ *     `scriptPubKey.address`. That it never ENCODES an address matters more here than it did for
+ *     Litecoin: Dogecoin has no bech32 at all and its base58 versions are 0x1e and 0x16, so an
+ *     address derived by analogy with LTC would be well-formed and unpayable. The one place this
+ *     repository does encode is `btcaddress.ts`, which serves the BIP157 light source and the
+ *     differential harness, is typed on its own `BtcChain` union, and carries no Dogecoin
+ *     parameters — deliberately silent rather than guessing. Nothing wires that path to a worker,
+ *     so it does not stand between this service and a Dogecoin Core node; it does mean a DOGE
+ *     light source is unbuilt work rather than a configuration change.
+ *   * ETC — `evm.ts` proves identity from `eth_chainId` against `declaredChainId`, which answers 61
+ *     on mainnet and 63 on Mordor, so a provider serving Ethereum to an `etc:mainnet` scope is
+ *     fatal at boot exactly as Sepolia-into-`ember` already is. Same `eth_*` methods, same 18
+ *     decimals, same address shape; the differences are all in the numbers, and the numbers are
+ *     read.
+ *
+ * **The number to be careful of is ETC's 7,500 confirmations**, which is read here and never
+ * restated but has one consequence that belongs in this file rather than in the spec: a cold start
+ * with no `INDEXER_START_HEIGHT_ETC_*` set resumes at `tip - 2 × confirmations`, so `etc` begins
+ * 15,000 blocks behind the head — about 57 hours of chain at the 13.7s block time the spec
+ * measured, and roughly 600 follow ticks at the default batch. That is the correct window (it is
+ * the smallest one in which a deposit can be watched through its whole confirmation life) and it
+ * is not a bug, but an operator who wants `etc` ready in minutes sets a start height explicitly.
+ * No other chain in this union makes that difference large enough to notice.
  */
-export type ChainId = 'ember' | 'eth' | 'btc' | 'sol' | 'xrp' | 'ltc'
+export type ChainId = 'ember' | 'eth' | 'etc' | 'btc' | 'sol' | 'xrp' | 'ltc' | 'doge'
 
-export const CHAIN_IDS: readonly ChainId[] = Object.freeze(['ember', 'eth', 'btc', 'sol', 'xrp', 'ltc'])
+export const CHAIN_IDS: readonly ChainId[] = Object.freeze([
+  'ember',
+  'eth',
+  'etc',
+  'btc',
+  'sol',
+  'xrp',
+  'ltc',
+  'doge',
+])
 
 export const NETWORKS: readonly Network[] = Object.freeze(['mainnet', 'testnet'])
 
 const ASSET_FOR_CHAIN: Readonly<Record<ChainId, AssetCode>> = Object.freeze({
   ember: 'EMBER',
   eth: 'ETH',
+  etc: 'ETC',
   btc: 'BTC',
   sol: 'SOL',
   xrp: 'XRP',
   ltc: 'LTC',
+  doge: 'DOGE',
 })
 
 export function isChainId(value: string): value is ChainId {

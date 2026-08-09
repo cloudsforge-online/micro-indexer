@@ -742,8 +742,10 @@ function scopeFrom(ctx: RequestContext): ChainScope {
   const chain = (ctx.params['chain'] ?? '').toLowerCase()
   const network = (ctx.params['network'] ?? '').toLowerCase()
   // 404 rather than 400: the path names a resource that does not exist, and a caller that asked
-  // for `/chains/doge/mainnet/status` has not made a malformed request, it has asked for a chain
-  // this estate does not run.
+  // for `/chains/bnb/mainnet/status` has not made a malformed request, it has asked for a chain
+  // this estate does not run. (The example used to be `doge`, which the estate now names — a chain
+  // that is in the union but has no configured provider is a different answer, 503
+  // `chain_not_followed`, and it comes from the route rather than from here.)
   if (!isChainId(chain)) throw new NotFoundError('unknown_chain', `no such chain: ${chain}`)
   if (!isNetwork(network)) {
     throw new NotFoundError('unknown_network', `no such network: ${network}`)

@@ -383,7 +383,10 @@ test('the status route answers with the depth the pinned contract publishes', as
 })
 
 test('a chain or network this estate does not run is 404, not 400', async () => {
-  const chain = await call('/chains/doge/mainnet/status', { token: 'reader' })
+  // `doge` was the example until the estate named it. A chain in the union that nothing follows is
+  // a different answer — 503 `chain_not_followed` — so the example has to be a chain
+  // `contracts-chain` does not carry at all, or this test would be asserting the wrong thing.
+  const chain = await call('/chains/bnb/mainnet/status', { token: 'reader' })
   assert.equal(chain.status, 404)
   assert.equal((chain.body['error'] as Record<string, string>)['code'], 'unknown_chain')
   const network = await call('/chains/ember/devnet/status', { token: 'reader' })
@@ -677,7 +680,7 @@ test('the token route authorises and normalises exactly as every other read does
   const malformed = await call('/tokens/ember/testnet/0xnothex', { token: 'reader' })
   assert.equal(malformed.status, 400)
   assert.equal((malformed.body['error'] as Record<string, string>)['code'], 'bad_address')
-  assert.equal((await call(`/tokens/doge/mainnet/${TOKEN}`, { token: 'reader' })).status, 404)
+  assert.equal((await call(`/tokens/bnb/mainnet/${TOKEN}`, { token: 'reader' })).status, 404)
 })
 
 /* --------------------------------------- the custody aggregate */
