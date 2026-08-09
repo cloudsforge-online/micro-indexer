@@ -116,9 +116,28 @@ test('a non-http endpoint is refused', () => {
 
 test('the chain list refuses an unknown chain, an unknown network and a duplicate', () => {
   assert.deepEqual(parseChainList('ember:testnet'), [{ chain: 'ember', network: 'testnet' }])
-  assert.throws(() => parseChainList('doge:mainnet'), EnvError)
+  // `doge:mainnet` stood here as the unknown chain until DOGE became one. The replacement is a
+  // chain `contracts-chain` does not name at all, because the assertion is that the list is checked
+  // against the union rather than parsed for shape.
+  assert.throws(() => parseChainList('bnb:mainnet'), EnvError)
   assert.throws(() => parseChainList('ember:devnet'), EnvError)
   assert.throws(() => parseChainList('ember:testnet,ember:testnet'), EnvError)
+})
+
+test('doge and etc are configurable chains, which is the point of adding them to the union', () => {
+  // `parseChainList` validates against `isChainId`, so widening the type is the whole of what makes
+  // an operator able to name either one. Nothing beyond this is wired: the estate runs no Dogecoin
+  // or Ethereum Classic node, so a deployment that set these would also have to set
+  // INDEXER_RPC_DOGE_MAINNET and INDEXER_RPC_ETC_MAINNET — and `loadEnv` refuses a chain with no
+  // endpoint, which is what stops this from being followable by accident.
+  assert.deepEqual(parseChainList('doge:mainnet,etc:mainnet'), [
+    { chain: 'doge', network: 'mainnet' },
+    { chain: 'etc', network: 'mainnet' },
+  ])
+  assert.throws(
+    () => loadEnv({ ...BASE, INDEXER_CHAINS: 'etc:mainnet' }),
+    (err: unknown) => err instanceof EnvError && /INDEXER_RPC_ETC_MAINNET is required/.test(err.message),
+  )
 })
 
 test('a signing secret is measured in key material, not in characters', () => {

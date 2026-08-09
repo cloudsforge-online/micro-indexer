@@ -46,50 +46,58 @@
 
 import { JOBS_SCHEMA_SQL } from '@cloudsforge/jobs'
 import type { Migration } from '@cloudsforge/db'
-import { CHAIN_IDS, NETWORKS } from './chains.ts'
 
 /**
- * Repeated on every chain table. A typo cannot mint a chain that nothing follows.
+ * The chain and network domains as SQL, **pinned once per migration and never derived.**
  *
- * **DERIVED, never restated.** This list used to be typed out by hand here, and it drifted: LTC
- * was added to `chains.ts` and not to this file, so `watched_addresses` rejected every Litecoin
- * address. Both estates were patched live, which fixed the databases that existed and left every
- * database created afterwards wrong — the worst shape a schema defect can take, because it is
- * invisible until somebody provisions a new environment and then it looks like a code bug.
+ * Repeating the domain on every chain table is what stops a typo minting a chain nothing follows.
+ * Getting the repetition RIGHT has now failed twice, in opposite directions, and both failures are
+ * the reason these are literals:
  *
- * Deriving it from `CHAIN_IDS` is what makes that unrepeatable: adding a chain to the type is now
- * the same act as allowing it in the schema. `migrations.test.ts` asserts the two agree, so a
- * future hand-written list fails CI rather than a deploy.
+ *   1. **Hand-written and drifted.** The list was typed out here while `chains.ts` kept its own, and
+ *      when LTC was added to the type nobody added it to the schema, so `watched_addresses_chain_ck`
+ *      rejected every Litecoin address — an indexer that cannot be told what to watch. Both estates
+ *      were patched live, which fixed the databases that existed and left every database created
+ *      afterwards wrong.
+ *   2. **Derived, and rewrote history.** The repair for (1) interpolated `CHAIN_IDS` into the SQL.
+ *      `@cloudsforge/db` hashes each migration's text and refuses the whole run when an applied one
+ *      has changed, so adding `ltc` to the type silently edited SQL that Postgres had already
+ *      executed and every existing estate refused to migrate. Migrations 4 and 5 were pinned in
+ *      response — and migration 6 was left derived, with a comment saying that was fine "for
+ *      migrations written from version 6 onward". It was not fine. Adding DOGE and ETC to the type
+ *      would have rewritten migration 6 and reproduced the outage exactly, three migrations later.
+ *
+ * So the rule has no exception left in it: **a checksummed artefact contains no value that can
+ * change.** Each of these is the domain as it shipped in the migration named, frozen at that
+ * moment, and a new chain gets a NEW constant and a NEW migration rather than an edit to one above.
+ *
+ * The agreement with `chains.ts` that derivation was reaching for is kept by `migrations.test.ts`
+ * instead, which reads the LAST chain check each table receives and asserts it is `CHAIN_IDS`
+ * exactly — both directions, so a chain in the type with no migration behind it and a chain in the
+ * schema that the type does not know are each a red build rather than a broken deploy. A test can
+ * do that safely because a test is not hashed.
  */
-const chainList = CHAIN_IDS.map((c) => `'${c}'`).join(',')
-const networkList = NETWORKS.map((n) => `'${n}'`).join(',')
-/**
- * **FROZEN. Migrations 4 and 5 are already applied, and their TEXT is their identity.**
- *
- * `@cloudsforge/db` hashes each migration's SQL and refuses to run when an applied one has changed
- * — "add a new migration instead of editing a released one". Deriving `CHAIN_CK` from `CHAIN_IDS`
- * was right for new migrations and wrong for these two: adding `ltc` to the type silently rewrote
- * SQL that Postgres had already executed, so every existing estate refused to migrate and the
- * service could not start. Correct guard, real outage.
- *
- * So the historical spelling is pinned here, exactly as it shipped. It must never be regenerated
- * from anything: a constant that can change is not a constant a migration may contain.
- */
-const CHAIN_CK_AS_APPLIED = `check (chain in ('ember','eth','btc','sol','xrp'))`
+const CHAIN_CK_AS_APPLIED_4_5 = `check (chain in ('ember','eth','btc','sol','xrp'))`
+const CHAIN_CK_AS_APPLIED_6 = `check (chain in ('ember','eth','btc','sol','xrp','ltc'))`
+const CHAIN_CK_AS_APPLIED_9 = `check (chain in ('ember','eth','etc','btc','sol','xrp','ltc','doge'))`
 
-/** Derived, for migrations written from version 6 onward. Adding a chain to the type allows it. */
-const CHAIN_CK = `check (chain in (${chainList}))`
-const NETWORK_CK = `check (network in (${networkList}))`
+/**
+ * One spelling so far, and it is pinned for the same reason rather than because it has burned
+ * anybody: `Network` is a closed pair in `contracts-chain` and widening it is an estate-wide event,
+ * but "unlikely to change" is exactly the argument that left migration 6 derived.
+ */
+const NETWORK_CK_AS_APPLIED = `check (network in ('mainnet','testnet'))`
 
 /**
  * Every table this service owns, in an order that is safe to truncate.
  *
  * Declared here, above `MIGRATIONS`, rather than at the foot of the file where it used to sit —
- * migration 6 builds its DDL from this list at module-evaluation time, so a definition below the
- * array would still be in its temporal dead zone. Moving it is also the point: this is now the ONE
- * list of chain-scoped tables, used by the migration that repairs their constraints and by the
- * database tests that truncate them. Writing a second one is how the chain check drifted in the
- * first place.
+ * migrations 6 and 9 build their DDL from this list at module-evaluation time, so a definition
+ * below the array would still be in its temporal dead zone. Moving it is also the point: this is
+ * the ONE list of chain-scoped tables, used by every migration that repairs or widens their
+ * constraints and by the database tests that truncate them. Writing a second one is how the chain
+ * check drifted in the first place — and it is why a widening migration cannot cover eight tables
+ * and quietly miss the ninth.
  */
 export const CHAIN_TABLES: readonly string[] = Object.freeze([
   'spent_outpoints',
@@ -196,8 +204,8 @@ export const MIGRATIONS: readonly Migration[] = [
         indexed_at  timestamptz not null default now(),
         updated_at  timestamptz not null default now(),
         constraint blocks_pk primary key (chain, network, hash),
-        constraint blocks_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint blocks_network_ck ${NETWORK_CK},
+        constraint blocks_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint blocks_network_ck ${NETWORK_CK_AS_APPLIED},
         constraint blocks_status_ck check (status in ('pending','included','finalised','orphaned')),
         constraint blocks_height_ck check (height >= 0)
       );
@@ -237,8 +245,8 @@ export const MIGRATIONS: readonly Migration[] = [
         -- transaction re-included in a different block after a reorg updates this row in place
         -- rather than producing a second one.
         constraint transactions_pk primary key (chain, network, hash),
-        constraint transactions_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint transactions_network_ck ${NETWORK_CK},
+        constraint transactions_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint transactions_network_ck ${NETWORK_CK_AS_APPLIED},
         constraint transactions_status_ck
           check (status in ('pending','success','failed','dropped','orphaned')),
         -- Mempool-only rows have neither. MATCH SIMPLE means the composite key below is simply
@@ -268,8 +276,8 @@ export const MIGRATIONS: readonly Migration[] = [
         data         text    not null default '0x',
         status       text    not null default 'included',
         constraint logs_pk primary key (chain, network, tx_hash, log_index),
-        constraint logs_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint logs_network_ck ${NETWORK_CK},
+        constraint logs_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint logs_network_ck ${NETWORK_CK_AS_APPLIED},
         constraint logs_status_ck check (status in ('included','orphaned')),
         constraint logs_index_ck check (log_index >= 0),
         constraint logs_tx_fk foreign key (chain, network, tx_hash)
@@ -313,8 +321,8 @@ export const MIGRATIONS: readonly Migration[] = [
         confirmed_at  timestamptz,
         reorged_at    timestamptz,
         updated_at    timestamptz   not null default now(),
-        constraint address_activity_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint address_activity_network_ck ${NETWORK_CK},
+        constraint address_activity_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint address_activity_network_ck ${NETWORK_CK_AS_APPLIED},
         constraint address_activity_direction_ck check (direction in ('in','out')),
         constraint address_activity_kind_ck check (asset_kind in ('native','token')),
         constraint address_activity_status_ck check (status in ('included','orphaned')),
@@ -359,8 +367,8 @@ export const MIGRATIONS: readonly Migration[] = [
         halt_reason text,
         updated_at  timestamptz not null default now(),
         constraint checkpoints_pk primary key (chain, network, stream),
-        constraint checkpoints_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint checkpoints_network_ck ${NETWORK_CK},
+        constraint checkpoints_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint checkpoints_network_ck ${NETWORK_CK_AS_APPLIED},
         constraint checkpoints_range_ck check ((range_from is null) = (range_to is null)),
         constraint checkpoints_range_order_ck
           check (range_from is null or range_to >= range_from)
@@ -384,8 +392,8 @@ export const MIGRATIONS: readonly Migration[] = [
         orphaned_transactions  integer     not null default 0,
         orphaned_activity      integer     not null default 0,
         orphaned_block_hashes  text[]      not null default '{}',
-        constraint reorgs_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint reorgs_network_ck ${NETWORK_CK},
+        constraint reorgs_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint reorgs_network_ck ${NETWORK_CK_AS_APPLIED},
         constraint reorgs_depth_ck check (depth > 0)
       );
 
@@ -411,8 +419,8 @@ export const MIGRATIONS: readonly Migration[] = [
         rate_limited_until   timestamptz,
         updated_at           timestamptz not null default now(),
         constraint provider_health_pk primary key (chain, network, provider),
-        constraint provider_health_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint provider_health_network_ck ${NETWORK_CK},
+        constraint provider_health_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint provider_health_network_ck ${NETWORK_CK_AS_APPLIED},
         constraint provider_health_state_ck check (state in ('healthy','degraded','down'))
       );
 
@@ -432,8 +440,8 @@ export const MIGRATIONS: readonly Migration[] = [
         label    text,
         added_at timestamptz not null default now(),
         constraint watched_addresses_pk primary key (chain, network, address),
-        constraint watched_addresses_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint watched_addresses_network_ck ${NETWORK_CK}
+        constraint watched_addresses_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint watched_addresses_network_ck ${NETWORK_CK_AS_APPLIED}
       );
     `,
   },
@@ -481,8 +489,8 @@ export const MIGRATIONS: readonly Migration[] = [
         status           text    not null default 'included',
         constraint spent_outpoints_pk
           primary key (chain, network, spending_tx_hash, txid, vout),
-        constraint spent_outpoints_chain_ck ${CHAIN_CK_AS_APPLIED},
-        constraint spent_outpoints_network_ck ${NETWORK_CK},
+        constraint spent_outpoints_chain_ck ${CHAIN_CK_AS_APPLIED_4_5},
+        constraint spent_outpoints_network_ck ${NETWORK_CK_AS_APPLIED},
         constraint spent_outpoints_status_ck check (status in ('included','orphaned')),
         constraint spent_outpoints_vout_ck check (vout >= 0),
         constraint spent_outpoints_tx_fk foreign key (chain, network, spending_tx_hash)
@@ -527,12 +535,17 @@ export const MIGRATIONS: readonly Migration[] = [
     // constraint would reject, so a replica still running it is unaffected and this may ship in
     // one migration. Dropping first with `if exists` makes it idempotent and makes it work on a
     // database that was already patched by hand.
+    //
+    // THE DOMAIN BELOW IS FROZEN AT THE SIX CHAINS THIS SHIPPED WITH and is not `CHAIN_IDS`. It was
+    // interpolated when it was written, which was the same mistake migrations 4 and 5 had just been
+    // pinned to escape — see the constants at the head of this file. Migration 9 is where `etc` and
+    // `doge` are allowed; this one is history and says what it said on the day.
     up: CHAIN_TABLES.map(
       (table) => `
       alter table ${table} drop constraint if exists ${table}_chain_ck;
-      alter table ${table} add constraint ${table}_chain_ck ${CHAIN_CK};
+      alter table ${table} add constraint ${table}_chain_ck ${CHAIN_CK_AS_APPLIED_6};
       alter table ${table} drop constraint if exists ${table}_network_ck;
-      alter table ${table} add constraint ${table}_network_ck ${NETWORK_CK};
+      alter table ${table} add constraint ${table}_network_ck ${NETWORK_CK_AS_APPLIED};
     `,
     ).join('\n'),
   },
@@ -637,6 +650,49 @@ export const MIGRATIONS: readonly Migration[] = [
         on blocks (chain, network, height)
         where detail->>'partial' is not null;
     `,
+  },
+  {
+    version: 9,
+    name: 'chain-check-doge-etc',
+    // ------------------------------------------------------------------------------------------
+    // ADMIT `etc` AND `doge` TO THE CHAIN DOMAIN ON EVERY CHAIN-SCOPED TABLE.
+    //
+    // `contracts-chain` gained both assets, and `chains.ts` gained both slugs in the same change.
+    // Neither of those touches the database. The domain the database actually enforces is whatever
+    // the last migration wrote, which as of 2026-08-09 is migration 6's six chains — on the live
+    // mainnet estate `blocks_chain_ck` reads
+    //
+    //     check (chain = any (array['ember','eth','btc','sol','xrp','ltc']))
+    //
+    // so a follower pointed at either new chain would authenticate, verify identity, fetch a block,
+    // and then raise 23514 on the very first insert. Forever, on every tick, with the failure
+    // arriving as a job error rather than as a configuration one — a shape that reads as "the
+    // indexer is broken" rather than "the schema was never widened".
+    //
+    // ALL NINE TABLES, NOT JUST `blocks`. One follow tick writes the block, its transactions, its
+    // logs or address activity, its spent outpoints, its checkpoint and its provider health inside
+    // ONE transaction. Widening a subset does not buy a partial success, it buys the same 23514 one
+    // statement later — and if the tables ever did commit separately, a block admitted while the
+    // movement inside it was refused is the worst answer this service can give: a chain that looks
+    // walked and is silently missing deposits. `CHAIN_TABLES` is the list, and it is the same list
+    // migration 6 repaired, so "every table" cannot drift from "every table this service owns".
+    //
+    // Expand-only and therefore one migration rather than four: widening a CHECK cannot reject
+    // anything the previous release writes, because the previous release has no slug for either
+    // chain to write. Dropping first with `if exists` keeps it idempotent and lets it land on a
+    // database an operator has already patched by hand, which is exactly how the LTC repair went.
+    //
+    // WHAT THIS DOES NOT DO. It does not follow either chain. `INDEXER_CHAINS` names neither, no
+    // `INDEXER_RPC_DOGE_*` or `INDEXER_RPC_ETC_*` exists, and the estate runs no Dogecoin or
+    // Ethereum Classic node — `env.ts` refuses a chain with no endpoint at boot, so the schema
+    // widening cannot start anything on its own. It removes the reason following them would fail;
+    // deciding to follow them is a deploy change, and a deliberate one.
+    up: CHAIN_TABLES.map(
+      (table) => `
+      alter table ${table} drop constraint if exists ${table}_chain_ck;
+      alter table ${table} add constraint ${table}_chain_ck ${CHAIN_CK_AS_APPLIED_9};
+    `,
+    ).join('\n'),
   },
 ]
 

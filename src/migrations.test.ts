@@ -116,28 +116,95 @@ test('checksums are stable, which is what makes an edited migration refuse to ru
   }
 })
 
-test('every chain in CHAIN_IDS is allowed by the schema, from one definition and not two', () => {
-  // The regression this locks down: LTC was added to `chains.ts` and not to the hand-written list
-  // in this file, so `watched_addresses_chain_ck` rejected every Litecoin address — an indexer
-  // that cannot be told what to watch. Both estates were patched live, which fixed the databases
-  // that existed and left every database created afterwards broken.
+/**
+ * The domain a column ACTUALLY ends up with: the last `check (<column> in (...))` any migration
+ * applies to `<table>_<column>_ck`, in migration order.
+ *
+ * Reading the last one rather than searching the whole file is the substance of the two tests
+ * below. An earlier spelling is history and is allowed to be narrow — migration 4's five chains
+ * still sit in `ALL_SQL` and always will — so "does this string appear anywhere" is a question that
+ * a widening migration answers for a table it never touched.
+ */
+function finalDomain(table: string, column: 'chain' | 'network'): readonly string[] | null {
+  const matches = [
+    ...ALL_SQL.matchAll(new RegExp(`${table}_${column}_ck check \\(${column} in \\(([^)]*)\\)\\)`, 'g')),
+  ]
+  const last = matches.at(-1)
+  if (!last) return null
+  return (last[1] ?? '').split(',').map((value) => value.trim().replace(/'/g, ''))
+}
+
+test('the chain domain every table ends up with is exactly CHAIN_IDS, in both directions', () => {
+  // The regression this locks down: LTC was added to `chains.ts` and not to the schema, so
+  // `watched_addresses_chain_ck` rejected every Litecoin address — an indexer that cannot be told
+  // what to watch. Both estates were patched live, which fixed the databases that existed and left
+  // every database created afterwards broken.
   //
-  // Asserting the constraint text against CHAIN_IDS is what makes a third list impossible: adding
-  // a chain to the type without the schema following now fails here rather than in a deploy.
-  for (const chain of CHAIN_IDS) {
-    assert.match(
-      ALL_SQL,
-      new RegExp(`check \\(chain in \\([^)]*'${chain}'`),
-      `${chain} is in CHAIN_IDS but no chain check allows it`,
+  // The repair for that interpolated `CHAIN_IDS` into the SQL, which cannot stand in a checksummed
+  // migration and no longer does — see the constants at the head of `migrations.ts`. This test is
+  // what replaces it, and it is stronger than the one it replaces in two ways. It compares SETS, so
+  // a chain in the schema that the type does not know fails as loudly as the other direction; and
+  // it reads the FINAL constraint per table, so a widening migration that quietly covers `blocks`
+  // and forgets `spent_outpoints` fails here rather than at the first insert of a follow tick.
+  for (const table of CHAIN_TABLES) {
+    const domain = finalDomain(table, 'chain')
+    assert.ok(domain, `${table} never has its chain domain pinned by any migration`)
+    assert.deepEqual(
+      [...domain].sort(),
+      [...CHAIN_IDS].sort(),
+      `${table} ends up admitting ${domain.join(',')}, which is not CHAIN_IDS`,
     )
   }
-  for (const network of NETWORKS) {
-    assert.match(
-      ALL_SQL,
-      new RegExp(`check \\(network in \\([^)]*'${network}'`),
-      `${network} is in NETWORKS but no network check allows it`,
+})
+
+test('the network domain every table ends up with is exactly NETWORKS', () => {
+  // The same shape for the pair that has never changed. It is asserted anyway because the cost of
+  // the assertion is nothing and the cost of discovering a third network was never admitted is a
+  // whole environment that cannot write a row.
+  for (const table of CHAIN_TABLES) {
+    const domain = finalDomain(table, 'network')
+    assert.ok(domain, `${table} never has its network domain pinned by any migration`)
+    assert.deepEqual([...domain].sort(), [...NETWORKS].sort())
+  }
+})
+
+test('the checksum of every released migration is the one it shipped with', () => {
+  // MIGRATIONS ARE APPEND-ONLY, and this is the only place that says so in a way that fails a
+  // build. `migrate()` compares each migration's checksum against the row it wrote when it applied
+  // it and refuses the WHOLE run on a mismatch, so an edit to released text is not a bad migration
+  // — it is every replica in the estate unable to start, discovered at deploy time.
+  //
+  // It has nearly happened twice and both were invisible in review, because neither was an edit to
+  // the SQL: both were edits to a CONSTANT the SQL interpolated. Adding `ltc` to `CHAIN_IDS`
+  // rewrote migrations 4 and 5; adding `doge` and `etc` would have rewritten migration 6, which was
+  // left derived when 4 and 5 were pinned. A reviewer cannot see that by reading the diff — the
+  // changed line is in another file — so it is pinned here as data.
+  //
+  // ADDING A ROW WHEN YOU ADD A MIGRATION IS THE INTENDED WORK. Changing an existing row is the
+  // thing this exists to make you stop and explain, and there is no legitimate reason to.
+  const shipped: Readonly<Record<number, string>> = {
+    1: 'eb9bd289',
+    2: '2479dd84',
+    3: '8b24c44e',
+    4: '040f74a8',
+    5: 'cefc269c',
+    6: 'b635fae7',
+    7: 'be00dd76',
+    8: '28e40f2c',
+    9: 'a3b213a5',
+  }
+  for (const m of MIGRATIONS) {
+    assert.equal(
+      checksumOf(m),
+      shipped[m.version],
+      `migration ${m.version} (${m.name}) no longer hashes to the text it was applied with`,
     )
   }
+  assert.equal(
+    Object.keys(shipped).length,
+    MIGRATIONS.length,
+    'a migration was added without pinning its checksum',
+  )
 })
 
 test('the converging migration repairs every chain-scoped table, whenever the database was created', () => {
