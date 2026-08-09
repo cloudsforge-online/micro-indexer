@@ -238,7 +238,7 @@ function workerFor(
     scope: SCOPE,
     rpc: pool,
     logger: silent,
-    metrics: registerServiceMetrics(new Metrics()),
+    metrics: registerServiceMetrics(new Metrics(), []),
     producer: 'indexer',
     followBatchBlocks: options.followBatchBlocks ?? 100,
     backfillBatchBlocks: 100,

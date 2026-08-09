@@ -402,7 +402,7 @@ before(async () => {
   indexerServer = createServer({
     lifecycle,
     logger: new Logger({ service: 'indexer-chainbacking', sink: () => {} }),
-    metrics: registerServiceMetrics(registerHttpMetrics(new Metrics())),
+    metrics: registerServiceMetrics(registerHttpMetrics(new Metrics()), []),
     // The auth layer is proved by `server.test.ts` against the real `Verifier`'s error types. Here
     // it is stubbed so this file tests the seam it is named for rather than a JWKS.
     verifier: {
