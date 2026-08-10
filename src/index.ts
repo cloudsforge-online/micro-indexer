@@ -230,7 +230,11 @@ const server = createServer({
   logger,
   metrics,
   verifier,
-  reads: postgresReadStore(sql),
+  // The same `pools` map `custody` and `tokens` are given below, and for the same reason: a scope
+  // this process holds no pool for is one it does not follow, and `/chains/:chain/:network/status`
+  // must say so rather than reading rows some earlier configuration left behind. See
+  // `ChainStatus.followed` for the mainnet measurement that made this necessary.
+  reads: postgresReadStore(sql, pools),
   // A chain in `INDEXER_CHAINS` whose family has no worker has no pool either, so the token route
   // answers 503 `chain_not_followed` for it rather than pretending. That is the same choice
   // `stubWorker` makes above and for the same reason: an absent map entry fails as `undefined is

@@ -722,6 +722,27 @@ test('a reorg at or past the alarm depth halts the chain rather than repairing i
   assert.equal(again.halted, true)
   assert.equal(again.blocksIndexed, 0)
   assert.equal(await countOf('reorgs'), 1, 'a halted chain does not re-detect its own reorg')
+
+  // The halt is a claim in the PRESENT TENSE, and a deployment that no longer follows this scope
+  // is not making it. Measured on mainnet on 2026-08-10: `checkpoints` held an `ember:testnet` row
+  // halted at height 87 on 2026-08-04 by a provider that had since been removed from
+  // `INDEXER_CHAINS`, and `micro-network-site` rendered it to readers as "This chain is halted" —
+  // six days after the last worker touched it. `custody.ts` had always refused such a scope with
+  // `chain_not_followed`; this document had not asked.
+  const stranger = postgresReadStore(db(), { has: () => false })
+  const unfollowed = await stranger.status(SCOPE)
+  assert.equal(unfollowed.followed, false)
+  assert.equal(unfollowed.halted, false, 'not a live alarm — this process is not walking this chain')
+  assert.equal(unfollowed.haltReason, null)
+  // The row itself is untouched: it is the record of what happened on the day it happened.
+  assert.equal((await getCheckpoint(db(), SCOPE, TIP_STREAM))?.halted, true)
+
+  // And it is a live claim again the moment the scope is followed again.
+  const follower = postgresReadStore(db(), { has: () => true })
+  const followed = await follower.status(SCOPE)
+  assert.equal(followed.followed, true)
+  assert.equal(followed.halted, true)
+  assert.match(followed.haltReason ?? '', /depth 6/)
 })
 
 test('indexing the same range twice produces identical state and no second event', { skip }, async () => {
