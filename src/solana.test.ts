@@ -209,7 +209,13 @@ const silent = new Logger({ service: 'indexer-test', sink: () => {} })
 
 function workerFor(
   node: FakeSolanaNode,
-  options: { followBatchBlocks?: number; dead?: boolean; startHeight?: number } = {},
+  options: {
+    followBatchBlocks?: number
+    dead?: boolean
+    startHeight?: number
+    /** Supplied only by tests that read the exposition afterwards. */
+    metrics?: Metrics
+  } = {},
 ): SolanaWorker {
   const endpoints = options.dead
     ? [
@@ -238,7 +244,7 @@ function workerFor(
     scope: SCOPE,
     rpc: pool,
     logger: silent,
-    metrics: registerServiceMetrics(new Metrics(), []),
+    metrics: options.metrics ?? registerServiceMetrics(new Metrics(), []),
     producer: 'indexer',
     followBatchBlocks: options.followBatchBlocks ?? 100,
     backfillBatchBlocks: 100,
@@ -247,6 +253,17 @@ function workerFor(
 }
 
 const signal = (): AbortSignal => new AbortController().signal
+
+/** The label sets and values one metric name has in a Prometheus exposition. */
+function renderedSeries(text: string, name: string): Map<string, string> {
+  const found = new Map<string, string>()
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#') || !line.startsWith(`${name}{`)) continue
+    const brace = line.indexOf('}')
+    found.set(line.slice(name.length, brace + 1), line.slice(brace + 2))
+  }
+  return found
+}
 
 async function canonicalSlots(): Promise<number[]> {
   const rows = await sql<{ height: string }[]>`
@@ -285,6 +302,42 @@ beforeEach(async () => {
 test('a cluster this scope may not index is fatal, not a warning', { skip }, async () => {
   const node = new FakeSolanaNode({ genesisHash: GENESIS_HASHES['mainnet-beta'] })
   await assert.rejects(() => workerFor(node).verifyIdentity(signal()), SolanaClusterError)
+})
+
+test('the follower publishes NO difficulty, because Solana has none', { skip }, async () => {
+  /*
+   * A refusal, made executable (micro-org#363).
+   *
+   * `evm.ts` and `bitcoin.ts` both set `indexer_chain_difficulty` from the block they have just
+   * indexed. The symmetry makes this file look unfinished, and the obvious "fix" — publish a 0, or
+   * a 1, so the gauge has a series for every chain and no dashboard has a hole — is the defect
+   * `beacon_chain_height_spread` was retired for on 2026-08-10: a number that is constant by
+   * construction, which converts "we cannot observe this" into "we observed it and it is fine".
+   *
+   * The comment in `solana.ts` says so. A comment does not fail a build, so this does. The
+   * follower is run for real, against blocks that really were indexed — asserted below, so this
+   * cannot pass because nothing happened — and the exposition must still have no series under that
+   * name at all.
+   */
+  const node = new FakeSolanaNode()
+  node.produceMany(3)
+  node.finalize(node.tip)
+  const metrics = registerServiceMetrics(new Metrics(), [])
+  const outcome = await workerFor(node, { metrics }).follow(signal())
+
+  // The follower did work. Without this the assertion below is green for a worker that did nothing.
+  assert.ok(outcome.blocksIndexed > 0, 'the follower must actually have indexed something')
+  const text = metrics.render()
+  assert.ok(
+    renderedSeries(text, 'indexer_tip_height').size > 0,
+    'the slot IS published — this test is about difficulty specifically, not about silence',
+  )
+
+  assert.equal(
+    renderedSeries(text, 'indexer_chain_difficulty').size,
+    0,
+    'a proof-of-stake chain published a proof-of-work difficulty',
+  )
 })
 
 test(

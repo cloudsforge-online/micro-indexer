@@ -19,6 +19,7 @@ import {
   BitcoinWorker,
   addressOf,
   btcToSats,
+  difficultyFromBits,
   extractBitcoinBlock,
   isCoinbase,
   outpointKey,
@@ -246,6 +247,41 @@ test('only a mainnet node may serve a mainnet scope', () => {
   assert.equal(ACCEPTED_CORE_CHAINS.testnet.includes('test'), true)
 })
 
+test('nBits becomes exactly the difficulty Core would have reported', () => {
+  /*
+   * The four hex strings and the four numbers were read off the estate's own litecoind on
+   * 2026-08-10 — `getblock(getblockhash(h), 1)` for each height, plus `getblockchaininfo` at the
+   * tip — and they are asserted to the last bit ON PURPOSE.
+   *
+   * `difficultyFromBits` transcribes Core's `GetDifficulty`, doubles and all, rather than doing the
+   * "obvious" bigint `max_target / target`. The bigint form is a few ULP away, and it is the form
+   * somebody will helpfully rewrite this into. Exact equality against real Core output is the only
+   * assertion that catches that, because both forms are correct to six digits and only one of them
+   * matches the number an operator sees when they check the metric against their own node.
+   */
+  assert.equal(difficultyFromBits('1934368d'), 82257185.75822285) // LTC tip, height 3,157,656
+  assert.equal(difficultyFromBits('192f1adc'), 91177350.72352147) // LTC height 3,156,656
+  assert.equal(difficultyFromBits('1b00b5c3'), 92301.94408029056) // LTC height 1,157,656
+  assert.equal(difficultyFromBits('1e0ffff0'), 0.000244140625) // LTC height 1
+  // The canonical difficulty-1 target. If this is not exactly 1 the whole scale is wrong.
+  assert.equal(difficultyFromBits('1d00ffff'), 1)
+
+  /*
+   * `null`, never a number, for everything that is not an nBits — the same rule `evm.ts` applies
+   * and for the same reason: a published 0 reads as a chain whose work has collapsed.
+   *
+   * The zero-mantissa case is the one worth its own line. `0xffff / 0` is `Infinity` in
+   * JavaScript, not an error; Prometheus renders that as `+Inf`, and every comparison an alert
+   * makes against `+Inf` silently stops meaning anything.
+   */
+  assert.equal(difficultyFromBits('1d000000'), null, 'a zero mantissa would publish +Inf')
+  assert.equal(difficultyFromBits(undefined), null)
+  assert.equal(difficultyFromBits(null), null)
+  assert.equal(difficultyFromBits(''), null)
+  assert.equal(difficultyFromBits('1d00ff'), null, 'nBits is four bytes, always')
+  assert.equal(difficultyFromBits('1d00fffg'), null, 'not hex')
+})
+
 /* ------------------------------------------------------------------ database-backed */
 
 const url = process.env['INDEXER_TEST_DATABASE_URL']
@@ -268,6 +304,12 @@ function workerFor(
     dead?: boolean
     startHeight?: number
     watchedAddressesOnly?: boolean
+    /**
+     * Supplied only by tests that read the exposition afterwards. The worker otherwise builds its
+     * own, which is unreachable from here — and a metric nobody can render is a metric no test can
+     * tell apart from one that was never set.
+     */
+    metrics?: Metrics
   } = {},
 ): BitcoinWorker {
   const endpoints = options.dead
@@ -299,7 +341,7 @@ function workerFor(
     scope: SCOPE,
     rpc: pool,
     logger: silent,
-    metrics: registerServiceMetrics(new Metrics(), []),
+    metrics: options.metrics ?? registerServiceMetrics(new Metrics(), []),
     producer: 'indexer',
     followBatchBlocks: options.followBatchBlocks ?? 100,
     backfillBatchBlocks: options.backfillBatchBlocks ?? 100,
@@ -309,6 +351,17 @@ function workerFor(
 }
 
 const signal = (): AbortSignal => new AbortController().signal
+
+/** The label sets and values one metric name has in a Prometheus exposition. */
+function renderedSeries(text: string, name: string): Map<string, string> {
+  const found = new Map<string, string>()
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#') || !line.startsWith(`${name}{`)) continue
+    const brace = line.indexOf('}')
+    found.set(line.slice(name.length, brace + 1), line.slice(brace + 2))
+  }
+  return found
+}
 
 async function canonicalHeights(): Promise<number[]> {
   const rows = await sql<{ height: string }[]>`
@@ -380,6 +433,37 @@ test('the follower indexes from a cold start and chains the blocks it wrote', { 
   const checkpoint = await getCheckpoint(db(), SCOPE, TIP_STREAM)
   assert.equal(checkpoint?.height, 5)
   assert.equal(checkpoint?.blockHash, node.hashAt(5))
+})
+
+test('the follower publishes the tip block’s difficulty from its nBits', { skip }, async () => {
+  /*
+   * micro-org#363, the UTXO half. What this asserts that the pure test above cannot is that a
+   * sample REACHES the exposition under the scope's labels: `Metrics.set` on an unregistered name
+   * returns silently and renders nothing, so a forgotten `register` produces exactly the greenly
+   * inert rule micro-org#310 measured, and only a render tells the two apart.
+   *
+   * It also pins the source. Reading `getblockchaininfo.difficulty` would have worked here and
+   * would have made the metric node-source-only — `btcsource.ts`'s light client has no JSON-RPC to
+   * ask, and it has the header. Taking it from the block means the same number arrives whichever
+   * source is serving.
+   */
+  const node = new FakeBitcoinNode()
+  node.appendMany(2)
+  const metrics = registerServiceMetrics(new Metrics(), [])
+  await workerFor(node, { metrics }).follow(signal())
+
+  const rendered = renderedSeries(metrics.render(), 'indexer_chain_difficulty')
+  assert.deepEqual(
+    rendered,
+    // The fake node's headers carry `1d00ffff`, the canonical difficulty-1 target.
+    new Map([[`{chain="${SCOPE.chain}",network="${SCOPE.network}"}`, '1']]),
+    'the tip block’s difficulty, keyed the way every other chain rule selects',
+  )
+  assert.deepEqual(
+    [...rendered.keys()],
+    [...renderedSeries(metrics.render(), 'indexer_tip_height').keys()],
+    'difficulty and tip height must be keyed identically',
+  )
 })
 
 test('a node without verbosity 3 still resolves prevouts, and agrees exactly', { skip }, async () => {

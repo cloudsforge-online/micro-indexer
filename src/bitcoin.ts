@@ -61,6 +61,7 @@ import {
   CHAIN_HALTED,
   DEPOSITS_CONFIRMED_TOTAL,
   DEPOSITS_OBSERVED_TOTAL,
+  DIFFICULTY,
   LAG_BLOCKS,
   REORGS_TOTAL,
   TIP_HEIGHT,
@@ -150,6 +151,64 @@ export interface RawBtcBlock {
   readonly weight?: number
   readonly version?: number
   readonly tx: readonly RawBtcTx[]
+}
+
+/* ------------------------------------------------------------------ difficulty */
+
+/**
+ * A header's `nBits` as the difficulty Core would report, or `null` when it is not a valid `nBits`.
+ *
+ * ## Why `bits` and not `getblockchaininfo.difficulty`
+ *
+ * Core hands out `difficulty` as a convenience field, and reaching for it would have made this
+ * metric a NODE-SOURCE-ONLY metric. `btcsource.ts` has two implementations and only one of them is
+ * a daemon: `lightSource` is a BIP157/158 client holding a header chain, and it has no JSON-RPC to
+ * ask. `bits` is in the 80-byte header itself, so both sources already carry it — `btcblock.ts`
+ * writes it out of the wire header and Core returns it on `getblock` — and this stays one number
+ * from one place whichever source is serving. A metric that quietly stops existing when the estate
+ * fails over to the light client is the kind of gap this file's `complete` flag exists to refuse.
+ *
+ * ## The arithmetic is Core's, deliberately, down to the double
+ *
+ * This is `GetDifficulty` transcribed: take the exponent byte, divide 0xffff by the 24-bit
+ * mantissa, and shift by 256 per byte until the exponent is 29. It is NOT computed as
+ * `max_target / target` in bigint and then converted, because that produces a value a few ULP away
+ * from the one every Bitcoin explorer and every operator's `getblockchaininfo` shows, and a metric
+ * that disagrees in the seventh digit with the tool the operator checks it against is a metric they
+ * stop believing.
+ *
+ * Verified against the estate's own litecoind on 2026-08-10 at height 3,157,656 — every one of
+ * these reproduces Core's own answer to the last bit, and they are the test vectors:
+ *
+ *     1934368d -> 82257185.75822285   (the tip that day; matches getblockchaininfo.difficulty)
+ *     192f1adc -> 91177350.72352147   (height 3,156,656)
+ *     1b00b5c3 ->     92301.94408029056
+ *     1e0ffff0 ->         0.000244140625  (height 1)
+ *     1d00ffff ->         1               (the canonical difficulty-1 target)
+ *
+ * ## `null` is a real answer
+ *
+ * A missing or malformed `bits` means the source told us nothing about the work in this block, and
+ * nothing is what gets published — see `difficultyGaugeValue` in `evm.ts` for the same rule and the
+ * same reason. A zero mantissa in particular would divide by zero and produce `Infinity`, which
+ * Prometheus renders as `+Inf` and every alert on it silently stops meaning anything.
+ */
+export function difficultyFromBits(bits: string | null | undefined): number | null {
+  if (typeof bits !== 'string' || !/^[0-9a-fA-F]{8}$/.test(bits)) return null
+  const compact = Number.parseInt(bits, 16)
+  const mantissa = compact & 0x00ffffff
+  if (mantissa === 0) return null
+  let shift = (compact >>> 24) & 0xff
+  let difficulty = 0x0000ffff / mantissa
+  while (shift < 29) {
+    difficulty *= 256
+    shift += 1
+  }
+  while (shift > 29) {
+    difficulty /= 256
+    shift -= 1
+  }
+  return difficulty
 }
 
 /* ------------------------------------------------------------------ amounts */
@@ -984,6 +1043,13 @@ export class BitcoinWorker implements ChainWorker {
       }
       await setCheckpoint(tx, this.#d.scope, stream, extracted.block.height, extracted.block.hash)
     })
+
+    // Tip stream only, for the reason written at the same line in `evm.ts`: a backfill walks
+    // history, and a gauge holding a two-year-old difficulty is worse than one holding none.
+    if (stream === TIP_STREAM) {
+      const difficulty = difficultyFromBits(raw.bits)
+      if (difficulty !== null) this.#d.metrics.set(DIFFICULTY, difficulty, this.#labels)
+    }
 
     this.#d.metrics.increment(BLOCKS_INDEXED_TOTAL, { ...this.#labels, stream })
     this.#d.metrics.increment(
