@@ -56,6 +56,7 @@ const reads: ReadStore = {
       indexedHeight: 98,
       indexedHash: HASH,
       lagBlocks: 2,
+      followed: true,
       halted: false,
       haltReason: null,
       providers: [],

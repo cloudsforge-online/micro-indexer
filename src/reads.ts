@@ -38,6 +38,7 @@ import {
   declaredChainId,
   familyOf,
   requiredConfirmations,
+  scopeKey,
   type ChainScope,
 } from './chains.ts'
 import type { Db } from './outbox.ts'
@@ -89,6 +90,25 @@ export interface ChainStatus {
   readonly indexedHash: string | null
   /** Null when no tip has ever been observed — a lag of zero would be a lie, not a default. */
   readonly lagBlocks: number | null
+  /**
+   * Whether THIS deployment follows this scope, which is a different question from whether it
+   * holds rows for it.
+   *
+   * `custody.ts` has always asked it — a scope with no pool is `chain_not_followed` there, refused
+   * before a single balance is summed. This document did not, and the difference was measured on
+   * mainnet on 2026-08-10: `checkpoints` still held an `ember:testnet` row left by a testnet
+   * provider that ran on that host on 2026-08-04, halted at height 87 with "reorg deeper than 256
+   * blocks". `INDEXER_CHAINS` had not listed `ember:testnet` for six days, no worker had touched
+   * the row since, and `micro-network-site` rendered it as a live alarm: "This chain is halted".
+   *
+   * A halt is a claim in the present tense — this service walked this chain and will not vouch for
+   * it. A deployment that does not follow the chain is not walking it and is not making that
+   * claim, so `halted` and `haltReason` below are reported as the absence they are whenever this
+   * is false. The row is not deleted: it is the record of what happened on the day it happened,
+   * and it becomes a live claim again the moment the scope is followed again.
+   */
+  readonly followed: boolean
+  /** Always false when `followed` is false — see there. */
   readonly halted: boolean
   readonly haltReason: string | null
   readonly providers: readonly ProviderView[]
@@ -394,7 +414,24 @@ async function notWatchedFromHeight(
   return watched ? null : partialFrom
 }
 
-export function postgresReadStore(sql: Db): ReadStore {
+/**
+ * `followed` is the set of scopes this process actually drives, keyed by `scopeKey`.
+ *
+ * It defaults to a set that answers yes to everything, and that default is for the tests and for
+ * any caller constructed before the pools exist — NOT for production. `index.ts` passes the same
+ * `pools` map `custody.ts` is given, so "followed" means one thing across the whole read API
+ * rather than two things that drift.
+ */
+export interface FollowedScopes {
+  has(key: string): boolean
+}
+
+const FOLLOWS_EVERYTHING: FollowedScopes = { has: () => true }
+
+export function postgresReadStore(
+  sql: Db,
+  followed: FollowedScopes = FOLLOWS_EVERYTHING,
+): ReadStore {
   const exec: Exec = sql
   return {
     async status(scope) {
@@ -406,6 +443,7 @@ export function postgresReadStore(sql: Db): ReadStore {
       ])
       const tipHeight = checkpoint?.tipHeight ?? null
       const indexedHeight = checkpoint?.height ?? null
+      const isFollowed = followed.has(scopeKey(scope))
       return {
         chain: scope.chain,
         network: scope.network,
@@ -420,8 +458,12 @@ export function postgresReadStore(sql: Db): ReadStore {
         indexedHash: checkpoint?.blockHash ?? null,
         lagBlocks:
           tipHeight === null ? null : Math.max(0, tipHeight - (indexedHeight ?? tipHeight)),
-        halted: checkpoint?.halted ?? false,
-        haltReason: checkpoint?.haltReason ?? null,
+        followed: isFollowed,
+        // Gated on `isFollowed`, not merely reported beside it. A consumer that renders `halted`
+        // and has never heard of `followed` is the one this defect was found through, and it is
+        // the one that must stop being lied to first.
+        halted: isFollowed && (checkpoint?.halted ?? false),
+        haltReason: isFollowed ? (checkpoint?.haltReason ?? null) : null,
         providers: providers.map((p) => ({
           provider: p.provider,
           host: p.urlHost,
