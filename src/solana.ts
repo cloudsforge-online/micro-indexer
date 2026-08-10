@@ -517,6 +517,25 @@ export class SolanaWorker implements ChainWorker {
     await recordTip(this.#d.sql, this.#d.scope, tip)
     this.#d.metrics.set(TIP_HEIGHT, tip, this.#labels)
 
+    /*
+     * AND DELIBERATELY NO `indexer_chain_difficulty` HERE (micro-org#363).
+     *
+     * `evm.ts` and `bitcoin.ts` both publish that gauge from the block they have just indexed, and
+     * the symmetry makes this file look unfinished. It is not. Solana has no proof of work, so
+     * there is no difficulty to read: not a difficulty this worker failed to find, not one behind
+     * an RPC nobody wired up — the quantity does not exist. Leader schedules are stake-weighted and
+     * slots are wall-clock ticks.
+     *
+     * The tempting thing is to publish 0, or 1, so the gauge has a series for every chain and the
+     * dashboard has no holes. That is precisely the defect `beacon_chain_height_spread` was retired
+     * for on 2026-08-10: it published a number that was constant by construction, which converted
+     * "we cannot observe this" into "we observed it and it is fine". A missing series is legible —
+     * an alert over it returns nothing and says so. A fabricated one is not.
+     *
+     * If a Solana health signal is ever wanted here, the honest ones are skip rate and the
+     * confirmed-to-finalized distance, and both are new metrics with their own names.
+     */
+
     const reorgs: ReorgOutcome[] = []
     let blocksIndexed = 0
     let halted = false

@@ -162,3 +162,97 @@ describe('the confirmation depth this service credits at', () => {
     )
   })
 })
+
+/*
+ * The other side of the same argument, for the metric micro-org#363 adds.
+ *
+ * `EmberDifficultyAtFloor` reads `indexer_chain_difficulty`, and the way THAT rule fails silently
+ * is the mirror image of micro-org#310's: not a registration with no sample, but a sample that is
+ * fabricated so the series exists for every chain. Solana has no proof of work; a 0 or a 1 there is
+ * an invented reading, and an invented reading is what `beacon_chain_height_spread` was retired for
+ * on 2026-08-10 — it reported agreement it had never checked.
+ *
+ * So these assert the shape of a metric that is deliberately *incomplete*: registered once, keyed
+ * like `indexer_tip_height`, and carrying series only for the chains that have something to say.
+ */
+const CHAIN_DIFFICULTY = 'indexer_chain_difficulty'
+const TIP = 'indexer_tip_height'
+
+describe('the chain difficulty this service publishes', () => {
+  it('is declared as a gauge under the name the rules file reads', () => {
+    const text = registerServiceMetrics(new Metrics(), ESTATE).render()
+    assert.ok(text.includes(`# TYPE ${CHAIN_DIFFICULTY} gauge`), 'the metric must be declared')
+    assert.ok(!text.includes(`# TYPE ${CHAIN_DIFFICULTY} counter`), 'a level, never an increase')
+    assert.equal(
+      serviceMetrics.DIFFICULTY,
+      CHAIN_DIFFICULTY,
+      'the module spells the name differently from the rule that reads it',
+    )
+  })
+
+  it('has NO sample at registration, unlike the confirmation depth, and that is the point', () => {
+    /*
+     * This is the assertion that stops a well-meaning reader from "fixing" the asymmetry above.
+     *
+     * `CONFIRMATION_DEPTH` is published here because it is configuration and its value is knowable
+     * at composition. A difficulty is an observation: it does not exist until a block has been
+     * read, exactly like `indexer_tip_height` and `indexer_lag_blocks`, neither of which is seeded
+     * either. Seeding it would mean choosing a number — and every available number is a lie. 0 is a
+     * chain whose work has collapsed; 1 is a chain anyone can mine; 256 is EMBER's floor asserted
+     * before a single block has been looked at, which would make `EmberDifficultyAtFloor` fire
+     * against a service that has not yet spoken to a node.
+     */
+    const text = registerServiceMetrics(new Metrics(), ESTATE).render()
+    assert.equal(
+      series(text, CHAIN_DIFFICULTY).size,
+      0,
+      'a seeded difficulty is a reading nothing measured',
+    )
+    // Asserted next to it so the two cannot be confused: the depth IS seeded, and `scopes` stays
+    // required for that reason. Nothing here relaxes micro-org#310.
+    assert.equal(series(text, DEPTH).size, ESTATE.length)
+    assert.equal(series(text, TIP).size, 0, 'the metric it is modelled on is not seeded either')
+  })
+
+  it('is keyed exactly like indexer_tip_height once a worker has published it', () => {
+    // `EmberDifficultyAtFloor` selects `{chain="ember"}` and `EmberTipNotAdvancing` selects the
+    // same label on `indexer_tip_height`. A runbook that tells an operator to put the two on one
+    // graph, and any later rule that joins them, both need identical keys. Asserting the whole
+    // label string is the form that survives someone adding a label to one and not the other.
+    const metrics = registerServiceMetrics(new Metrics(), ESTATE)
+    for (const scope of ESTATE) {
+      const labels = { chain: scope.chain, network: scope.network }
+      metrics.set(TIP, 11_242, labels)
+      metrics.set(CHAIN_DIFFICULTY, 8_146, labels)
+    }
+    const text = metrics.render()
+
+    assert.deepEqual(
+      [...series(text, CHAIN_DIFFICULTY).keys()].sort(),
+      [...series(text, TIP).keys()].sort(),
+      'the two chain gauges are keyed differently',
+    )
+  })
+
+  it('carries a series only for the chains that have one, and never for the rest', () => {
+    /*
+     * The honest shape, asserted as a shape. A chain that publishes nothing must leave the metric
+     * with no series for it — not a zero, not a one — and the exposition must still be readable
+     * with a partial set, because that is what the mainnet estate will actually export: `ember`
+     * (EVM, proof of work) and `ltc` (proof of work) publish, and a Solana scope would not.
+     */
+    const scopes: readonly ChainScope[] = [
+      { chain: 'ember', network: 'mainnet' },
+      { chain: 'sol', network: 'mainnet' },
+    ]
+    const metrics = registerServiceMetrics(new Metrics(), scopes)
+    // Only the proof-of-work chain speaks. `solana.ts` never calls `set` for this name at all.
+    metrics.set(CHAIN_DIFFICULTY, 256, { chain: 'ember', network: 'mainnet' })
+
+    assert.deepEqual(
+      series(metrics.render(), CHAIN_DIFFICULTY),
+      new Map([['{chain="ember",network="mainnet"}', '256']]),
+      'a chain with no proof of work must have no series, rather than a plausible one',
+    )
+  })
+})

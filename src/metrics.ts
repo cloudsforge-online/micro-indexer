@@ -28,6 +28,7 @@ export const DEPOSITS_OBSERVED_TOTAL = 'indexer_deposits_observed_total'
 export const DEPOSITS_CONFIRMED_TOTAL = 'indexer_deposits_confirmed_total'
 export const CHAIN_HALTED = 'indexer_chain_halted'
 export const TIP_HEIGHT = 'indexer_tip_height'
+export const DIFFICULTY = 'indexer_chain_difficulty'
 
 /**
  * Reorg depth as a **bucket**, not as the raw number.
@@ -111,6 +112,67 @@ export function registerServiceMetrics(metrics: Metrics, scopes: readonly ChainS
     .register({
       name: TIP_HEIGHT,
       help: 'The chain tip as last observed by this service',
+      kind: 'gauge',
+      labels: ['chain', 'network'],
+    })
+    .register({
+      /*
+       * Proof-of-work difficulty at the tip, so that "the retarget has run out of room" can be
+       * asked at all (micro-org#363).
+       *
+       * ── WHY IT LIVES HERE AND NOT IN THE CHAIN ────────────────────────────────────────────────
+       *
+       * Nothing in the estate published difficulty before this. `hearth/node/src` has no Prometheus
+       * surface of any kind, so the alternative was to grow one in a consensus daemon in order to
+       * export a number this service already has in hand: the follower reads the whole block on the
+       * tip stream and the `chain`/`network` labels are the ones every other rule joins on.
+       *
+       * ── IT HAS NO BOOT-TIME SAMPLE, AND THAT DOES NOT WEAKEN micro-org#310 ────────────────────
+       *
+       * `CONFIRMATION_DEPTH` below is published at registration because it is CONFIGURATION — a
+       * compile-time constant of an exact-pinned package — and the property `scopes` buys is that a
+       * caller cannot register it without publishing it. Difficulty is not configuration; it is an
+       * OBSERVATION, and it does not exist until a block has been read, exactly like `TIP_HEIGHT`
+       * and `LAG_BLOCKS` above. Publishing a placeholder at boot would be the fabricated sample
+       * micro-org#310 is against, arriving from the other direction: a zero on the wire is a chain
+       * that reads as broken, and a one is a chain that reads as trivially mineable.
+       *
+       * So `scopes` stays required, and it stays required for the reason it was made required — it
+       * is still the only thing that publishes `CONFIRMATION_DEPTH`. Nothing here relaxes it.
+       *
+       * ── SOME CHAINS WILL NEVER HAVE A SERIES, DELIBERATELY ────────────────────────────────────
+       *
+       * `solana.ts` publishes nothing to this gauge and says why at its `TIP_HEIGHT` set. Solana has
+       * no proof of work and therefore no difficulty; a 0 or a 1 there would be an invented reading,
+       * which is what `beacon_chain_height_spread` was retired for on 2026-08-10. `evm.ts` also
+       * declines when a block reports difficulty 0 — that is what a post-merge chain reports for
+       * ever, and it is also what Hearth's own genesis header carries (measured 2026-08-10 against
+       * `cf-hearth-seed`: block 0x0 returns `difficulty: "0x0"`, block 0x2af6 returns `"0x100"`).
+       *
+       * A gauge with series for some chains and not others is the honest shape. A gauge with a
+       * series for every chain, some of them made up, is the shape that reads the same and lies.
+       *
+       * ── AND THERE IS DELIBERATELY NO COMPANION `indexer_difficulty_floor` ─────────────────────
+       *
+       * The obvious move is `CONFIRMATION_DEPTH`'s: publish the threshold so the rule compares two
+       * published series. That works for the depth because the value IS
+       * `chainSpec(asset).confirmations` out of the exact-pinned contract the money path itself
+       * calls — one number, reached by construction. There is no equivalent source for Hearth's
+       * difficulty floor. It is `MAX_TARGET` in `hearth/node/src/params.js`, pinned to
+       * `GENESIS_TARGET`, in a repository this service does not and should not depend on, and it is
+       * on no RPC method this service speaks. Deriving it from the genesis block was checked and
+       * does not work: Hearth's block 0 reports difficulty 0, not 256.
+       *
+       * A floor gauge here would therefore be a SECOND COPY of a consensus constant with nothing
+       * keeping it in step — and it would fail silently in the worse direction, because if Hearth
+       * ever lowers its floor the gauge would keep asserting the old one and the alert would simply
+       * go quiet. `EmberDifficultyAtFloor` compares against a literal 256 with that provenance
+       * written beside it, which is falsifiable in one RPC call and cannot pretend to be authority.
+       */
+      name: DIFFICULTY,
+      help:
+        'Proof-of-work difficulty of the newest block this service indexed on the tip stream. ' +
+        'Absent for chains with no proof of work, and for blocks that report a difficulty of 0.',
       kind: 'gauge',
       labels: ['chain', 'network'],
     })

@@ -9,6 +9,7 @@ import {
   ERC20_TRANSFER_TOPIC,
   EvmWorker,
   addressFromTopic,
+  difficultyGaugeValue,
   extractBlock,
   hexToBigInt,
   hexToNumber,
@@ -177,6 +178,34 @@ test('a transaction with no receipt is pending, not success', () => {
   assert.equal(out.activity.length, 0, 'an unestablished outcome must not credit anything')
 })
 
+test('a difficulty gauge value is the block’s number, and null wherever there is not one', () => {
+  // The two live readings micro-org#363 is about, taken from `cf-hearth-seed` on 2026-08-10 with
+  // `eth_getBlockByNumber`. 0x100 is 256, the floor EMBER sat at for ~2,000 blocks; 0x1fd2 is the
+  // 8,146 the browser-hashrate burst drove it to before the tab closed and the tip stopped for
+  // nineteen minutes. Both are literal here so the alert's `== 256` is anchored to a measurement
+  // rather than to arithmetic done in a comment.
+  assert.equal(difficultyGaugeValue('0x100'), 256)
+  assert.equal(difficultyGaugeValue('0x1fd2'), 8146)
+  assert.equal(difficultyGaugeValue('100'), 256, 'the odd provider omits the 0x')
+
+  // EVERY ONE OF THESE MUST BE `null` AND NOT `0`, and they are the reason this function exists.
+  // `0` is a publishable gauge value: it renders, Prometheus stores it, and it reads on a
+  // dashboard as a chain whose work has collapsed. Each of these is instead a chain that has no
+  // difficulty to report, which is a series that must not exist at all.
+  assert.equal(difficultyGaugeValue('0x0'), null, "Hearth's own genesis header, measured 2026-08-10")
+  assert.equal(difficultyGaugeValue(undefined), null, 'the provider omitted the field')
+  assert.equal(difficultyGaugeValue(null), null)
+  assert.equal(difficultyGaugeValue(''), null)
+  assert.equal(difficultyGaugeValue('0xzz'), null, 'not a quantity: we were told nothing')
+
+  // Above 2^53 it rounds rather than throwing, unlike `hexToNumber`. Pre-merge Ethereum ran near
+  // 1.5e16, and refusing to publish there would cost the metric on the chains it is most worth
+  // having. Prometheus stores a float64 either way, so the rounding is the exposition format's and
+  // not this line's.
+  assert.equal(difficultyGaugeValue('0x2386f26fc10000'), 10_000_000_000_000_000)
+  assert.throws(() => hexToNumber('0xffffffffffffffff'), RangeError, 'heights still refuse to round')
+})
+
 /* ------------------------------------------------------------------ database-backed */
 
 /**
@@ -203,6 +232,12 @@ function workerFor(
     backfillBatchBlocks?: number
     fault?: (method: string, callIndex: number) => Error | null
     dead?: boolean
+    /**
+     * Supplied only by tests that read the exposition afterwards. The worker otherwise builds its
+     * own, which is unreachable from here — and a metric nobody can render is a metric no test can
+     * tell apart from one that was never set.
+     */
+    metrics?: Metrics
   } = {},
 ): EvmWorker {
   const endpoints = options.dead
@@ -237,7 +272,7 @@ function workerFor(
     family: 'ember',
     rpc: pool,
     logger: silent,
-    metrics: registerServiceMetrics(new Metrics(), []),
+    metrics: options.metrics ?? registerServiceMetrics(new Metrics(), []),
     producer: 'indexer',
     followBatchBlocks: options.followBatchBlocks ?? 100,
     backfillBatchBlocks: options.backfillBatchBlocks ?? 100,
@@ -246,6 +281,23 @@ function workerFor(
 }
 
 const signal = (): AbortSignal => new AbortController().signal
+
+/**
+ * The label sets and values one metric name has in a Prometheus exposition.
+ *
+ * Reading the RENDERED text rather than asking the `Metrics` object is the point: a registration
+ * with no sample behind it still emits `# HELP` and `# TYPE`, so only the series lines distinguish
+ * "published" from "declared" — which is the distinction micro-org#310 was about.
+ */
+function renderedSeries(text: string, name: string): Map<string, string> {
+  const found = new Map<string, string>()
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#') || !line.startsWith(`${name}{`)) continue
+    const brace = line.indexOf('}')
+    found.set(line.slice(name.length, brace + 1), line.slice(brace + 2))
+  }
+  return found
+}
 
 async function canonicalHeights(): Promise<number[]> {
   const rows = await sql<{ height: string }[]>`
@@ -977,6 +1029,60 @@ test('backfill advances its own stream, resumes, and never touches the follower�
   // A completed range is not picked up again.
   const done = await worker.backfill(signal())
   assert.equal(done.stream, null)
+})
+
+test('the tip stream publishes difficulty; a backfill deliberately does not', { skip }, async () => {
+  /*
+   * micro-org#363. `EmberDifficultyAtFloor` reads `indexer_chain_difficulty` and there was no such
+   * name in the estate before this change, so what has to be asserted first is the thing that is
+   * invisible in a code review: that a sample REACHES the exposition, under the label set the rule
+   * selects on. `Metrics.set` on a name that was never registered is a silent no-op — it returns
+   * without throwing and renders nothing — so a missing `register` produces exactly the greenly
+   * inert rule micro-org#310 measured, and only a render can tell the two apart.
+   */
+  const chain = new FakeChain()
+  chain.appendMany(3)
+
+  /*
+   * THE BACKFILL RUNS FIRST, ON ITS OWN REGISTRY, AND THIS ORDER IS THE ASSERTION. A backfill
+   * walks history. EMBER spent roughly 2,000 blocks pinned at difficulty 256 before 2026-08-10, so
+   * a backfill that published would hold this gauge at the floor — firing `EmberDifficultyAtFloor`
+   * — while the live chain sat 32x above it. The gauge means "the tip", so a registry that has
+   * only ever backfilled must have NO series at all, and it can only be shown to have none if
+   * nothing followed before it.
+   */
+  const backfillOnly = registerServiceMetrics(new Metrics(), [])
+  await ensureBackfill(db(), SCOPE, 0, 2)
+  const backfilled = await workerFor(chain, {
+    metrics: backfillOnly,
+    backfillBatchBlocks: 100,
+  }).backfill(signal())
+
+  // The backfill did run. Without this the assertion below passes for the wrong reason, and goes
+  // on passing if `backfill` is replaced with a no-op.
+  assert.equal(backfilled.blocksIndexed, 3, 'the backfill must actually have walked the range')
+  assert.equal(
+    renderedSeries(backfillOnly.render(), 'indexer_chain_difficulty').size,
+    0,
+    'a backfill published a difficulty for a block that is not the tip',
+  )
+
+  const metrics = registerServiceMetrics(new Metrics(), [])
+  await workerFor(chain, { metrics }).follow(signal())
+
+  const rendered = renderedSeries(metrics.render(), 'indexer_chain_difficulty')
+  assert.deepEqual(
+    rendered,
+    new Map([[`{chain="${SCOPE.chain}",network="${SCOPE.network}"}`, '1000']]),
+    'the tip block’s difficulty, keyed the way every other chain rule selects',
+  )
+  // The same key as the tip height, spelled out rather than assumed: a dashboard that puts the two
+  // on one panel, and any future rule that joins them, needs the label sets to be identical.
+  assert.deepEqual(
+    [...rendered.keys()],
+    [...renderedSeries(metrics.render(), 'indexer_tip_height').keys()],
+    'difficulty and tip height must be keyed identically',
+  )
 })
 
 test('two runs over the same historical range produce identical rows', { skip }, async () => {

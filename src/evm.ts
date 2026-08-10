@@ -66,6 +66,7 @@ import {
   CHAIN_HALTED,
   DEPOSITS_CONFIRMED_TOTAL,
   DEPOSITS_OBSERVED_TOTAL,
+  DIFFICULTY,
   LAG_BLOCKS,
   REORGS_TOTAL,
   TIP_HEIGHT,
@@ -172,6 +173,49 @@ export function hexToNumber(value: string | undefined | null): number {
 
 export function toHexQuantity(value: number): string {
   return `0x${value.toString(16)}`
+}
+
+/**
+ * A block's proof-of-work difficulty as a gauge value, or `null` when this chain has none.
+ *
+ * ## `null` rather than `0`, and this is the whole point of the function
+ *
+ * Three different states arrive at this function as "no useful difficulty", and every one of them
+ * would become the number `0` if the caller just parsed the field:
+ *
+ *   - the provider omitted `difficulty` entirely;
+ *   - the chain is proof-of-STAKE and reports `0x0` for ever, which is what every post-merge
+ *     Ethereum block says;
+ *   - the block is Hearth's genesis, which also reports `0x0` (measured 2026-08-10 against
+ *     `cf-hearth-seed`: `eth_getBlockByNumber("0x0")` returns `difficulty: "0x0"`, while block
+ *     `0x2af6` returns `"0x100"` — the floor — and `0x2bea` returns `"0x1fd2"`, the 8,146 that
+ *     micro-org#363 measured by hand).
+ *
+ * A `0` published for any of those is a chain that reads as broken on a dashboard and as "not at
+ * the floor" to an alert. `null` publishes nothing, which is the same answer `solana.ts` gives and
+ * for the same reason: a gauge is allowed to have no series, and is not allowed to invent one.
+ *
+ * ## Why `Number` here, when `hexToNumber` throws
+ *
+ * `hexToNumber` refuses to round because a height that lost its low bits is a checkpoint that
+ * resumes in the wrong place. A difficulty is never used to address anything — it is read as a
+ * magnitude, and Prometheus stores every gauge as a float64 regardless, so the 53-bit mantissa is
+ * imposed by the exposition format and not by this line. Throwing above 2^53 would cost the estate
+ * the metric on exactly the chains whose difficulty is worth watching (pre-merge Ethereum ran at
+ * ~1.5e16) in exchange for precision no scrape could have carried.
+ */
+export function difficultyGaugeValue(raw: string | null | undefined): number | null {
+  if (raw === undefined || raw === null || raw === '') return null
+  let parsed: bigint
+  try {
+    parsed = hexToBigInt(raw)
+  } catch {
+    // A provider that answered with something that is not a quantity has told us nothing about the
+    // difficulty. Nothing is what gets published.
+    return null
+  }
+  if (parsed <= 0n) return null
+  return Number(parsed)
 }
 
 /** keccak256("Transfer(address,address,uint256)"). The one event every fungible token emits. */
@@ -796,6 +840,15 @@ export class EvmWorker implements ChainWorker {
       }
       await setCheckpoint(tx, this.#d.scope, stream, extracted.block.height, extracted.block.hash)
     })
+
+    // Difficulty is published from the TIP STREAM ONLY (micro-org#363). A backfill walks history,
+    // and history's difficulty is not the chain's difficulty — a backfill of the 2,000 blocks
+    // EMBER spent pinned at 256 would hold the gauge at the floor while the live chain sat 32x
+    // above it, which is the alert firing on a chain state that ended days ago.
+    if (stream === TIP_STREAM) {
+      const difficulty = difficultyGaugeValue(raw.difficulty)
+      if (difficulty !== null) this.#d.metrics.set(DIFFICULTY, difficulty, this.#labels)
+    }
 
     this.#d.metrics.increment(BLOCKS_INDEXED_TOTAL, { ...this.#labels, stream })
     this.#d.metrics.increment(
