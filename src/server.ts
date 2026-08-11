@@ -170,6 +170,7 @@ const DOMAIN: ReadonlyArray<readonly [string, string, Handler]> = [
   ['GET', '/tokens/:chain/:network/:address', tokenObservation],
   ['GET', '/custody/:chain/:network/total', custodyTotal],
   ['GET', '/custody/:chain/:network/addresses/:address', custodyAddressBalance],
+  ['GET', '/custody/:chain/:network/addresses/:address/outpoints', custodyAddressOutpoints],
   ['GET', '/blocks/:chain/:network/:height', blockByHeight],
   ['POST', '/watch/:chain/:network/:address', watchAddress],
   ['POST', '/backfills/:chain/:network', requestBackfill],
@@ -635,6 +636,46 @@ async function custodyAddressBalance(ctx: RequestContext, deps: ServerDeps): Pro
     // `CustodyTotalUnavailableError` and every one must reach `handle` as a non-200, because a 200
     // carrying a defaulted balance is a number that would be journalled.
     return { status: 200, body: await deps.custody.balance(scope, address) }
+  } finally {
+    done()
+  }
+}
+
+/**
+ * Which outpoints a named bitcoin-family address may still hold — the input to a withdrawal that
+ * cannot be assembled any other way on this estate.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THIS ROUTE EXISTS BECAUSE THE NODE WILL NOT ANSWER.** `listunspent` is a wallet RPC, both
+ * bitcoind and litecoind run `disablewallet=1`, and `micro-settlement` therefore cannot select
+ * coins on any bitcoin-family chain — which is why no BTC or LTC withdrawal can be built today
+ * (micro-org#382). Nothing else on the estate holds the spend history of an address it does not
+ * have the wallet for; this service walked every block, so it does.
+ *
+ * `READ_SCOPE`, on the same argument as the balance route beside it and one more of its own. The
+ * disclosure argument is the same — the caller names the address, so a node could tell you this.
+ * The use argument is stronger: this answer becomes the input set of a signed transaction. Failing
+ * closed means a caller without the grant builds nothing, which is a stuck withdrawal; failing
+ * open would mean anything on the port can influence which coins the platform tries to spend.
+ *
+ * **A 200 here is a floor, not an authority.** `custody.ts` carries the full argument: settlement
+ * re-reads every outpoint with `gettxout`, which a wallet-less node does answer, so a list that is
+ * too long is corrected downstream. A list that is too short is not correctable — it looks exactly
+ * like a swept address — which is why this route inherits every refusal the balance route has and
+ * has no fallback at all.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+async function custodyAddressOutpoints(ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
+  await authorise(ctx, deps, READ_SCOPE)
+  const scope = scopeFrom(ctx)
+  const address = addressFrom(ctx, scope.chain)
+  const done = deps.lifecycle.track()
+  try {
+    // No fallback, for a sharper reason than the two routes above have. A defaulted `[]` would not
+    // be a wrong number, it would be a wrong FACT — "this address holds nothing" — and the caller
+    // would either refuse a funded withdrawal or, worse, build a transaction that spends only part
+    // of what it should and sends the rest to a change output it computed from the same short list.
+    return { status: 200, body: await deps.custody.outpoints(scope, address) }
   } finally {
     done()
   }

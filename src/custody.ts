@@ -164,9 +164,11 @@ import {
   headBlock,
   nextUnfinishedBackfill,
   partialFromHeight,
+  unspentOutpoints,
   unspentOutputTotals,
   type AddressHistory,
   type CustodyAddress,
+  type UnspentOutpoint,
 } from './store.ts'
 import { toBlockParam, type RpcCaller } from './tokenstate.ts'
 
@@ -334,6 +336,62 @@ export interface CustodyAddressObservation {
   readonly observedAt: string
 }
 
+/** One unspent output, named the way a bitcoin-family transaction names its input. */
+export interface CustodyOutpoint {
+  readonly txid: string
+  readonly vout: number
+  /** Smallest units, decimal string — never a JSON number. See the observation's header. */
+  readonly amount: string
+  readonly blockHeight: number
+}
+
+/**
+ * Which outpoints an address may still hold, at a proved confirmed height.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * `micro-settlement` needs this because it cannot ask the node. Both bitcoind and litecoind run
+ * with `disablewallet=1` — the correct configuration for a node that is not a custodian — and
+ * `listunspent` is a *wallet* RPC, so on the estate's own nodes it is `-32601 Method not found`.
+ * That single missing method is the whole reason no BTC or LTC withdrawal can be built today
+ * (micro-org#382).
+ *
+ * **The indexer proposes; the node disposes.** This answer is not authority to spend. It is the
+ * set of outpoints that, according to a record proved contiguous to the confirmed height, have not
+ * been seen spent. Settlement re-reads every one of them with `gettxout` — which exists on a
+ * wallet-less node, returns null for an output already spent, and is the party that actually knows
+ * — and drops any the node no longer serves. So the failure this side can cause is a list that is
+ * too LONG, and a too-long list is caught downstream. A list that is too SHORT is the dangerous
+ * one: it is indistinguishable from an address that has been swept, and settlement would build a
+ * smaller transaction or refuse a withdrawal that is fully funded. That asymmetry is why every
+ * fault the balance route can raise is raised here too, rather than answering a shorter list.
+ *
+ * **`amount` is informational.** Settlement signs against the value `gettxout` serves, not this
+ * one, because the value that goes into a signature must come from the party that will validate
+ * the signature. It is carried so an operator can read the list and so selection can order
+ * candidates without a round trip per outpoint.
+ *
+ * A decimal string rather than a number, like every other amount this service serves: a satoshi
+ * value near the 21M-coin supply cap is 2.1e15, which is inside IEEE 754's integer range today and
+ * is one JSON parser away from not being. Nothing on the wire is worth that risk.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export interface CustodyAddressOutpoints {
+  readonly chain: string
+  readonly network: string
+  readonly assetCode: string
+  readonly decimals: number
+  /** Canonical for the family, as the caller sent it. */
+  readonly address: string
+  /** Ordered amount DESC, then txid ASC, then vout ASC. Empty is a measured empty, not a fault. */
+  readonly outpoints: readonly CustodyOutpoint[]
+  readonly requiredConfirmations: number
+  readonly observedAtBlock: number
+  readonly observedAtBlockHash: string
+  readonly headHeight: number
+  readonly tipHeight: number | null
+  readonly observedAt: string
+}
+
 export interface CustodyObserver {
   /** Resolves with a total, or throws. It never resolves with an incomplete one. */
   total(scope: ChainScope): Promise<CustodyTotalObservation>
@@ -345,6 +403,12 @@ export interface CustodyObserver {
    * the exact ordering — watch, then measure — whose window this call exists to close.
    */
   balance(scope: ChainScope, address: string): Promise<CustodyAddressObservation>
+  /**
+   * One named address's unspent outpoints, at the same confirmed height `balance` reads at, on the
+   * bitcoin family only. Every other family refuses with `family_not_supported`: an account-model
+   * chain has no outpoints to list, and answering `[]` there would be a lie shaped like an answer.
+   */
+  outpoints(scope: ChainScope, address: string): Promise<CustodyAddressOutpoints>
 }
 
 export interface CustodyObserverDeps {
@@ -643,6 +707,59 @@ export function rpcCustodyObserver(deps: CustodyObserverDeps): CustodyObserver {
         observedAt: new Date().toISOString(),
       }
     },
+
+    async outpoints(scope, address) {
+      const anchor = await confirmedAnchor(deps, scope)
+      const { caller, at } = anchor
+
+      if (!DERIVED_FAMILIES.has(anchor.family)) {
+        // Before the anchor would also be defensible; after it is better. `confirmedAnchor` is what
+        // distinguishes "this chain has no outpoints" from "this chain is not followed here at
+        // all", and a caller that gets `family_not_supported` for a chain the estate does not index
+        // would go and look for a bitcoin implementation that was never the problem.
+        throw new CustodyTotalUnavailableError(
+          'family_not_supported',
+          `${scopeKey(scope)} is ${anchor.family}, which has no outpoints — an account-model ` +
+            'chain holds a balance, not a set of spendable outputs',
+        )
+      }
+
+      // The same claim the balance route reads, and read the same way: an unwatched address has
+      // made no claim, an absent claim is "no activity below height 0", and `assertDerivable`
+      // turns that into a proof on a genesis-walked chain and a refusal on a cold-started one.
+      const [watched] = await custodyAddressHistory(deps.sql, scope, [address])
+      const entries = [{ address, historyFromHeight: watched?.historyFromHeight ?? null }]
+      await assertDerivable(deps, scope, anchor, entries)
+      const found = await unspentOutpoints(deps.sql, scope, address, at)
+
+      // The closing hash check, for the reason `total` and `balance` make it: the list was read at
+      // a height, and a reorg between the two proofs means it describes a chain that no longer
+      // exists. Coin on an orphaned fork is the one thing a coin selector must never be handed —
+      // it would build a transaction whose inputs cannot be found, and every later attempt would
+      // rebuild it from the same phantom.
+      await assertNodeAgrees(caller, anchor.family, at, anchor.hash)
+
+      const asset = assetOf(scope.chain)
+      return {
+        chain: scope.chain,
+        network: scope.network,
+        assetCode: asset,
+        decimals: chainSpec(asset).decimals,
+        address,
+        outpoints: found.map((one: UnspentOutpoint) => ({
+          txid: one.txid,
+          vout: one.vout,
+          amount: one.amount.toString(),
+          blockHeight: one.blockHeight,
+        })),
+        requiredConfirmations: anchor.confirmations,
+        observedAtBlock: at,
+        observedAtBlockHash: anchor.hash,
+        headHeight: anchor.headHeight,
+        tipHeight: anchor.tipHeight,
+        observedAt: new Date().toISOString(),
+      }
+    },
   }
 }
 
@@ -678,12 +795,38 @@ async function assertNodeAgrees(
 }
 
 /**
- * Σ balance over a set, DERIVED from this service's own record, and the two proofs that entitle it
- * to be called a balance at all.
+ * Σ balance over a set, DERIVED from this service's own record.
+ *
+ * The sum itself is one query (`store.unspentOutputTotals`) and is the easy part. What makes the
+ * number true is `assertDerivable` below, which runs first and is shared with every other reading
+ * taken from the same rows.
+ */
+async function deriveBalances(
+  deps: CustodyObserverDeps,
+  scope: ChainScope,
+  anchor: ConfirmedAnchor,
+  entries: readonly AddressHistory[],
+): Promise<Map<string, bigint>> {
+  await assertDerivable(deps, scope, anchor, entries)
+  return await unspentOutputTotals(
+    deps.sql,
+    scope,
+    entries.map((entry) => entry.address),
+    anchor.at,
+  )
+}
+
+/**
+ * The three proofs that entitle a reading derived from this service's own record to be believed.
  *
  * ══════════════════════════════════════════════════════════════════════════════════════════════
- * The sum itself is one query (`store.unspentOutputTotal`) and is the easy part. What makes the
- * number true is what is checked before it:
+ * Split out of `deriveBalances` when a second derived reading appeared — the unspent OUTPOINTS a
+ * bitcoin-family address holds, for `micro-settlement`'s coin selection (micro-org#382). It is one
+ * function rather than two copies because the copies would diverge, and the direction they would
+ * diverge in is the dangerous one: a list that is short reads downstream as an address that has
+ * been swept, and nothing on the far side can tell the two apart. The sum has the same problem and
+ * has always had these guards; the list is not entitled to fewer of them.
+ *
  *
  * **1. Contiguous canonical coverage from `lo` to the confirmed height.** A hole loses receipts
  * (understates → positive drift) and loses spends (overstates → negative drift), with nothing
@@ -714,12 +857,12 @@ async function assertNodeAgrees(
  * `backfill_in_flight`.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
-async function deriveBalances(
+async function assertDerivable(
   deps: CustodyObserverDeps,
   scope: ChainScope,
   anchor: ConfirmedAnchor,
   entries: readonly AddressHistory[],
-): Promise<Map<string, bigint>> {
+): Promise<void> {
   const coverage = await canonicalCoverage(deps.sql, scope, anchor.at)
   const lo = coverage.lowestHeight
   if (lo === null || coverage.highestHeight === null) {
@@ -771,7 +914,8 @@ async function deriveBalances(
       'backfill_in_flight',
       `${rescan.stream} on ${scopeKey(scope)} has reached ${rescan.height ?? 'nothing'} of ` +
         `${rescan.rangeTo} and covers blocks at or below the confirmed height ${anchor.at} — the ` +
-        'record it is rewriting is the record this total sums, so the total is not yet a total',
+        'record it is rewriting is the record this reading is derived from, so the reading is not ' +
+        'yet a reading',
     )
   }
   for (const entry of entries) {
@@ -788,12 +932,6 @@ async function deriveBalances(
       )
     }
   }
-  return await unspentOutputTotals(
-    deps.sql,
-    scope,
-    entries.map((entry) => entry.address),
-    anchor.at,
-  )
 }
 
 /**

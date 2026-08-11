@@ -1086,3 +1086,162 @@ test('a node serving a different chain at the confirmed height is a refusal, not
   const { caller } = ltcCaller({ hashAt: (h) => (h === LTC_AT ? `0x${'e'.repeat(64)}` : hashAt(h)) })
   await assertRefusal(() => ltcObserver(caller).total(LTC), 'head_diverged')
 })
+
+/* --------------------------------------- the coins, not the sum (micro-org#382) */
+
+test('the outpoint list is the balance, itemised — and refuses everywhere the balance does', { skip }, async () => {
+  // `micro-settlement` cannot ask the node which coins an address holds: bitcoind and litecoind
+  // both run `disablewallet=1`, so `listunspent` is `-32601 Method not found`, and no BTC or LTC
+  // withdrawal can be built without this route (micro-org#382). It is the same derivation as the
+  // balance beside it, behind the same anchor and the same three proofs, and this test is where
+  // "the same" stops being a claim in a comment.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 900n)
+  await fund(11, 'tx-b', 0, 'ltc1qbb', 100n)
+  await spend(12, 'tx-spend', 'tx-a', 0)
+  await fund(13, 'tx-c', 2, 'ltc1qaa', 250n)
+  await fund(14, 'tx-d', 1, 'ltc1qaa', 700n)
+  // Above the confirmed height, and therefore not offered. A coin at the head has not reached the
+  // depth this platform requires; handing it to a selector would build a transaction whose input
+  // a one-block reorg erases, and the confirmation policy would exist only in the balance.
+  await fund(LTC_AT + 1, 'tx-fresh', 0, 'ltc1qaa', 5_000n)
+
+  const observed = await ltcObserver(ltcCaller().caller).outpoints(LTC, 'ltc1qaa')
+  // Largest first, so a selector taking a prefix builds the smallest transaction: a bitcoin fee is
+  // paid per byte and every extra input is ~68 more of them.
+  assert.deepEqual(observed.outpoints, [
+    { txid: 'tx-d', vout: 1, amount: '700', blockHeight: 14 },
+    { txid: 'tx-c', vout: 2, amount: '250', blockHeight: 13 },
+  ])
+  // Amounts are STRINGS, exactly as every other amount this service serves is. A satoshi value
+  // near the 21M-coin cap is 2.1e15 — inside IEEE 754 today, one JSON parser away from not being.
+  assert.equal(
+    observed.outpoints.every((one) => typeof one.amount === 'string'),
+    true,
+  )
+  // The SAME height and hash as the balance, taken from the same anchor. Two readings about one
+  // address at two heights would let a caller see a balance it then cannot spend.
+  const balance = await ltcObserver(ltcCaller().caller).balance(LTC, 'ltc1qaa')
+  assert.equal(observed.observedAtBlock, balance.observedAtBlock)
+  assert.equal(observed.observedAtBlockHash, balance.observedAtBlockHash)
+  assert.equal(observed.requiredConfirmations, LTC_CONFIRMATIONS)
+  assert.equal(observed.assetCode, 'LTC')
+  assert.equal(observed.address, 'ltc1qaa')
+  // And they agree about the money, which is the property the whole design rests on: settlement
+  // must never be shown a balance it cannot itemise, nor coins that do not add up to it.
+  assert.equal(
+    observed.outpoints.reduce((acc, one) => acc + BigInt(one.amount), 0n).toString(),
+    balance.balance,
+  )
+})
+
+test('an address with nothing to spend is an empty list, and that is an ANSWER', { skip }, async () => {
+  // The one place an empty list is legitimate: the record is whole, the address is claimed from
+  // genesis, and its coin has genuinely all been spent. Refusing here would freeze a withdrawal
+  // from a different address in the same batch, so the distinction has to be real in both
+  // directions — an empty answer where the proofs hold, a refusal where they do not.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 900n)
+  await spend(12, 'tx-spend', 'tx-a', 0)
+
+  const observed = await ltcObserver(ltcCaller().caller).outpoints(LTC, 'ltc1qaa')
+  assert.deepEqual(observed.outpoints, [])
+  assert.equal(observed.observedAtBlock, LTC_AT)
+})
+
+test('every proof the balance makes, the outpoint list makes too', { skip }, async () => {
+  // THE ASYMMETRY THIS TEST EXISTS FOR. A balance that is too low freezes a withdrawal, which is
+  // loud. A coin list that is too short is SILENT: it is indistinguishable from an address that
+  // has been swept, and settlement acts on it by building a smaller transaction — spending part of
+  // the address's coin and sending the remainder to change. So the list may not be entitled to
+  // fewer proofs than the sum, and each case below is a state in which the query would have
+  // succeeded and returned too few rows.
+  const observe = (): CustodyObserver => ltcObserver(ltcCaller().caller)
+  const outpointsOf = (): Promise<unknown> => observe().outpoints(LTC, 'ltc1qaa')
+
+  // 1. A record with a HOLE in it. The missing blocks may hold this address's receipts.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 900n)
+  await sql`delete from blocks where chain = 'ltc' and network = 'testnet' and height = 40`
+  await assertRefusal(outpointsOf, 'history_not_walked')
+
+  // 2. A COLD-STARTED record under an address nobody has vouched for. Coin it received before the
+  //    first walked block is invisible here, and invisible reads as spent.
+  await sql`delete from blocks where chain = 'ltc' and network = 'testnet'`
+  await sql`delete from checkpoints where chain = 'ltc' and network = 'testnet'`
+  await walkLtc(20, LTC_HEAD)
+  await assertRefusal(outpointsOf, 'history_unknown')
+
+  // 3. A BACKFILL rewriting blocks below the confirmed height. Contiguity holds throughout and the
+  //    rows are half written — the one way a hole hides from a contiguity check.
+  await sql`delete from blocks where chain = 'ltc' and network = 'testnet'`
+  await sql`delete from checkpoints where chain = 'ltc' and network = 'testnet'`
+  await walkLtc(0, LTC_HEAD)
+  await upsertBlock(sql, LTC, {
+    height: 30,
+    hash: hashAt(30),
+    parentHash: hashAt(29),
+    blockTime: new Date(1_700_000_000_000),
+    txCount: 0,
+    detail: { partial: 'watched-addresses-only' },
+  })
+  await ensureBackfill(sql, LTC, 10, 50)
+  await assertRefusal(outpointsOf, 'backfill_in_flight')
+  await setCheckpoint(sql, LTC, 'backfill:10-50', 50, hashAt(50))
+
+  // 4. A node that no longer serves the chain these rows describe. The list is read from this
+  //    service's own record, so this closing check is the only thing that asks whether the record
+  //    is still about the chain that exists — and coin on an orphaned fork is the single worst
+  //    input a selector can be handed, because every rebuild produces the same unbroadcastable
+  //    transaction.
+  const { caller } = ltcCaller({ hashAt: (h) => (h === LTC_AT ? `0x${'e'.repeat(64)}` : hashAt(h)) })
+  await assertRefusal(() => ltcObserver(caller).outpoints(LTC, 'ltc1qaa'), 'head_diverged')
+})
+
+test('a reorg landing BETWEEN the two proofs takes the coin list with it', { skip }, async () => {
+  // The opening check cannot see this and the query cannot either: the rows are read from this
+  // service's own record, so a chain that changes underneath them produces a list that looks
+  // completely ordinary. Only the CLOSING check can tell, and here it is the difference between
+  // refusing and handing a selector coin that exists on an orphaned fork — inputs no node will
+  // accept, in a transaction every retry will rebuild identically.
+  await walkLtc(0, LTC_HEAD)
+  await watchAddress(sql, LTC, 'ltc1qaa', 'deposit:u-1')
+  await fund(10, 'tx-a', 0, 'ltc1qaa', 900n)
+
+  // Honest on the opening proof, a different chain by the closing one.
+  let asked = 0
+  const caller: RpcCaller = {
+    async call<T>(method: string, params?: readonly unknown[]): Promise<T> {
+      assert.equal(method, 'getblockhash')
+      asked += 1
+      const height = Number(params?.[0] ?? -1)
+      return (asked > 1 && height === LTC_AT ? `0x${'9'.repeat(64)}` : hashAt(height)) as T
+    },
+  }
+  await assertRefusal(() => ltcObserver(caller).outpoints(LTC, 'ltc1qaa'), 'head_diverged')
+  // Twice, not once: the opening proof passed and the closing one is what caught it.
+  assert.equal(asked, 2)
+})
+
+test('an account-model chain is refused rather than answered with an empty list', { skip }, async () => {
+  // EMBER has no outpoints — there is nothing to list, and `[]` would be a lie shaped like an
+  // answer: a caller reading it would conclude the address holds no spendable coin. 501 upstream,
+  // because no amount of waiting makes an account chain grow a UTXO set.
+  await walkChain()
+  const chain = honestChain()
+  await watchAddress(sql, SCOPE, '0xaa', 'deposit:u-1')
+  await assertRefusal(
+    () => observer(chain).outpoints(SCOPE, '0xaa'),
+    'family_not_supported',
+  )
+
+  // The refusal is taken AFTER the anchor, deliberately. On a chain this replica does not follow
+  // at all the answer is `chain_not_followed`, not `family_not_supported` — a caller told the
+  // family is unsupported would go looking for a bitcoin implementation that was never missing.
+  await sql`delete from blocks where chain = 'ember' and network = 'testnet'`
+  await sql`delete from checkpoints where chain = 'ember' and network = 'testnet'`
+  await assertRefusal(() => observer(chain).outpoints(SCOPE, '0xaa'), 'nothing_indexed')
+})
