@@ -36,7 +36,7 @@ told to the whole network and invites connection attempts that can only time out
 peers sync perfectly well through NAT — the node simply gets fewer peers and serves none. That is
 the correct trade here, not a limitation being worked around.
 
-## `blocksonly=1` — do not accept transaction relay
+## `blocksonly` — on bitcoind and dogecoind, off on litecoind
 
 **A deposit is credited at a confirmation depth and never at zero.** `contracts-chain` sets that
 depth and `wallet` re-checks it independently; nothing in this estate acts on an unconfirmed
@@ -47,6 +47,30 @@ node absolutely.
 Our own outgoing transactions are unaffected: `sendrawtransaction` still relays a transaction the
 node itself submits. Turning this off buys zero-confirmation visibility that the estate has decided
 it does not want, and pays for it in the one resource that is genuinely scarce on this box.
+
+**That argument assumes nothing builds blocks, and on 2026-08-09 something started.** micro-pool
+asks litecoind for `getblocktemplate`, and a node with no mempool has nothing to put in a template.
+Measured in litecoind's own debug log while `blocksonly=1` was still set:
+
+```
+CreateNewBlock(): block weight: 1188 txs: 0 fees: 0
+```
+
+Every block the pool could have found would have collected the subsidy and no fees at all — and
+nothing anywhere would have looked wrong, because an empty block is a valid block and the share
+accounting either side of it is correct. It also removed the only bound on a `getblocktemplate`
+longpoll, which ends when the tip moves *or* `mempool.GetTransactionsUpdated()` changes; the second
+cannot happen on an empty mempool, which is the mechanism behind micro-org#307. The same log after
+`blocksonly=0` on 2026-08-11, same node, same hour:
+
+```
+CreateNewBlock(): block weight: 205817 txs: 237 fees: 382472
+```
+
+So the rule is not "blocksonly is correct" but **"blocksonly is correct on a node that only
+observes"**. bitcoind and dogecoind still only observe. litecoind does not, and carries
+`maxmempool=200` to bound what it now keeps — its real mempool five minutes after the restart was
+212 transactions in 46 kB. See micro-org#377.
 
 ## `txindex=1` — maintain a transaction index, on all three
 
