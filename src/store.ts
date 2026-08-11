@@ -1075,6 +1075,105 @@ export async function unspentOutputTotals(
   return new Map(rows.map((row) => [row.address, BigInt(row.total ?? '0')]))
 }
 
+/** One unspent output, named the way a bitcoin-family transaction names its input. */
+export interface UnspentOutpoint {
+  /** The funding transaction. */
+  readonly txid: string
+  /** Which of its outputs. This is `address_activity.log_index` on a bitcoin-family credit. */
+  readonly vout: number
+  /** Smallest units. Informational to the caller — see the header. */
+  readonly amount: bigint
+  /** The height the credit was included at, which is what makes its depth computable. */
+  readonly blockHeight: number
+}
+
+/**
+ * The SAME unspent set as `unspentOutputTotals`, listed rather than summed.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **The predicate above is the predicate here, and that is the whole design of this function.**
+ * Every word of `unspentOutputTotals`'s header applies unchanged — outputs minus spent outpoints
+ * and never `in − out`, `status = 'included'` on both sides, and the two obligations it puts on
+ * its caller (a contiguous record below any activity, and a `height` at the confirmation depth)
+ * are obligations here too. It is written as a second query rather than as a `sum()` over this one
+ * because the aggregate is the number `micro-ledger` reconciles against and its cost is a single
+ * grouped scan; changing that shape to serve a caller that wants rows would move an estate-wide
+ * solvency read for the convenience of a withdrawal.
+ *
+ * **The two are proved to agree by test rather than by sharing text.** `store.test.ts` sums this
+ * list and asserts it equals `unspentOutputTotals` over a fixture that has an orphaned credit, an
+ * orphaned spend, an included spend and a credit above the height — the four ways the predicates
+ * could drift apart. A shared SQL fragment would look safer and would prove nothing.
+ *
+ * ── WHY `amount` IS INFORMATIONAL AND WHAT THE CALLER DOES WITH IT ────────────────────────────
+ *
+ * `micro-settlement` re-reads every outpoint this returns with `gettxout` before it signs anything
+ * (micro-org#382). That call is the authority on the value, the scriptPubKey and the depth, and it
+ * answers `null` for an outpoint that has been spent. So this list is a set of CANDIDATES: the
+ * indexer says which outpoints might still be ours, and the node says which of them are. A stale
+ * or over-inclusive answer here costs one wasted RPC and cannot put a coin into a transaction that
+ * does not exist.
+ *
+ * The dangerous direction is the other one — a list that is SHORT — and nothing downstream can
+ * detect it, because an address swept clean and an address whose record has a hole in it look
+ * identical from the far side. That is why the caller in `custody.ts` makes every proof the
+ * derived balance makes and refuses rather than answering a shorter list.
+ *
+ * ── ORDERING ─────────────────────────────────────────────────────────────────────────────────
+ *
+ * Largest first, then by outpoint, which is total. `micro-settlement` sorts again on the same key
+ * before it selects coins, so this is not what makes its selection deterministic — it is what
+ * makes two reads of this route a moment apart differ only when the chain differed, rather than
+ * when the planner chose a different scan.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export async function unspentOutpoints(
+  exec: Exec,
+  scope: ChainScope,
+  address: string,
+  height: number,
+): Promise<readonly UnspentOutpoint[]> {
+  const rows = await exec<
+    { txid: string; vout: number; amount: string; block_height: string }[]
+  >`
+    select credit.tx_hash as txid, credit.log_index as vout,
+           credit.amount::text as amount, credit.block_height as block_height
+      from address_activity credit
+     where credit.chain = ${scope.chain}
+       and credit.network = ${scope.network}
+       and credit.direction = 'in'
+       and credit.status = 'included'
+       and credit.asset_kind = 'native'
+       and credit.block_height <= ${height}
+       and credit.address = ${address}
+       -- An output index is what makes a credit an OUTPOINT. A native credit without one is an
+       -- account-model movement, and it would be unspendable-by-construction here: the spend
+       -- predicate below compares against null and never matches, so such a row would be listed
+       -- as unspent for ever. Excluded by name rather than by trusting the route's family gate.
+       and credit.log_index is not null
+       and not exists (
+         select 1
+           from spent_outpoints spend
+          where spend.chain = credit.chain
+            and spend.network = credit.network
+            and spend.txid = credit.tx_hash
+            and spend.vout = credit.log_index
+            and spend.status = 'included'
+            and spend.block_height <= ${height}
+       )
+     order by credit.amount desc, credit.tx_hash asc, credit.log_index asc
+  `
+  return rows.map((row) => ({
+    txid: row.txid,
+    // A bitcoin-family credit always carries its output index here — `bitcoin.ts` writes it — and
+    // the predicate above already refuses to match a spend against a null. A row that reached here
+    // with no index would be an EVM credit on a chain this route does not serve.
+    vout: Number(row.vout),
+    amount: BigInt(row.amount),
+    blockHeight: Number(row.block_height),
+  }))
+}
+
 /**
  * Which of these addresses is worth a deposit event.
  *

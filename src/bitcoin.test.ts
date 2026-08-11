@@ -604,6 +604,22 @@ test(
     assert.equal(page.items[0]?.confirmations, null, 'a retracted movement has no depth')
     assert.equal(page.items[0]?.confirmed, false)
 
+    // And through the SPENDABILITY path, which is the reading `micro-settlement` builds a
+    // withdrawal from (micro-org#382). This reorg is the only fixture here that produces an
+    // orphaned credit and an orphaned spend at once, so it is the only place the two status
+    // filters can be told apart — and they fail in opposite, both-bad directions.
+    const { unspentOutpoints } = await import('./store.ts')
+    // Alice's coin is SPENDABLE AGAIN. The transaction that spent it was orphaned, so the spend no
+    // longer happened, and a source that ignored `status` on the spend would answer an empty list
+    // — an address that visibly holds 3 BTC and cannot pay, for ever, with no error anywhere.
+    assert.deepEqual(await unspentOutpoints(db(), SCOPE, ALICE, 9), [
+      { txid: node.txidAt(7, 1), vout: 0, amount: 300_000_000n, blockHeight: 7 },
+    ])
+    // Bob's coin is GONE. The credit was orphaned, and a source that ignored `status` on the credit
+    // would hand a selector an outpoint no node will serve — every attempt to spend it rejected,
+    // and every retry rebuilding the same doomed transaction.
+    assert.deepEqual(await unspentOutpoints(db(), SCOPE, BOB, 9), [])
+
     // No new deposit event: the replacement chain paid nobody being watched.
     assert.deepEqual(await outboxTopics(), [DEPOSIT_OBSERVED])
   },
@@ -1015,6 +1031,156 @@ test(
     // spent all of it, Bob holds the two payments plus the dust from the unresolved spend.
     assert.equal(narrowed.get(ALICE) ?? 0n, 0n, 'Alice’s only output was spent at height 5')
     assert.equal(narrowed.get(BOB), 290_000_000n + 390_000_000n + 1_000n)
+  },
+)
+
+test(
+  'THE #382 AGREEMENT: the outpoint list and the balance are two readings of one fact',
+  { skip },
+  async () => {
+    // `micro-settlement` cannot ask the node which coins an address holds — bitcoind and litecoind
+    // both run `disablewallet=1`, so `listunspent` is `-32601 Method not found` — and this list is
+    // what replaces it (micro-org#382). The predicate behind it is written out a second time in
+    // `unspentOutpoints` rather than shared with `unspentOutputTotals`, because one returns rows
+    // and the other returns a sum and SQL will not factor that for us. THIS TEST IS THE PROOF THAT
+    // THE TWO COPIES AGREE, and it is the only thing standing between a divergence and a
+    // withdrawal built from coins that are already spent (too long, caught by `gettxout`
+    // downstream) or from a subset of the address's coin with the remainder silently sent to
+    // change (too short, caught by nobody).
+    const { unspentOutpoints, unspentOutputTotals } = await import('./store.ts')
+    const node = narrowingNode()
+    await watchAddress(db(), SCOPE, ALICE, 'deposit:alice')
+    await watchAddress(db(), SCOPE, BOB, 'deposit:bob')
+    await workerFor(node, { watchedAddressesOnly: true }).follow(signal())
+
+    const agreesAt = async (height: number, address: string): Promise<bigint> => {
+      const listed = await unspentOutpoints(db(), SCOPE, address, height)
+      const summed = (await unspentOutputTotals(db(), SCOPE, [address], height)).get(address) ?? 0n
+      const total = listed.reduce((acc, one) => acc + one.amount, 0n)
+      assert.equal(total, summed, `Σ outpoints ≠ balance for ${address} at ${height}`)
+      return total
+    }
+
+    // Bob holds all three payments: two at height 5, one at height 6 from the unresolved spend.
+    const bob = await unspentOutpoints(db(), SCOPE, BOB, 6)
+    assert.equal(await agreesAt(6, BOB), 290_000_000n + 390_000_000n + 1_000n)
+    // Ordered amount DESC, so a selector taking a prefix takes the fewest inputs — which is the
+    // cheapest transaction, because a bitcoin fee is paid per byte and an input is ~68 of them.
+    assert.deepEqual(
+      bob.map((one) => one.amount),
+      [390_000_000n, 290_000_000n, 1_000n],
+    )
+    // `vout` is the OUTPUT INDEX, not a row number and not a position in this list. A transaction
+    // spends `txid:vout`, so an off-by-one here signs an input that does not exist — or, worse,
+    // one that exists and belongs to somebody else.
+    assert.deepEqual(bob, [
+      { txid: node.txidAt(5, 2), vout: 0, amount: 390_000_000n, blockHeight: 5 },
+      { txid: node.txidAt(5, 1), vout: 0, amount: 290_000_000n, blockHeight: 5 },
+      { txid: node.txidAt(6, 1), vout: 0, amount: 1_000n, blockHeight: 6 },
+    ])
+
+    // Alice was paid at height 3 and spent it all at height 5. The list must go EMPTY when the
+    // spend lands — an outpoint that survives its own spend is a coin selector's worst input,
+    // because the node rejects the transaction and every retry rebuilds the identical one.
+    assert.deepEqual(await unspentOutpoints(db(), SCOPE, ALICE, 6), [])
+    assert.equal(await agreesAt(6, ALICE), 0n)
+
+    // And the height is a real cut, in both readings at once. Read at 4, Alice still holds her
+    // coin and Bob has none — which is what makes the confirmation depth mean anything: a caller
+    // must not be handed a coin that is only spendable on a chain deeper than it asked about.
+    assert.equal(await agreesAt(4, ALICE), 300_000_000n)
+    assert.deepEqual(
+      (await unspentOutpoints(db(), SCOPE, ALICE, 4)).map((one) => one.txid),
+      [node.txidAt(3, 1)],
+    )
+    assert.deepEqual(await unspentOutpoints(db(), SCOPE, BOB, 4), [])
+    assert.equal(await agreesAt(4, BOB), 0n)
+
+    // An address nobody watched: empty, and the SUM is empty too. The store layer does not hedge —
+    // that is `custody.ts`'s job, and this asserts the two layers do not both try to and disagree.
+    assert.deepEqual(await unspentOutpoints(db(), SCOPE, CAROL, 6), [])
+    assert.equal(await agreesAt(6, CAROL), 0n)
+
+    // Two rows the bitcoin writer would never produce, inserted by hand because the query has to
+    // be right about them anyway. `address_activity` is one table for eight chains, so what makes
+    // a row a spendable coin is the row's own shape and not the chain it happens to sit on.
+    await sql`
+      insert into address_activity
+        (chain, network, address, direction, asset_code, asset_kind, token_address, amount,
+         tx_hash, entry_key, log_index, block_height, block_hash)
+      values
+        -- A TOKEN credit. It is a balance, not an output; nothing can spend it as coin, and adding
+        -- it would put an outpoint in the list with no txid:vout behind it on any chain.
+        (${SCOPE.chain}, ${SCOPE.network}, ${BOB}, 'in', 'USDT', 'token',
+         ${'0x' + 'ab'.repeat(20)}, 500, ${node.txidAt(6, 1)}, 'synthetic:token', 0, 6,
+         ${node.hashAt(6)}),
+        -- A NATIVE credit with NO output index. An account-model chain writes these — it has no
+        -- outpoints at all — and a credit with no vout cannot name an input. Admitting it would
+        -- hand a selector an undefined where a number must go.
+        (${SCOPE.chain}, ${SCOPE.network}, ${BOB}, 'in', 'BTC', 'native', null, 700,
+         ${node.txidAt(6, 1)}, 'synthetic:no-vout', null, 6, ${node.hashAt(6)})
+    `
+    const after = await unspentOutpoints(db(), SCOPE, BOB, 6)
+    assert.deepEqual(after, bob, 'neither row is an outpoint, so neither may appear as one')
+    assert.equal(
+      after.every((one) => Number.isInteger(one.vout)),
+      true,
+      'every entry names a real output index — a NaN here is a transaction that cannot be built',
+    )
+  },
+)
+
+test(
+  'spending one output of a transaction does not spend the CHANGE beside it',
+  { skip },
+  async () => {
+    // The shape every withdrawal this platform sends will produce: one transaction, one output to
+    // the recipient, one output of change back to us. If a spend of `txid:0` were matched against
+    // the credit at `txid:1` — the two differ only by an output index — then the moment the first
+    // withdrawal from an address confirmed, its change would vanish from the spendable set. The
+    // address would show a balance it could never pay from, and no error would be raised anywhere:
+    // a short list is indistinguishable from a swept address. This is the single most likely way
+    // for #382's query to be wrong, and it is the one the general fixture cannot reach, because
+    // there no transaction pays one address twice.
+    const { unspentOutpoints, unspentOutputTotals } = await import('./store.ts')
+    const node = new FakeBitcoinNode()
+    node.appendMany(2)
+    // Height 3: one transaction, two outputs, both to Alice — a payment and its change.
+    node.append([
+      {
+        inputs: [node.coinbaseOutpoint(1)],
+        outputs: [
+          { address: ALICE, sats: 100_000_000n },
+          { address: ALICE, sats: 200_000_000n },
+        ],
+      },
+    ])
+    // Height 4: only vout 0 is spent. vout 1 is untouched and must survive.
+    node.append([
+      { inputs: [{ txid: node.txidAt(3, 1), vout: 0 }], outputs: [{ address: BOB, sats: 90_000_000n }] },
+    ])
+
+    await watchAddress(db(), SCOPE, ALICE, 'deposit:alice')
+    await workerFor(node, { watchedAddressesOnly: true }).follow(signal())
+
+    // Both outputs were recorded, once each — the premise, and itself worth asserting, because a
+    // writer that credited the address once would make the rest of this test vacuously pass.
+    assert.deepEqual(
+      (await unspentOutpoints(db(), SCOPE, ALICE, 3)).map((one) => [one.vout, one.amount]),
+      [
+        [1, 200_000_000n],
+        [0, 100_000_000n],
+      ],
+    )
+
+    assert.deepEqual(await unspentOutpoints(db(), SCOPE, ALICE, 4), [
+      { txid: node.txidAt(3, 1), vout: 1, amount: 200_000_000n, blockHeight: 3 },
+    ])
+    assert.equal(
+      (await unspentOutputTotals(db(), SCOPE, [ALICE], 4)).get(ALICE),
+      200_000_000n,
+      'the sum has to lose exactly the one output that was spent, and so does the list',
+    )
   },
 )
 

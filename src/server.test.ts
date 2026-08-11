@@ -18,6 +18,7 @@ import type {
 import {
   CustodyTotalUnavailableError,
   type CustodyAddressObservation,
+  type CustodyAddressOutpoints,
   type CustodyObserver,
   type CustodyTotalFault,
   type CustodyTotalObservation,
@@ -226,6 +227,31 @@ const custody: CustodyObserver = {
       tipHeight: 100,
       observedAt: '2026-01-01T00:00:00.000Z',
     } satisfies CustodyAddressObservation
+  },
+
+  async outpoints(scope, address) {
+    asked.push({ what: 'custody-outpoints', scope })
+    // Same armed fault again. The property this layer owns is that a refusal reaches the wire as a
+    // non-200 — and for THIS route the alternative is not a wrong number but a wrong fact, an
+    // empty list that reads as "this address has been swept".
+    if (custodyFault) throw new CustodyTotalUnavailableError(custodyFault, `armed: ${custodyFault}`)
+    return {
+      chain: scope.chain,
+      network: scope.network,
+      assetCode: 'EMBER',
+      decimals: 18,
+      address,
+      outpoints: [
+        { txid: 'a'.repeat(64), vout: 1, amount: '600000000000000000', blockHeight: 30 },
+        { txid: 'b'.repeat(64), vout: 0, amount: '100000000000000000', blockHeight: 31 },
+      ],
+      requiredConfirmations: 60,
+      observedAtBlock: 39,
+      observedAtBlockHash: HASH,
+      headHeight: 98,
+      tipHeight: 100,
+      observedAt: '2026-01-01T00:00:00.000Z',
+    } satisfies CustodyAddressOutpoints
   },
 }
 
@@ -799,6 +825,95 @@ test('an address balance refuses exactly as the total does — never a 200, neve
   assert.equal((await call(path, { token: 'reader' })).status, 200)
 })
 
+/* --------------------------------------- the coins a withdrawal is built from */
+
+test('an address’s outpoints are served behind indexer:read, as strings, in the order given', async () => {
+  // Gated for a harder reason than the balance beside it: this answer becomes the INPUT SET of a
+  // signed transaction. A caller without the grant must build nothing at all.
+  const path = `/custody/ember/testnet/addresses/${ADDRESS}/outpoints`
+  assert.equal((await call(path)).status, 401)
+  assert.equal((await call(path, { token: 'unscoped' })).status, 403)
+  assert.equal((await call(path, { token: 'player' })).status, 403)
+
+  const answer = await call(path, { token: 'reader' })
+  assert.equal(answer.status, 200)
+  const outpoints = answer.body['outpoints'] as Record<string, unknown>[]
+  assert.equal(outpoints.length, 2)
+  // Amounts are STRINGS on the wire. A satoshi value near the 21M-coin cap is 2.1e15 — inside
+  // IEEE 754's exact integer range today and one JSON parser away from not being — and this list
+  // is what a coin selector adds up.
+  assert.equal(typeof outpoints[0]!['amount'], 'string')
+  assert.equal(outpoints[0]!['amount'], '600000000000000000')
+  // `vout` and `blockHeight` are numbers: an output index and a height are small and bounded, and
+  // a caller has to do arithmetic on both.
+  assert.equal(typeof outpoints[0]!['vout'], 'number')
+  assert.equal(typeof outpoints[0]!['blockHeight'], 'number')
+  // Order is carried through untouched — the observer sorts amount DESC so a selector can take a
+  // prefix, and a transport that re-sorted would silently change which coins get spent.
+  assert.deepEqual(
+    outpoints.map((one) => one['txid']),
+    ['a'.repeat(64), 'b'.repeat(64)],
+  )
+  // Same proved height and depth as the balance route. Two readings about one address taken at
+  // different heights would let a caller check a balance it cannot then spend.
+  assert.equal(answer.body['observedAtBlock'], 39)
+  assert.equal(answer.body['requiredConfirmations'], 60)
+  assert.equal(answer.body['address'], ADDRESS.toLowerCase())
+})
+
+test('outpoints refuse rather than answer a shorter list', async () => {
+  const path = `/custody/ember/testnet/addresses/${ADDRESS}/outpoints`
+  // `history_not_walked` and `backfill_in_flight` are the two that matter most here: both are
+  // states in which the query would SUCCEED and return fewer rows than exist. A 200 carrying that
+  // list is indistinguishable from a swept address, and a caller acting on it would either refuse
+  // a funded withdrawal or spend a subset and send the remainder to a change output computed from
+  // the same short list.
+  for (const code of [
+    'history_not_walked',
+    'backfill_in_flight',
+    'history_unknown',
+    'head_diverged',
+    'chain_halted',
+  ] as CustodyTotalFault[]) {
+    custodyFault = code
+    const answer = await call(path, { token: 'reader' })
+    assert.equal(answer.status, 503, `${code} must answer 503`)
+    assert.equal((answer.body['error'] as Record<string, string>)['code'], code)
+    assert.equal(answer.body['outpoints'], undefined)
+    // Never a 404 and never a 200 with `[]` — both are "this address holds nothing" wearing a
+    // different hat.
+    assert.notEqual(answer.status, 404)
+  }
+  // A family with no outpoints is 501, not 503: no amount of waiting makes an account-model chain
+  // grow a UTXO set, and a caller that retried a 503 for ever would never learn that.
+  custodyFault = 'family_not_supported'
+  const unsupported = await call(path, { token: 'reader' })
+  assert.equal(unsupported.status, 501)
+  assert.equal(
+    (unsupported.body['error'] as Record<string, string>)['code'],
+    'family_not_supported',
+  )
+  custodyFault = null
+  assert.equal((await call(path, { token: 'reader' })).status, 200)
+})
+
+test('the outpoints suffix does not collide with the balance route', async () => {
+  // Both patterns start `/custody/:chain/:network/addresses/:address`, and a matcher that let
+  // `:address` swallow a slash would serve a BALANCE to a caller that asked for outpoints — a 200
+  // with no `outpoints` key, which a lenient client reads as an empty set.
+  asked.length = 0
+  const answer = await call(`/custody/ember/testnet/addresses/${ADDRESS}/outpoints`, {
+    token: 'reader',
+  })
+  assert.equal(answer.status, 200)
+  assert.ok(Array.isArray(answer.body['outpoints']))
+  assert.equal(answer.body['balance'], undefined)
+  assert.deepEqual(
+    asked.map((one) => one.what),
+    ['custody-outpoints'],
+  )
+})
+
 test('a malformed address is refused before any provider is asked', async () => {
   const answer = await call('/custody/ember/testnet/addresses/nonsense', { token: 'reader' })
   assert.equal(answer.status, 400)
@@ -822,6 +937,7 @@ test('the served route table is exactly this, in both spellings', () => {
       'GET /v1/tokens/:chain/:network/:address',
       'GET /v1/custody/:chain/:network/total',
       'GET /v1/custody/:chain/:network/addresses/:address',
+      'GET /v1/custody/:chain/:network/addresses/:address/outpoints',
       'GET /v1/blocks/:chain/:network/:height',
       'POST /v1/watch/:chain/:network/:address',
       'POST /v1/backfills/:chain/:network',
@@ -833,6 +949,7 @@ test('the served route table is exactly this, in both spellings', () => {
       'GET /tokens/:chain/:network/:address',
       'GET /custody/:chain/:network/total',
       'GET /custody/:chain/:network/addresses/:address',
+      'GET /custody/:chain/:network/addresses/:address/outpoints',
       'GET /blocks/:chain/:network/:height',
       'POST /watch/:chain/:network/:address',
       'POST /backfills/:chain/:network',
