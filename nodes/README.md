@@ -89,14 +89,16 @@ the reachable surface is *reading chain data* and *relaying a transaction that w
 else*. **`custody` holds every private key and always will**; this node must never be given one.
 Without `disablewallet`, RPC reachability changes from an inconvenience into a way to spend money.
 
-**dogecoind does not have it, and that is a known gap rather than a decision.** `dogecoin.conf`
-carries `disablewallet=0`. Measured on 2026-08-11 the wallet holds nothing — `getbalance`
-0.00000000, `txcount` 0, a keypool dating from 2025-01-10 — so it is inherited, not funded, and
-`custody` still holds every key that matters. It is recorded instead of flipped because flipping it
-is a restart and wants a check first: the obvious reason to keep a wallet is merge mining, and
-`auxtemplate.ts` calls `createauxblock(payoutAddress)` with the pool's own address rather than the
-wallet-backed `getauxblock()`, which suggests it is not needed — but that is read from code and not
-proved against a wallet-less daemon. The conf file says the same thing at the line itself.
+**All three daemons have it as of 2026-08-11.** dogecoind was the exception, and micro-org#374
+closed the gap the honest way round: it asked for proof before a restart, because the one plausible
+reason to keep a wallet on a Dogecoin node is merge mining. A scratch regtest dogecoind 1.14.9 was
+mined to height 250 so AuxPoW was active, then restarted with `disablewallet=1` and its `wallet.dat`
+moved aside. `getwalletinfo` answered `-32601 Method not found`, and `createauxblock <address>`
+answered in full — hash, chainid 98, previousblockhash, coinbasevalue, bits, height, target — with
+`submitauxblock` present and validating. The only call that stops working is the wallet-backed
+`getauxblock()`, which answers `-12 Keypool ran out`; `auxtemplate.ts` has never used it. The live
+node's inherited wallet held nothing (balance 0, txcount 0, keypool dated 2025-01-10) and was moved
+to `wallet.dat.aside` rather than deleted.
 
 ## `rpcbind` scoped to bridge gateways, never `0.0.0.0`
 
