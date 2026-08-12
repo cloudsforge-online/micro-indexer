@@ -118,6 +118,16 @@ interface RawTx {
   readonly input?: string
 }
 
+/**
+ * A block as `eth_getBlockByNumber` returns it.
+ *
+ * The named fields are the ones this file reads and reasons about. The index signature is the
+ * other half of the type and it is deliberate: an EVM header carries whatever the chain's rules
+ * put in it — `stateRoot`, `receiptsRoot`, `logsBloom`, `extraData`, `mixHash`, `nonce`,
+ * `baseFeePerGas` on a London chain, `withdrawalsRoot` after Shanghai — and this service does not
+ * get to decide which of them a reader is allowed to see. Naming a subset here is what made
+ * `extractBlock` narrow the header down to four fields for a year; see `headerDetail`.
+ */
 interface RawBlock {
   readonly number: string
   readonly hash: string
@@ -128,6 +138,7 @@ interface RawBlock {
   readonly gasUsed?: string
   readonly gasLimit?: string
   readonly difficulty?: string
+  readonly [field: string]: unknown
 }
 
 interface RawLog {
@@ -246,6 +257,80 @@ export function normaliseAddress(value: string | null | undefined): string | nul
 
 /* ------------------------------------------------------------------ extraction */
 
+/**
+ * The key holding the block body, and the only key the header record drops.
+ *
+ * `eth_getBlockByNumber(height, true)` returns the transactions inline. They are not header
+ * fields, they are already rows in `transactions` with their receipts resolved, and a copy of them
+ * inside `blocks.detail` would put the largest object this service handles into a jsonb column
+ * twice.
+ */
+const BLOCK_BODY_KEY = 'transactions'
+
+/**
+ * The header, as the node gave it.
+ *
+ * ## What this replaces, and why the replacement is a whole-object copy rather than a longer list
+ *
+ * Until micro-org#395 this was four hand-picked keys: `miner`, `gasUsed`, `gasLimit`,
+ * `difficulty`. Everything else the node sent was discarded at the point of extraction and never
+ * reached the database, so no consumer could recover it and no read route could serve it.
+ *
+ * The field that made the omission matter is **`stateRoot`**. On an account-model chain a premine
+ * lives in the genesis *allocation* — in state — and the header commits to it, so `stateRoot` on
+ * block 0 is the only cryptographic evidence that nobody was funded before the first block was
+ * mined (`hearth/node/src/chain/genesis.js` says exactly this at the alloc). EMBER's genesis
+ * answers `0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421`, the canonical
+ * empty-trie root. `micro-explorer-web` renders `detail` verbatim under a heading reading "the
+ * header, exactly as the node gave it" — so a curated list here was that page's promise being
+ * broken one service away from the page making it.
+ *
+ * A LONGER hand-picked list would have been the same defect with a later expiry date. Every field
+ * added to the EVM header since this file was written — `baseFeePerGas`, `withdrawalsRoot`,
+ * `blobGasUsed`, `excessBlobGas`, `parentBeaconBlockRoot` — arrived after somebody had already
+ * decided what the interesting fields were, and the same is true of whatever a chain adds next.
+ * The only list that cannot go stale is the node's own.
+ *
+ * ## Insertion order is the node's, and that is load-bearing
+ *
+ * `JSON.parse` preserves object key order for non-numeric keys and `postgres` serialises this
+ * object as it stands, so the order the node used survives as far as the INSERT. It does not
+ * survive the column: `blocks.detail` is `jsonb` (migration 3), and jsonb stores keys sorted by
+ * length and then bytewise. **So the order a reader gets back is jsonb's, not the node's**, and no
+ * amount of care in this function changes that — a `json` column would preserve it and would also
+ * cost migration 8's `detail->>'partial'` index, which is a working guarantee traded for a
+ * cosmetic one.
+ *
+ * What this function guarantees is the property that was actually broken: no field is dropped,
+ * renamed or reinterpreted. Restoring a readable order is a display concern and is done in
+ * `micro-explorer-web`, by SORTING the keys it is given — never by selecting from them, which is
+ * the mistake this change exists to undo.
+ *
+ * ## Nothing is normalised, including `miner`
+ *
+ * The old code lower-cased `miner` through `normaliseAddress`. That is correct for the columns
+ * this service matches on — `where address = $1` must not miss because of EIP-55 casing — and it
+ * is wrong here, because this record's entire value is that it can be held up against `curl`
+ * output and compared. `address_activity` and `transactions` still normalise; that is where
+ * matching happens. This is the record, not the index.
+ *
+ * ## What it costs
+ *
+ * A full EVM header is ~1.4 kB of JSON against ~150 B for the four fields, and `logsBloom` alone
+ * is 514 of those bytes. On EMBER mainnet's 13,946 blocks that is ~20 MB. On a chain with millions
+ * of indexed blocks it is gigabytes, and an operator who follows one should know that before
+ * turning it on rather than from a disk alert — the same cost argument migration 8 makes for
+ * `address_activity`.
+ */
+export function headerDetail(raw: RawBlock): Record<string, unknown> {
+  const detail: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === BLOCK_BODY_KEY) continue
+    detail[key] = value
+  }
+  return detail
+}
+
 export interface ExtractedBlock {
   readonly block: BlockInput
   readonly transactions: readonly TransactionInput[]
@@ -284,12 +369,7 @@ export function extractBlock(
     // EVM timestamps are seconds. Milliseconds would put every block in 1970.
     blockTime: new Date(hexToNumber(raw.timestamp) * 1_000),
     txCount: rawTxs.length,
-    detail: {
-      miner: normaliseAddress(raw.miner),
-      gasUsed: raw.gasUsed ?? null,
-      gasLimit: raw.gasLimit ?? null,
-      difficulty: raw.difficulty ?? null,
-    },
+    detail: headerDetail(raw),
   }
 
   const transactions: TransactionInput[] = []

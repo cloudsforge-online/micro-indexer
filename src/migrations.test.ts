@@ -192,6 +192,7 @@ test('the checksum of every released migration is the one it shipped with', () =
     7: 'be00dd76',
     8: '28e40f2c',
     9: 'a3b213a5',
+    10: '59a363f7',
   }
   for (const m of MIGRATIONS) {
     assert.equal(
