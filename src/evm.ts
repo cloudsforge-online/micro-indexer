@@ -67,6 +67,8 @@ import {
   DEPOSITS_CONFIRMED_TOTAL,
   DEPOSITS_OBSERVED_TOTAL,
   DIFFICULTY,
+  DOMINANT_MINER_SHARE,
+  EASED_BLOCKS_WINDOW,
   LAG_BLOCKS,
   REORGS_TOTAL,
   TIP_HEIGHT,
@@ -86,6 +88,7 @@ import {
   insertReorg,
   isHalted,
   markConfirmed,
+  minerWindow,
   nextUnfinishedBackfill,
   orphanAbove,
   pendingConfirmations,
@@ -227,6 +230,45 @@ export function difficultyGaugeValue(raw: string | null | undefined): number | n
   }
   if (parsed <= 0n) return null
   return Number(parsed)
+}
+
+/** The window the two micro-org#451 gauges are computed over. */
+export const MINER_WINDOW = 100
+
+/**
+ * The two micro-org#451 Phase-0 numbers, from a newest-first slice of canonical blocks.
+ *
+ * `dominantShare` — the busiest single coinbase's share of the window, 0..1. Blocks with no
+ * `miner` field (a chain that has none, a header from before micro-org#395 widened `detail`)
+ * count in the DENOMINATOR: a window this service cannot attribute must read as "nobody is
+ * dominant", never as 1.0 because the one attributable block happened to have a miner.
+ *
+ * `easedBlocks` — blocks whose difficulty is less than a QUARTER of their parent's. That is the
+ * signature of the hearth#13 emergency easement and of nothing else: the LWMA's per-block step is
+ * bounded by its 60-block window (one sample is ~3% of the weight), so no honest retarget moves
+ * 4x in one block, and the easement — a cliff to the floor from 55x above it, measured
+ * 2026-08-12 — always does. Written this way so this service imports NO constant from hearth:
+ * the floor's value lives in a repository this one does not depend on, and a copied 256 here
+ * would go quiet if hearth ever lowered it (the same argument that kept a floor gauge out of
+ * this file in micro-org#363).
+ */
+export function minerWindowStats(
+  rows: ReadonlyArray<{ height: number; miner: string | null; difficulty: string | null }>,
+): { dominantShare: number; easedBlocks: number } | null {
+  if (rows.length < 2) return null
+  const counts = new Map<string, number>()
+  for (const row of rows) {
+    if (row.miner) counts.set(row.miner, (counts.get(row.miner) ?? 0) + 1)
+  }
+  const busiest = Math.max(0, ...counts.values())
+  let eased = 0
+  // rows are newest first, so rows[i + 1] is the PARENT of rows[i].
+  for (let i = 0; i < rows.length - 1; i++) {
+    const child = difficultyGaugeValue(rows[i]?.difficulty)
+    const parent = difficultyGaugeValue(rows[i + 1]?.difficulty)
+    if (child !== null && parent !== null && child * 4 < parent) eased += 1
+  }
+  return { dominantShare: busiest / rows.length, easedBlocks: eased }
 }
 
 /** keccak256("Transfer(address,address,uint256)"). The one event every fungible token emits. */
@@ -928,6 +970,17 @@ export class EvmWorker implements ChainWorker {
     if (stream === TIP_STREAM) {
       const difficulty = difficultyGaugeValue(raw.difficulty)
       if (difficulty !== null) this.#d.metrics.set(DIFFICULTY, difficulty, this.#labels)
+
+      // Tip stream only, like DIFFICULTY above and for the same reason: a backfill walking the
+      // 2,000 floor-pinned blocks of early August would report a dominance and an easement count
+      // that ended days ago. One indexed scan over this service's own table; the node is not
+      // asked anything.
+      const window = await minerWindow(this.#d.sql, this.#d.scope, MINER_WINDOW)
+      const stats = minerWindowStats(window)
+      if (stats !== null) {
+        this.#d.metrics.set(DOMINANT_MINER_SHARE, stats.dominantShare, this.#labels)
+        this.#d.metrics.set(EASED_BLOCKS_WINDOW, stats.easedBlocks, this.#labels)
+      }
     }
 
     this.#d.metrics.increment(BLOCKS_INDEXED_TOTAL, { ...this.#labels, stream })

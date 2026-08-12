@@ -29,6 +29,8 @@ export const DEPOSITS_CONFIRMED_TOTAL = 'indexer_deposits_confirmed_total'
 export const CHAIN_HALTED = 'indexer_chain_halted'
 export const TIP_HEIGHT = 'indexer_tip_height'
 export const DIFFICULTY = 'indexer_chain_difficulty'
+export const DOMINANT_MINER_SHARE = 'indexer_chain_dominant_miner_share'
+export const EASED_BLOCKS_WINDOW = 'indexer_chain_eased_blocks_window'
 
 /**
  * Reorg depth as a **bucket**, not as the raw number.
@@ -173,6 +175,34 @@ export function registerServiceMetrics(metrics: Metrics, scopes: readonly ChainS
       help:
         'Proof-of-work difficulty of the newest block this service indexed on the tip stream. ' +
         'Absent for chains with no proof of work, and for blocks that report a difficulty of 0.',
+      kind: 'gauge',
+      labels: ['chain', 'network'],
+    })
+    /**
+     * The two micro-org#451 Phase-0 series: who is setting the difficulty, and how often the
+     * hearth#13 easement is firing. Both are WINDOWED GAUGES over the last MINER_WINDOW canonical
+     * blocks rather than counters, because the question each answers is about the chain's current
+     * state — "is one miner dominant NOW", "is the easement chronic NOW" — and a counter would
+     * make every consumer reconstruct the window with a rate() nobody would size correctly.
+     *
+     * Deliberately NO per-coinbase label. A coinbase address is unbounded caller-controlled
+     * cardinality — the same argument depthBucket makes one screen up — and the Phase-3 trigger
+     * only reads the SHARE. The dominant address itself is logged, not labelled.
+     */
+    .register({
+      name: DOMINANT_MINER_SHARE,
+      help:
+        'Share of the last N canonical blocks won by the single busiest coinbase, 0..1. ' +
+        'The micro-org#451 Phase-3 trigger reads this. Absent until the window has data.',
+      kind: 'gauge',
+      labels: ['chain', 'network'],
+    })
+    .register({
+      name: EASED_BLOCKS_WINDOW,
+      help:
+        'Blocks in the last N whose difficulty fell more than 4x in one step — the signature of ' +
+        'the hearth#13 emergency easement, which no LWMA step can produce. Constant-free on ' +
+        'purpose: the floor value lives in a repository this service does not import.',
       kind: 'gauge',
       labels: ['chain', 'network'],
     })

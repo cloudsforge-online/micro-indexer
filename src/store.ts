@@ -230,6 +230,35 @@ export async function headBlock(exec: Exec, scope: ChainScope): Promise<StoredBl
   return row ? toBlock(row) : null
 }
 
+/**
+ * The last `n` canonical blocks' miner and difficulty, newest first — the window behind the two
+ * micro-org#451 gauges.
+ *
+ * Read from `detail` rather than from the node: the question is about blocks this service has
+ * already accepted, the jsonb is the header exactly as the node gave it (micro-org#395), and one
+ * indexed-scan per tip block costs microseconds where a 100-deep RPC walk per poll would cost the
+ * node the same work over and over.
+ *
+ * `difficulty` comes back as the RAW header string (hex like "0x36b0" on hearth) and is parsed by
+ * the caller with the same tolerance `difficultyGaugeValue` applies to the gauge — this function
+ * does not guess at formats, because BTC's `detail` will hold `bits` instead and a parse here
+ * would be wrong for it.
+ */
+export async function minerWindow(
+  exec: Exec,
+  scope: ChainScope,
+  n: number,
+): Promise<Array<{ height: number; miner: string | null; difficulty: string | null }>> {
+  const rows = await exec<Array<{ height: string; miner: string | null; difficulty: string | null }>>`
+    select height, detail->>'miner' as miner, detail->>'difficulty' as difficulty
+      from blocks
+     where chain = ${scope.chain} and network = ${scope.network} and status <> 'orphaned'
+     order by height desc
+     limit ${n}
+  `
+  return rows.map((row) => ({ height: Number(row.height), miner: row.miner, difficulty: row.difficulty }))
+}
+
 /* ------------------------------------------------------------------ transaction, log, activity */
 
 export async function upsertTransaction(
