@@ -694,6 +694,95 @@ export const MIGRATIONS: readonly Migration[] = [
     `,
     ).join('\n'),
   },
+  {
+    version: 10,
+    name: 'rewalk-narrowed-evm-headers',
+    // ------------------------------------------------------------------------------------------
+    // ENQUEUE A RE-WALK OF EVERY EVM BLOCK WHOSE HEADER WAS STORED AS FOUR HAND-PICKED FIELDS.
+    //
+    // Until micro-org#395 `evm.ts` reduced every header to `miner`, `gasUsed`, `gasLimit` and
+    // `difficulty` before it reached `blocks.detail`. Everything else the node sent — `stateRoot`,
+    // `parentHash`, `receiptsRoot`, `transactionsRoot`, `logsBloom`, `extraData`, `nonce`,
+    // `mixHash` — was discarded at extraction, so it is not merely unqueried, it is NOT IN THIS
+    // DATABASE. `micro-explorer-web` renders `detail` under a heading reading "the header, exactly
+    // as the node gave it", which made a curated list a promise this schema could not keep.
+    //
+    // The field that makes it worth a migration rather than a note is `stateRoot`. On an
+    // account-model chain a premine lives in the genesis allocation, the genesis header commits to
+    // that state root, and so block 0's `stateRoot` is the ONLY cryptographic evidence that nobody
+    // held a balance before the first block was mined. EMBER's is the canonical empty-trie root.
+    // The code fix serves it for every block walked from now on and can do nothing at all for
+    // 13,946 blocks already stored, which includes the one block anybody would come to check.
+    //
+    // NO SQL CAN INVENT THE MISSING BYTES. They only exist on the node, so the repair is to walk
+    // those heights again — and the machinery for walking a range again already exists and is
+    // driven by a row in this table. `store.ts:ensureBackfill` writes exactly the row below, the
+    // `indexer.backfill` job drains it on its own lease and its own checkpoint stream, and
+    // `upsertBlock`'s `on conflict (chain, network, hash) do update set detail = excluded.detail`
+    // is what makes a second walk rewrite the header rather than collide with it. So this migration
+    // enqueues work rather than doing any, which is also what keeps it off the deploy's critical
+    // path: a one-shot migrator that walked a chain would hold the advisory lock for hours.
+    //
+    // Re-indexing emits NOTHING. `#indexBlock` publishes `deposit.observed` only for a movement
+    // whose `address_activity` insert actually inserted, so a re-walk of 13,946 blocks produces
+    // zero duplicate events for `micro-wallet` or `micro-settlement` to reconcile. That property is
+    // the reason a blanket re-walk is a safe repair and not a customer-visible one.
+    //
+    // ── BOUNDED, AND THE BOUND IS 20,000 BLOCKS PER SCOPE ───────────────────────────────────────
+    //
+    // Sized to cover EMBER whole and nothing else whole. Mainnet stood at 13,946 blocks and testnet
+    // at 7,970 on 2026-08-11, so both re-walk from genesis, which is the case the ticket is about.
+    // An `eth` or `etc` follower has no such luck: those chains are in the tens of millions of
+    // blocks, one `eth_getBlockByNumber` plus receipts each, and an unbounded range would be a
+    // months-long re-walk enqueued by a schema migration that nobody asked for. The most recent
+    // 20,000 blocks is the window in which a header is still being looked at.
+    //
+    // The bound is a LITERAL and this migration will not grow with the chain. A scope past 20,000
+    // blocks when it lands keeps narrow headers below the window, permanently, until somebody
+    // enqueues more — `POST /v1/backfills/:chain/:network` takes an explicit range and is the
+    // supported way to say so. `not jsonb_exists(detail, 'stateRoot')` is what finds them:
+    //
+    //     select chain, network, min(height), max(height), count(*) from blocks
+    //      where chain in ('ember','eth','etc') and not jsonb_exists(detail, 'stateRoot')
+    //      group by chain, network;
+    //
+    // `jsonb_exists(detail, 'stateRoot')` rather than `detail ? 'stateRoot'` because the operator
+    // spelling is a question mark inside a string that several drivers rewrite as a placeholder,
+    // and a migration is not the place to find out which.
+    //
+    // EVM CHAINS ONLY, PINNED AS A LITERAL, for the reason every domain in this file is a literal:
+    // a checksummed artefact contains no value that can change. Bitcoin-family and Solana headers
+    // were never narrowed — `bitcoin.ts` and `solana.ts` pick fields deliberately from formats that
+    // are not one flat header — so re-walking them would be cost with no repair behind it.
+    //
+    // ── THIS IS THE ONE MIGRATION HERE THAT IS NOT INDIFFERENT TO RELEASE ORDER ─────────────────
+    //
+    // It adds no column and drops none, so a replica on the previous release cannot fail on it. It
+    // can, however, DRAIN the range with the narrowing code still in it: the blocks would be
+    // rewritten exactly as narrow as they are now and the checkpoint would reach `range_to`, after
+    // which nothing re-enqueues it and the repair is silently spent. The estate's migrator is a
+    // one-shot job from the same image tag as the service, so in practice the code that drains this
+    // is the code that shipped it — and if that assumption ever fails, the recovery is the `select`
+    // above followed by the backfill route, not another migration.
+    up: `
+      insert into checkpoints (chain, network, stream, height, range_from, range_to)
+      select scope.chain,
+             scope.network,
+             'backfill:' || greatest(scope.lowest, scope.highest - 19999) || '-' || scope.highest,
+             null,
+             greatest(scope.lowest, scope.highest - 19999),
+             scope.highest
+        from (
+          select chain, network, min(height) as lowest, max(height) as highest
+            from blocks
+           where chain in ('ember','eth','etc')
+             and status <> 'orphaned'
+             and not jsonb_exists(detail, 'stateRoot')
+           group by chain, network
+        ) as scope
+      on conflict (chain, network, stream) do nothing;
+    `,
+  },
 ]
 
 /**

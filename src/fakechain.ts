@@ -63,19 +63,40 @@ interface FakeReceipt {
   }>
 }
 
+/**
+ * A block header with the fields a real node sends, not the four this rig used to carry.
+ *
+ * The old shape held exactly the fields `evm.ts` then kept, so a fake chain could never have shown
+ * that the extraction dropped anything — the rig and the defect agreed. micro-org#395 is about
+ * `stateRoot` in particular, so the header served here is the one `eth_getBlockByNumber` returns,
+ * in the order a node returns it.
+ */
 interface FakeBlock {
   readonly number: string
   readonly hash: string
   readonly parentHash: string
-  readonly timestamp: string
+  readonly nonce: string
+  readonly sha3Uncles: string
+  readonly logsBloom: string
+  readonly transactionsRoot: string
+  readonly stateRoot: string
+  readonly receiptsRoot: string
   readonly miner: string
-  readonly gasUsed: string
-  readonly gasLimit: string
   readonly difficulty: string
+  readonly totalDifficulty: string
+  readonly extraData: string
+  readonly size: string
+  readonly gasLimit: string
+  readonly gasUsed: string
+  readonly timestamp: string
+  readonly mixHash: string
   readonly transactions: readonly FakeTx[]
+  readonly uncles: readonly string[]
 }
 
 const ZERO_HASH = `0x${'0'.repeat(64)}`
+/** keccak256(rlp([])) — what every uncle-less chain reports for `sha3Uncles`. */
+const EMPTY_UNCLE_HASH = '0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347'
 
 function digest(...parts: string[]): string {
   return `0x${createHash('sha256').update(parts.join('|')).digest('hex')}`
@@ -184,12 +205,25 @@ export class FakeChain {
       number: hex(height),
       hash,
       parentHash: parent ? parent.hash : ZERO_HASH,
-      timestamp: hex(this.#startTimestamp + height * this.#blockSeconds),
+      nonce: '0x0000000000000000',
+      sha3Uncles: EMPTY_UNCLE_HASH,
+      logsBloom: `0x${'0'.repeat(512)}`,
+      transactionsRoot: digest('txroot', String(this.#fork), String(height)),
+      // Derived from `(fork, height)` like every other hash here, so a rewritten block's state root
+      // differs from the one it replaced — which is what lets a test tell the two apart.
+      stateRoot: digest('stateroot', String(this.#fork), String(height)),
+      receiptsRoot: digest('receiptsroot', String(this.#fork), String(height)),
       miner: '0x00000000000000000000000000000000000000aa',
-      gasUsed: hex(21_000 * built.length),
-      gasLimit: hex(30_000_000),
       difficulty: hex(1_000),
+      totalDifficulty: hex(1_000 * (height + 1)),
+      extraData: '0x',
+      size: hex(512 + 100 * built.length),
+      gasLimit: hex(30_000_000),
+      gasUsed: hex(21_000 * built.length),
+      timestamp: hex(this.#startTimestamp + height * this.#blockSeconds),
+      mixHash: ZERO_HASH,
       transactions: built,
+      uncles: [],
     })
   }
 

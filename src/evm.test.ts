@@ -206,6 +206,76 @@ test('a difficulty gauge value is the block’s number, and null wherever there 
   assert.throws(() => hexToNumber('0xffffffffffffffff'), RangeError, 'heights still refuse to round')
 })
 
+test('the stored header is every field the node sent, and the body is the only thing dropped', () => {
+  // EMBER mainnet genesis, field for field, as `eth_getBlockByNumber("0x0", true)` answered
+  // `https://rpc.cloudsforge.online` on 2026-08-12 — the block micro-org#395 was filed against, and
+  // the one whose `stateRoot` is the empty-trie root and therefore the only proof that nobody was
+  // allocated a balance before the first block was mined. Nineteen fields plus the body; the code
+  // this replaced stored four of them.
+  const raw = {
+    number: '0x0',
+    hash: '0x0bd75ff12fe407213d4b5e43fc10777e5c24ee0484d3ea07ed1fa3516289900b',
+    parentHash: `0x${'0'.repeat(64)}`,
+    nonce: '0x0000000000000000',
+    sha3Uncles: '0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347',
+    logsBloom: `0x${'0'.repeat(512)}`,
+    transactionsRoot: '0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421',
+    stateRoot: '0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421',
+    receiptsRoot: '0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421',
+    miner: `0x${'0'.repeat(40)}`,
+    difficulty: '0x0',
+    totalDifficulty: '0x0',
+    // "hearth/7411" — the network name in the genesis extraData, which is what makes a cheaply
+    // mined empty testnet block structurally invalid on mainnet.
+    extraData: '0x6865617274682f37343131',
+    size: '0x236',
+    gasLimit: '0x1c9c380',
+    gasUsed: '0x0',
+    timestamp: '0x684ee180',
+    mixHash: `0x${'0'.repeat(64)}`,
+    transactions: [],
+    uncles: [],
+  }
+  const detail = extractBlock(raw, new Map(), 'EMBER').block.detail
+
+  // THE ASSERTION IS ON THE WHOLE KEY SET, not on `stateRoot`. A test that named the four or five
+  // fields somebody cared about in 2026 is the same shape of mistake as the code it replaced: it
+  // would pass unchanged the day a curated list came back and dropped `baseFeePerGas`.
+  assert.deepEqual(
+    Object.keys(detail).sort(),
+    Object.keys(raw)
+      .filter((key) => key !== 'transactions')
+      .sort(),
+    'every header field the node sent is stored, and only the body is left out',
+  )
+  for (const [key, value] of Object.entries(detail)) {
+    assert.equal(value, raw[key as keyof typeof raw], `${key} was reinterpreted on the way in`)
+  }
+
+  // The body is rows in `transactions`, with receipts resolved. A second copy inside a jsonb column
+  // would be the largest object this service handles, stored twice.
+  assert.equal('transactions' in detail, false)
+
+  // What the page exists to show. Named separately from the set assertion above because a reader
+  // arriving from micro-org#395 is looking for this line and not for a `deepEqual`.
+  assert.equal(
+    detail['stateRoot'],
+    '0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421',
+    'the canonical empty-trie root: genesis allocated nothing to anybody',
+  )
+})
+
+test('a header field the node omits is absent rather than stored as null', () => {
+  // The old code wrote `gasUsed: null` for a provider that did not send it, which is a claim that
+  // the node answered and said nothing. Absence is the honest record of a field that never arrived,
+  // and it is what lets `not jsonb_exists(detail, 'stateRoot')` in migration 10 find the blocks
+  // this service narrowed rather than the blocks a provider was thin about.
+  const raw = { number: '0x1', hash: '0xb', parentHash: '0xa', timestamp: '0x1' }
+  const detail = extractBlock(raw, new Map(), 'EMBER').block.detail
+  assert.deepEqual(Object.keys(detail).sort(), ['hash', 'number', 'parentHash', 'timestamp'])
+  assert.equal('gasUsed' in detail, false)
+})
+
 /* ------------------------------------------------------------------ database-backed */
 
 /**
@@ -1131,4 +1201,90 @@ test('a provider without eth_getBlockReceipts falls back per transaction', { ski
   // Probed once, then remembered: probing per block wastes a round trip on every block.
   assert.equal(chain.calls.filter((c) => c === 'eth_getBlockReceipts').length, 1)
   assert.equal(await countOf('transactions', `and status = 'success'`), 1)
+})
+
+test('the whole header reaches the database and is served back', { skip }, async () => {
+  const chain = new FakeChain()
+  chain.appendMany(2)
+  await workerFor(chain).follow(signal())
+
+  const stored = await postgresReadStore(db()).block(SCOPE, 2)
+  assert.ok(stored)
+
+  // Compared against the node's own answer, key for key. Asserting a handful of names would let
+  // the next curated list through as long as it kept the names this test happened to know.
+  const served = chain.handle('eth_getBlockByNumber', ['0x2', true]) as Record<string, unknown>
+  const header = Object.keys(served).filter((key) => key !== 'transactions')
+  assert.deepEqual(Object.keys(stored.detail).sort(), header.sort())
+  for (const key of header) {
+    assert.equal(String(stored.detail[key]), String(served[key]), `${key} did not survive storage`)
+  }
+})
+
+test('migration 10 enqueues a bounded re-walk of exactly the narrowed blocks', { skip }, async () => {
+  /*
+   * micro-org#395. The code fix serves the whole header for every block walked after it ships and
+   * can do nothing for the blocks already stored — and `stateRoot` on block 0, the field a reader
+   * comes to check, is by definition one of those. So the repair is a re-walk, and it is enqueued
+   * as a `checkpoints` row because that is the row `ensureBackfill` writes and the backfill job
+   * already drains.
+   *
+   * The migration's SQL is executed directly rather than through `migrate()`, which ran it once in
+   * `before` against an empty `blocks`. That is the correct behaviour on a fresh database and also
+   * the behaviour that proves nothing; what has to be asserted is what it does to a database that
+   * HAS narrowed rows in it.
+   */
+  const migration = MIGRATIONS.find((m) => m.name === 'rewalk-narrowed-evm-headers')
+  assert.ok(migration, 'the re-walk migration is gone; no estate ever gets its old headers back')
+
+  const chain = new FakeChain()
+  chain.appendMany(3)
+  await workerFor(chain).follow(signal())
+
+  // The old shape, written back over the first three blocks: the four fields `evm.ts` kept before
+  // micro-org#395, and nothing else. Narrowing rows the follower has already written is the only
+  // honest way to reach the state every live estate is actually in.
+  await sql`
+    update blocks
+       set detail = jsonb_build_object('miner', detail->'miner', 'gasUsed', detail->'gasUsed',
+                                       'gasLimit', detail->'gasLimit', 'difficulty', detail->'difficulty')
+     where chain = ${SCOPE.chain} and network = ${SCOPE.network} and height <= 2
+  `
+  // A family this migration must leave alone. `bitcoin.ts` and `solana.ts` pick their header fields
+  // from formats that are not one flat header, so they were never narrowed and re-walking them
+  // would be cost with no repair behind it.
+  await sql`
+    insert into blocks (chain, network, height, hash, parent_hash, block_time, tx_count, detail)
+    values ('sol', ${SCOPE.network}, 7, '0xsol', '0xp', now(), 0, ${sql.json({ parentSlot: 6 })})
+  `
+
+  await sql.unsafe(migration.up)
+
+  const rows = await sql<{ chain: string; stream: string; lo: string; hi: string }[]>`
+    select chain, stream, range_from as lo, range_to as hi from checkpoints
+     where range_to is not null order by chain
+  `
+  assert.deepEqual(
+    rows.map((r) => ({ ...r })),
+    [{ chain: SCOPE.chain, stream: 'backfill:0-2', lo: '0', hi: '2' }],
+    'one range covering the narrow blocks only, and nothing at all for Solana',
+  )
+
+  // Draining it rewrites the headers, which is the only thing that makes the row worth writing.
+  const before = await postgresReadStore(db()).block(SCOPE, 0)
+  assert.equal(before?.detail['stateRoot'], undefined, 'the fixture must start without one')
+
+  await workerFor(chain, { backfillBatchBlocks: 100 }).backfill(signal())
+
+  const genesis = await postgresReadStore(db()).block(SCOPE, 0)
+  const served = chain.handle('eth_getBlockByNumber', ['0x0', true]) as Record<string, unknown>
+  assert.equal(
+    genesis?.detail['stateRoot'],
+    served['stateRoot'],
+    'the block the ticket is about still has no state root after the re-walk',
+  )
+
+  // Idempotent: a migrator that runs twice, or an operator who pastes the statement, adds nothing.
+  await sql.unsafe(migration.up)
+  assert.equal(await countOf('checkpoints', 'and range_to is not null'), 1)
 })
