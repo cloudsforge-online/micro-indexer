@@ -10,6 +10,7 @@ import {
   EvmWorker,
   addressFromTopic,
   difficultyGaugeValue,
+  minerWindowStats,
   extractBlock,
   hexToBigInt,
   hexToNumber,
@@ -176,6 +177,56 @@ test('a transaction with no receipt is pending, not success', () => {
   assert.equal(out.transactions[0]?.status, 'pending')
   assert.equal(out.transactions[0]?.fee, null)
   assert.equal(out.activity.length, 0, 'an unestablished outcome must not credit anything')
+})
+
+test('the miner window reads dominance and the easement signature, and nothing else', () => {
+  // Newest first, exactly as minerWindow returns it. The shape of the 2026-08-12 measurement:
+  // one tab holding 15 of 16 blocks, difficulty ~0x36xx throughout.
+  const tab = '0xd8e8e0ed392d57d9d57da146856cfab7835bf294'
+  const server = '0x2098b519aaf94e704534c6de35c5c516723dcca8'
+  const rows = Array.from({ length: 16 }, (_, i) => ({
+    height: 20438 - i,
+    miner: i === 7 ? server : tab,
+    difficulty: '0x36d3',
+  }))
+  const stats = minerWindowStats(rows)
+  assert.ok(stats)
+  assert.equal(stats.dominantShare, 15 / 16)
+  assert.equal(stats.easedBlocks, 0, 'flat difficulty is not an easement')
+
+  // The hearth#13 cliff: 0x36d3 (14,035) to 0x100 (256) in ONE step — a 54x drop no LWMA step
+  // can produce (one sample is ~3% of a 60-block window). The child is the EASED block.
+  const eased = minerWindowStats([
+    { height: 3, miner: server, difficulty: '0x100' },
+    { height: 2, miner: tab, difficulty: '0x36d3' },
+    { height: 1, miner: tab, difficulty: '0x36a0' },
+  ])
+  assert.ok(eased)
+  assert.equal(eased.easedBlocks, 1)
+
+  // An honest LWMA slide of the same total size, spread over steps each under 4x, counts nothing:
+  // the detector reads the CLIFF, not the destination.
+  const slide = minerWindowStats([
+    { height: 4, miner: tab, difficulty: '0x100' },   // 256
+    { height: 3, miner: tab, difficulty: '0x300' },   // 768  (3x step)
+    { height: 2, miner: tab, difficulty: '0x900' },   // 2304 (3x step)
+    { height: 1, miner: tab, difficulty: '0x1b00' },  // 6912 (3x step)
+  ])
+  assert.ok(slide)
+  assert.equal(slide.easedBlocks, 0)
+
+  // Attribution honesty: blocks with no miner stay in the denominator. Three blocks, one
+  // attributable, must read 1/3 — never 1.0.
+  const sparse = minerWindowStats([
+    { height: 3, miner: tab, difficulty: null },
+    { height: 2, miner: null, difficulty: null },
+    { height: 1, miner: null, difficulty: null },
+  ])
+  assert.ok(sparse)
+  assert.equal(sparse.dominantShare, 1 / 3)
+
+  // A window too short to say anything says nothing — null, not a confident 1.0 from one block.
+  assert.equal(minerWindowStats([{ height: 1, miner: tab, difficulty: '0x100' }]), null)
 })
 
 test('a difficulty gauge value is the block’s number, and null wherever there is not one', () => {
