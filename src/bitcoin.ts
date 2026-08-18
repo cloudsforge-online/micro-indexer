@@ -217,30 +217,88 @@ export function difficultyFromBits(bits: string | null | undefined): number | nu
 export const MAX_SATOSHIS = 2_100_000_000_000_000n
 
 /**
- * BTC (as Core serialises it) → satoshis.
+ * The largest amount an 8-decimal JSON number can carry EXACTLY: 2^53 base units.
  *
- * Core reports amounts in BTC as a JSON number, so by the time any of this code runs the decimal
- * has already been through an IEEE-754 double. That sounds fatal for money and is not, but the
+ * Not a policy, a property of the wire format. Above it the ULP of a double exceeds one base unit,
+ * so two adjacent amounts serialise to the same number and no amount of care on this side can tell
+ * them apart. It is stated here because it is the real boundary of what `btcToSats` can promise,
+ * and because on Bitcoin and Litecoin it is unreachable — their supply caps are below it — which is
+ * why the promise looked unconditional until Dogecoin arrived.
+ */
+export const MAX_EXACT_UNITS = 9_007_199_254_740_992n
+
+/**
+ * The plausibility ceiling per native asset, in base units. **A DECODE CHECK, NOT AN ACCOUNTING
+ * RULE** — a value above the ceiling means the field this came from was not an amount.
+ *
+ * It has to be per-asset because it was per-asset all along and only Bitcoin was ever asked. A
+ * hardcoded 21M rejected `59612750.309` DOGE — an ordinary Dogecoin output — and killed the DOGE
+ * follower five retries into its first block on 2026-08-18.
+ *
+ * These live here rather than in `contracts/packages/chain` on purpose. That package publishes
+ * facts other services are held to; this is one module's sanity bound on one wire format, and
+ * nothing outside this file should be reading a supply cap from an indexer.
+ */
+export const MAX_UNITS_BY_ASSET: Readonly<Record<string, bigint>> = {
+  /** 21,000,000 × 1e8. Fixed by consensus and by the halving schedule; it cannot be raised. */
+  BTC: 2_100_000_000_000_000n,
+  /** 84,000,000 × 1e8. Litecoin's cap is 4× Bitcoin's, and the old constant rejected a quarter of it. */
+  LTC: 8_400_000_000_000_000n,
+  /**
+   * Dogecoin HAS NO CAP — 10,000 DOGE per block, forever, ~5.26e9 a year on top of the ~1.5e11
+   * outstanding in 2026. So this is a chosen ceiling and not a consensus one: 1e12 DOGE, roughly
+   * six times today's supply and about a century and a half of issuance away. Above `2^53` units
+   * (≈90,071,992 DOGE) the decode below is correctly rounded rather than exact, which is a
+   * statement about JSON and not about this ceiling — see `btcToSats`.
+   */
+  DOGE: 100_000_000_000_000_000_000n,
+}
+
+/** The ceiling for a native asset. Unlisted falls back to Bitcoin's, which refuses rather than invents. */
+export function maxUnitsFor(nativeAssetCode: string): bigint {
+  return MAX_UNITS_BY_ASSET[nativeAssetCode.toUpperCase()] ?? MAX_SATOSHIS
+}
+
+/**
+ * A coin amount (as Core serialises it) → base units.
+ *
+ * Core reports amounts as a JSON number, so by the time any of this code runs the decimal has
+ * already been through an IEEE-754 double. That sounds fatal for money and mostly is not, but the
  * reason is worth writing down rather than trusting:
  *
- *   the largest valid amount is 21e6 BTC; the ULP of a double near 21e6 is about 3.7e-9; scaled by
- *   1e8 that is an error of about 0.37 satoshis, and the true value is an exact multiple of one
- *   satoshi. So the nearest integer to `value * 1e8` is the exact amount, for every amount Bitcoin
- *   can represent. `Math.round` recovers it exactly; it does not merely get close.
+ *   `toFixed(8)` is specified as the decimal `n / 10^8` NEAREST to the exact value of the double —
+ *   computed from that value, not through a `× 1e8` that rounds a second time. So the only error
+ *   left is the one already baked in when the JSON was parsed, at most half a ULP. Below
+ *   `MAX_EXACT_UNITS` the ULP is under one base unit, which makes the original amount the nearest
+ *   8-decimal decimal to the double this side received. It is therefore recovered EXACTLY.
  *
- * That argument holds only inside the valid range, so the range is checked rather than assumed —
- * a `value` outside it means the field was not a Bitcoin amount, and the honest response to a
- * number this function cannot vouch for is to throw. Crediting a wrong amount silently is the one
+ * This replaced `BigInt(Math.round(value * 1e8))`, whose own comment proved exactness at 21e6 BTC
+ * and was right there and only there. That proof needs the combined error under half a unit, and
+ * the multiply's own rounding pushes it past that above 2^25 coins (~33.5e6) — inside Litecoin's
+ * supply and far inside Dogecoin's. The rewrite is not a style change: it moves the guarantee from
+ * "true for Bitcoin" to "true for every amount the wire can carry".
+ *
+ * Above `MAX_EXACT_UNITS` the value returned is correctly rounded but NOT provably exact, because
+ * the distinction was destroyed before this function was called. That band is reachable only on
+ * Dogecoin, only on third-party whale outputs, and only for rows this service records rather than
+ * credits: DOGE is absent from `WALLET_FEE_QUOTES` and `payableChainsOnly` gates deposits ahead of
+ * anything here. The estate's own DOGE income is a 10,000-coin merge-mined block reward, four
+ * orders of magnitude inside the exact band.
+ *
+ * Everything else is refused rather than guessed at. Crediting a wrong amount silently is the one
  * outcome that must not be available.
  */
-export function btcToSats(value: number): bigint {
+export function btcToSats(value: number, maxUnits: bigint = MAX_SATOSHIS): bigint {
   if (!Number.isFinite(value)) {
     throw new RangeError(`bitcoin amount ${value} is not a finite number`)
   }
   if (value < 0) throw new RangeError(`bitcoin amount ${value} is negative`)
-  const sats = BigInt(Math.round(value * 1e8))
-  if (sats > MAX_SATOSHIS) {
-    throw new RangeError(`bitcoin amount ${value} exceeds the 21,000,000 BTC supply cap`)
+  // Exponential notation would break the split, and `toFixed` only reaches for it at 1e21 — which
+  // every ceiling above is comfortably below, so the guard is the ceiling itself.
+  const [whole = '0', fraction = ''] = value.toFixed(8).split('.')
+  const sats = BigInt(whole) * 100_000_000n + BigInt(fraction)
+  if (sats > maxUnits) {
+    throw new RangeError(`bitcoin amount ${value} exceeds this chain's ${maxUnits} base-unit ceiling`)
   }
   return sats
 }
@@ -360,6 +418,9 @@ export function extractBitcoinBlock(
 ): ExtractedBitcoinBlock {
   const height = raw.height
   const blockHash = raw.hash
+  // Read once per block rather than per output. Bitcoin's cap would reject ordinary Dogecoin
+  // amounts, so this is what makes the extractor chain-correct instead of Bitcoin-correct.
+  const maxUnits = maxUnitsFor(nativeAssetCode)
 
   const block: BlockInput = {
     height,
@@ -391,7 +452,7 @@ export function extractBitcoinBlock(
 
     let outputTotal = 0n
     for (const vout of tx.vout) {
-      outputTotal += btcToSats(vout.value)
+      outputTotal += btcToSats(vout.value, maxUnits)
     }
 
     // ---- inputs: outbound movements, the fee, and the spend records
@@ -433,7 +494,7 @@ export function extractBitcoinBlock(
         continue
       }
 
-      const amount = btcToSats(resolved.value)
+      const amount = btcToSats(resolved.value, maxUnits)
       inputTotal += amount
       if (resolved.address && amount > 0n) {
         activity.push(
@@ -453,7 +514,7 @@ export function extractBitcoinBlock(
 
     // ---- outputs: inbound movements, one per output, which is the UTXO rule
     for (const vout of tx.vout) {
-      const amount = btcToSats(vout.value)
+      const amount = btcToSats(vout.value, maxUnits)
       // A zero-value output is a data carrier (OP_RETURN) or dust convention. It credits nobody.
       if (amount === 0n) continue
       const address = addressOf(vout.scriptPubKey)

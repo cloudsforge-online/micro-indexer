@@ -17,11 +17,14 @@ import {
   ACCEPTED_CORE_CHAINS,
   BitcoinNetworkError,
   BitcoinWorker,
+  MAX_EXACT_UNITS,
+  MAX_SATOSHIS,
   addressOf,
   btcToSats,
   difficultyFromBits,
   extractBitcoinBlock,
   isCoinbase,
+  maxUnitsFor,
   outpointKey,
   signalsRbf,
   type Prevout,
@@ -65,6 +68,49 @@ test('an amount this function cannot vouch for throws rather than crediting a gu
   assert.throws(() => btcToSats(Number.POSITIVE_INFINITY), RangeError)
   assert.throws(() => btcToSats(-1), RangeError)
   assert.throws(() => btcToSats(21_000_001), RangeError, 'above the supply cap')
+})
+
+// The regression. `59612750.30919116` is a real Dogecoin output, and a hardcoded 21M ceiling
+// rejected it — five retries later the doge:mainnet follower was dead, on its first block, with
+// "exceeds the 21,000,000 BTC supply cap" as the only explanation. The ceiling was always a decode
+// check and was always per-asset; only Bitcoin had ever been asked.
+test('an ordinary Dogecoin amount decodes instead of killing the follower', () => {
+  const doge = maxUnitsFor('DOGE')
+  assert.equal(btcToSats(59_612_750.30919116, doge), 5_961_275_030_919_116n)
+  assert.equal(btcToSats(59_608_155.38999116, doge), 5_960_815_538_999_116n)
+  // A merge-mined block reward, which is what the estate's own DOGE income actually is.
+  assert.equal(btcToSats(10_000, doge), 1_000_000_000_000n)
+  // The same amount under Bitcoin's ceiling is still refused, so the check did not become a no-op.
+  assert.throws(() => btcToSats(59_612_750.30919116), RangeError)
+})
+
+test('the ceiling is the asset’s, and an unlisted asset gets the strictest one', () => {
+  assert.equal(maxUnitsFor('BTC'), 2_100_000_000_000_000n)
+  assert.equal(maxUnitsFor('LTC'), 8_400_000_000_000_000n, 'Litecoin’s cap is 4× Bitcoin’s')
+  assert.equal(maxUnitsFor('doge'), maxUnitsFor('DOGE'), 'case is not significant')
+  assert.ok(maxUnitsFor('DOGE') > MAX_EXACT_UNITS, 'Dogecoin has no consensus cap to lean on')
+  assert.equal(maxUnitsFor('XMR'), MAX_SATOSHIS, 'unlisted refuses rather than invents')
+  // 30M LTC is inside Litecoin's supply and was rejected by the old constant.
+  assert.equal(btcToSats(30_000_000, maxUnitsFor('LTC')), 3_000_000_000_000_000n)
+})
+
+// The old decode was `BigInt(Math.round(value * 1e8))`, whose exactness proof needs the combined
+// error under half a unit and gets there only below ~2^25 coins. `toFixed(8)` is specified as the
+// nearest n/1e8 to the double's exact value, so the multiply's own rounding is gone. Below
+// MAX_EXACT_UNITS the ULP is under one base unit, which makes recovery exact rather than close.
+test('every amount the wire can carry exactly is recovered exactly', () => {
+  const doge = maxUnitsFor('DOGE')
+  // Straddling 2^25 coins, where the old proof stopped holding, and 2^53 units, where the wire
+  // format itself stops distinguishing adjacent amounts.
+  for (const units of [
+    3_355_443_200_000_000n, // 2^25 coins
+    3_355_443_200_000_001n,
+    5_961_275_030_919_116n,
+    9_007_199_254_740_992n, // MAX_EXACT_UNITS
+  ]) {
+    const asNumber = Number(units) / 1e8
+    assert.equal(btcToSats(asNumber, doge), units, `${units} did not round-trip`)
+  }
 })
 
 test('an output pays one address, or nobody — and nobody is a real answer', () => {
